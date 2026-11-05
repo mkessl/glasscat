@@ -313,6 +313,7 @@ impl App {
                     scroll: 0,
                 }
             }
+            KeyCode::Char('o') if ctrl => self.transcript.toggle_reasoning(),
             KeyCode::Char('a') if ctrl => self.input.line_start(),
             KeyCode::Char('e') if ctrl => self.input.line_end(),
             KeyCode::Char('u') if ctrl => self.input.kill_before(),

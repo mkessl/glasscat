@@ -35,12 +35,26 @@ pub struct Transcript {
     blocks: Vec<Block>,
     cache: Vec<Option<Vec<Line>>>,
     width: usize,
+    /// Reasoning shown in full rather than folded.
+    reasoning_open: bool,
 }
+
+/// Lines of reasoning shown while the model is still thinking.
+const THINKING_TAIL: usize = 3;
 
 impl Transcript {
     pub fn push(&mut self, b: Block) {
+        // The block before was laid out as the last one.
+        if let Some(c) = self.cache.last_mut() {
+            *c = None;
+        }
         self.blocks.push(b);
         self.cache.push(None);
+    }
+
+    pub fn toggle_reasoning(&mut self) {
+        self.reasoning_open ^= true;
+        self.cache.iter_mut().for_each(|c| *c = None);
     }
 
     /// Appends streamed text to the last block if it is of the same kind.
@@ -69,9 +83,11 @@ impl Transcript {
             self.cache.iter_mut().for_each(|c| *c = None);
             self.width = width;
         }
-        for (b, c) in self.blocks.iter().zip(self.cache.iter_mut()) {
+        let n = self.blocks.len();
+        for (i, (b, c)) in self.blocks.iter().zip(self.cache.iter_mut()).enumerate() {
             if c.is_none() {
-                *c = Some(layout(b, width));
+                let open = self.reasoning_open;
+                *c = Some(layout(b, width, open, i + 1 == n));
             }
         }
         let mut out = Vec::new();
@@ -90,7 +106,7 @@ static BLANK: Line = Line {
     style: Style::dim(),
 };
 
-fn layout(b: &Block, width: usize) -> Vec<Line> {
+fn layout(b: &Block, width: usize, reasoning_open: bool, last: bool) -> Vec<Line> {
     let mut out = Vec::new();
     let mut add = |text: String, style: Style| out.push(Line { text, style });
     match b {
@@ -117,7 +133,24 @@ fn layout(b: &Block, width: usize) -> Vec<Line> {
             }
         }
         Block::Reasoning(t) => {
-            for l in wrap(t.trim(), width) {
+            let lines = wrap(t.trim(), width);
+            let skip = if reasoning_open {
+                0
+            } else {
+                let (verb, keep) = if last {
+                    ("thinking", THINKING_TAIL)
+                } else {
+                    ("thought", 0)
+                };
+                let n = lines.len();
+                let s = if n == 1 { "" } else { "s" };
+                add(
+                    clip(&format!("{verb} · {n} line{s} · ctrl+o shows"), width),
+                    Style::dim(),
+                );
+                n.saturating_sub(keep)
+            };
+            for l in lines.into_iter().skip(skip) {
                 add(l, Style::dim().italic());
             }
         }
@@ -191,6 +224,23 @@ mod tests {
             result: "a\nb\nc".into(),
         });
         assert_eq!(texts(&mut t, 40), ["▸ read src/main.rs", "  a  (+2 lines)"]);
+    }
+
+    #[test]
+    fn reasoning_folds_once_the_model_moves_on() {
+        let mut t = Transcript::default();
+        t.stream("a\nb\nc\nd", true);
+        assert_eq!(
+            texts(&mut t, 40),
+            ["thinking · 4 lines · ctrl+o shows", "b", "c", "d"]
+        );
+        t.stream("answer", false);
+        assert_eq!(
+            texts(&mut t, 40),
+            ["thought · 4 lines · ctrl+o shows", "", "answer"]
+        );
+        t.toggle_reasoning();
+        assert_eq!(texts(&mut t, 40), ["a", "b", "c", "d", "", "answer"]);
     }
 
     #[test]
