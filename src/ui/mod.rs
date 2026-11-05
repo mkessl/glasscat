@@ -23,7 +23,8 @@ use serde_json::Value;
 
 use crate::Result;
 use crate::agent::{Session, Shown};
-use crate::openai::Event as Stream;
+use crate::context::Item;
+use crate::openai::{Event as Stream, Served};
 use input::Input;
 use screen::{Screen, Style};
 use transcript::{Block, Transcript};
@@ -34,11 +35,14 @@ const FRAME: Duration = Duration::from_millis(16);
 const INPUT_MAX_ROWS: usize = 8;
 const WHEEL_LINES: usize = 3;
 const PROMPT: &str = "› ";
+const INPUT_POLL: Duration = Duration::from_millis(20);
 
 enum Msg {
     Term(Event),
     Agent(AgentMsg),
     Done(Box<Session>, Option<String>),
+    /// A result that arrived on its own, such as a policy lookup.
+    Block(Block),
 }
 
 enum AgentMsg {
@@ -52,6 +56,8 @@ enum AgentMsg {
         result: String,
     },
     Usage(Value),
+    Served(Served),
+    Timing(Option<Duration>, Duration),
     StartedOver,
 }
 
@@ -72,21 +78,49 @@ struct App {
     last_request: Vec<u8>,
     busy: Option<String>,
     usage: Option<Value>,
+    /// Who answered last, as the stream said.
+    served: Option<Served>,
+    /// The last request's time to first token and in all.
+    timing: Option<(Option<Duration>, Duration)>,
     cancel: Arc<AtomicBool>,
     tx: Sender<Msg>,
     /// Where the input was drawn: first screen row and first text row shown.
     input_at: (u16, usize),
     quit: bool,
+    /// Whether the keyboard enhancement flags are on.
+    keyboard: bool,
+    /// Stops the input thread while another program has the terminal.
+    paused: Arc<AtomicBool>,
+    /// Whether the input thread may still be reading.
+    reading: Arc<AtomicBool>,
+    /// A hand-edited context that did not parse, to be opened again.
+    kept_edit: Option<std::path::PathBuf>,
 }
 
 pub fn run(session: Session) -> Result<()> {
     // Before the input thread: the terminal queries here read input too.
-    let _term = TermGuard::enter()?;
+    let term = TermGuard::enter()?;
     let (w, h) = terminal::size()?;
     let (tx, rx) = mpsc::channel();
     let input_tx = tx.clone();
+    let paused = Arc::new(AtomicBool::new(false));
+    let reading = Arc::new(AtomicBool::new(true));
+    let (p, r) = (paused.clone(), reading.clone());
     std::thread::spawn(move || {
-        while let Ok(e) = event::read() {
+        loop {
+            // Paused while another program has the terminal.
+            if p.load(Ordering::Relaxed) {
+                r.store(false, Ordering::Relaxed);
+                std::thread::sleep(INPUT_POLL);
+                continue;
+            }
+            r.store(true, Ordering::Relaxed);
+            let e = match event::poll(INPUT_POLL) {
+                Ok(true) => event::read(),
+                Ok(false) => continue,
+                Err(e) => Err(e),
+            };
+            let Ok(e) = e else { break };
             if input_tx.send(Msg::Term(e)).is_err() {
                 break;
             }
@@ -108,12 +142,23 @@ pub fn run(session: Session) -> Result<()> {
         tx,
         input_at: (0, 0),
         quit: false,
+        keyboard: term.keyboard,
+        paused,
+        reading,
+        kept_edit: None,
+        served: None,
+        timing: None,
     };
     app.transcript.push(Block::Info(format!(
         "{} · {} · /help lists commands and keys",
         crate::NAME,
         app.model
     )));
+    let items = &app.session.as_ref().expect("not started yet").items;
+    if items.len() > 1 {
+        replay(items, &mut app.transcript);
+        app.hint_unanswered(false);
+    }
     app.event_loop(rx)
 }
 
@@ -176,6 +221,7 @@ impl App {
             Msg::Term(Event::Resize(w, h)) => self.screen.resize(w, h),
             Msg::Term(_) => {}
             Msg::Agent(a) => self.agent(a),
+            Msg::Block(b) => self.transcript.push(b),
             Msg::Done(session, err) => {
                 self.session = Some(session);
                 self.busy = None;
@@ -183,25 +229,103 @@ impl App {
                 if let Some(e) = err {
                     self.transcript.push(Block::Error(e));
                 }
-                let session = self.session.as_ref().expect("just put back");
-                if session.unanswered() {
-                    let why = if cancelled {
-                        "Stopped."
-                    } else if session.cut_reply().is_some() {
-                        "The reply was cut off."
-                    } else {
-                        "No reply."
-                    };
-                    let how = if session.continues_from_token() {
-                        "continues the reply from where it stopped"
-                    } else {
-                        "asks again"
-                    };
-                    self.transcript
-                        .push(Block::Info(format!("{why} Enter on an empty line {how}.")));
-                }
+                self.hint_unanswered(cancelled);
             }
         }
+    }
+
+    /// Opens the context in the user's editor and takes back the result.
+    fn edit_context(&mut self) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let path = std::env::temp_dir().join(format!(
+            "{}-context-{}.txt",
+            crate::NAME,
+            std::process::id()
+        ));
+        let kept = self.kept_edit.take().is_some_and(|p| p.exists());
+        let written = if kept {
+            Ok(())
+        } else {
+            std::fs::write(&path, crate::context::to_text(&session.items))
+        };
+        if let Err(e) = written {
+            self.transcript
+                .push(Block::Error(format!("{}: {e}", path.display())));
+            return;
+        }
+        let ran = self.run_outside(|| editor(&path));
+        let text = ran.and_then(|()| std::fs::read_to_string(&path).map_err(|e| e.to_string()));
+        let session = self.session.as_mut().expect("checked above");
+        if text.as_ref().is_ok_and(|t| t.trim().is_empty()) {
+            let _ = std::fs::remove_file(&path);
+            self.transcript.push(Block::Info(
+                "The file was empty, so the context is unchanged.".into(),
+            ));
+            return;
+        }
+        let result = text.and_then(|t| {
+            let items = crate::context::from_text(&t).map_err(|e| {
+                self.kept_edit = Some(path.clone());
+                format!(
+                    "{e}. The context is unchanged; /edit opens your text again ({}).",
+                    path.display()
+                )
+            })?;
+            session.set_items(items).map_err(|e| e.to_string())
+        });
+        match result {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&path);
+                let items = session.items.clone();
+                self.transcript.clear();
+                replay(&items, &mut self.transcript);
+                self.transcript
+                    .push(Block::Info("The context was edited by hand.".into()));
+                self.hint_unanswered(false);
+            }
+            Err(e) => self.transcript.push(Block::Error(e)),
+        }
+    }
+
+    /// Gives the terminal to another program for the length of `f`.
+    fn run_outside<T>(&mut self, f: impl FnOnce() -> T) -> T {
+        self.paused.store(true, Ordering::Relaxed);
+        while self.reading.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        restore(self.keyboard);
+        let out = f();
+        let _ = setup(self.keyboard);
+        self.paused.store(false, Ordering::Relaxed);
+        let (w, h) = terminal::size().unwrap_or((self.screen.width(), self.screen.height()));
+        self.screen.resize(w, h);
+        out
+    }
+
+    /// Says how to pick up a turn the model did not finish, if there is one.
+    fn hint_unanswered(&mut self, cancelled: bool) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        if !session.unanswered() {
+            return;
+        }
+        let why = if cancelled {
+            "Stopped."
+        } else if session.cut_reply().is_some() {
+            "The reply was cut off."
+        } else {
+            "No reply."
+        };
+        let how = if session.continues_from_token() {
+            "continues the reply from where it stopped"
+        } else {
+            "asks again"
+        };
+        self.transcript
+            .push(Block::Info(format!("{why} Enter on an empty line {how}.")));
     }
 
     fn agent(&mut self, a: AgentMsg) {
@@ -224,6 +348,8 @@ impl App {
                 self.transcript.push(Block::Tool { name, args, result });
             }
             AgentMsg::Usage(u) => self.usage = Some(u),
+            AgentMsg::Served(s) => self.served = Some(s),
+            AgentMsg::Timing(first, total) => self.timing = Some((first, total)),
             AgentMsg::StartedOver => self.transcript.push(Block::Info(
                 "The model wrote the reply anew instead of continuing it; only the new one is kept.".into(),
             )),
@@ -259,6 +385,8 @@ impl App {
                 session.clear();
                 self.transcript.clear();
                 self.usage = None;
+                self.served = None;
+                self.timing = None;
                 self.last_request.clear();
                 self.transcript
                     .push(Block::Info("A new conversation.".into()));
@@ -272,6 +400,39 @@ impl App {
                 self.model = arg.to_string();
                 self.transcript
                     .push(Block::Info(format!("The model is now {arg}.")));
+            }
+            "/edit" => self.edit_context(),
+            "/provider" => {
+                let name = session.log.as_ref().map_or("unnamed", |l| l.1.as_str());
+                let base = session.base_url.clone();
+                let mut text = format!("The provider is {name}, at {base}.");
+                match self.served.clone() {
+                    Some(s) if crate::policy::known(&base) => {
+                        text.push_str(" Asking OpenRouter about the last reply…");
+                        let tx = self.tx.clone();
+                        std::thread::spawn(move || {
+                            let b = match crate::policy::describe(&base, &s) {
+                                Ok(t) => Block::Info(t),
+                                Err(e) => Block::Error(format!("policy lookup failed: {e}")),
+                            };
+                            let _ = tx.send(Msg::Block(b));
+                        });
+                    }
+                    _ if crate::policy::known(&base) => text.push_str(
+                        " OpenRouter names the provider that ran a model with each reply; \
+                         ask again after one.",
+                    ),
+                    Some(s) => text.push_str(&format!(
+                        " The last reply came from {}. {} knows no policy API for this provider.",
+                        s.model,
+                        crate::NAME
+                    )),
+                    None => text.push_str(&format!(
+                        " {} knows no policy API for this provider.",
+                        crate::NAME
+                    )),
+                }
+                self.transcript.push(Block::Info(text));
             }
             "/undo" => match session.undo() {
                 Ok(done) => self.transcript.push(Block::Info(done)),
@@ -318,6 +479,8 @@ impl App {
                 Shown::Stream(Stream::Call(n)) => send(AgentMsg::Calling(n.into())),
                 Shown::Stream(Stream::CallArgs(_)) => {}
                 Shown::Usage(u) => send(AgentMsg::Usage(u.clone())),
+                Shown::Served(s) => send(AgentMsg::Served(s.clone())),
+                Shown::Timing { first, total } => send(AgentMsg::Timing(first, total)),
                 Shown::StartedOver => send(AgentMsg::StartedOver),
                 Shown::ToolDone { name, args, result } => send(AgentMsg::Tool {
                     name: name.into(),
@@ -506,11 +669,29 @@ impl App {
             .set_cursor(Some((px + col as u16, input_y + (row - top) as u16)));
 
         // Status.
-        let left = match &self.busy {
-            Some(b) => format!("{} · {b}", self.model),
-            None => self.model.clone(),
-        };
-        let right = format!("{}ctrl+t context ", usage_text(self.usage.as_ref()));
+        let mut left = self.model.clone();
+        if let Some(s) = &self.served {
+            if s.model != self.model {
+                left = format!("{left} → {}", s.model);
+            }
+            if let Some(p) = &s.provider {
+                left = format!("{left} on {p}");
+            }
+        }
+        if let Some(b) = &self.busy {
+            left = format!("{left} · {b}");
+        }
+        // On a narrow screen the timing goes first, then the usage.
+        let usage = usage_text(self.usage.as_ref());
+        let timing = timing_text(self.timing, self.usage.as_ref());
+        let right = [
+            format!("{usage}{timing}ctrl+t context "),
+            format!("{usage}ctrl+t context "),
+            "ctrl+t context ".to_string(),
+        ]
+        .into_iter()
+        .find(|r| text::width(r) <= w as usize * 2 / 3)
+        .unwrap_or_default();
         let rx = w.saturating_sub(text::width(&right) as u16);
         self.screen
             .put(0, status_y, rx.saturating_sub(1), &left, Style::dim());
@@ -538,6 +719,61 @@ impl App {
     }
 }
 
+/// Runs `$VISUAL` or `$EDITOR` on a file and waits for it.
+fn editor(path: &std::path::Path) -> std::result::Result<(), String> {
+    let cmd = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .ok()
+        .filter(|c| !c.trim().is_empty())
+        .unwrap_or_else(|| if cfg!(windows) { "notepad" } else { "vi" }.into());
+    let mut words = cmd.split_whitespace();
+    let program = words.next().expect("not empty");
+    let status = std::process::Command::new(program)
+        .args(words)
+        .arg(path)
+        .status()
+        .map_err(|e| format!("could not run the editor {cmd}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the editor {cmd} ended with {status}; the context is unchanged"
+        ))
+    }
+}
+
+/// Shows a saved conversation as it went.
+fn replay(items: &[Item], t: &mut Transcript) {
+    let results: std::collections::HashMap<&str, &str> = items
+        .iter()
+        .filter_map(|i| match i {
+            Item::ToolResult { call_id, content } => Some((call_id.as_str(), content.as_str())),
+            _ => None,
+        })
+        .collect();
+    for item in items {
+        match item {
+            Item::User(text) => t.push(Block::User(text.clone())),
+            Item::Assistant(r) => {
+                if !r.reasoning.trim().is_empty() {
+                    t.push(Block::Reasoning(r.reasoning.clone()));
+                }
+                if !r.text.trim().is_empty() {
+                    t.push(Block::Text(r.text.clone()));
+                }
+                for c in &r.calls {
+                    t.push(Block::Tool {
+                        name: c.name.clone(),
+                        args: c.args.clone(),
+                        result: results.get(c.id.as_str()).unwrap_or(&"").to_string(),
+                    });
+                }
+            }
+            Item::System(_) | Item::ToolResult { .. } => {}
+        }
+    }
+}
+
 fn put_line(screen: &mut Screen, y: u16, w: u16, line: &transcript::Line) {
     let mut x = 0;
     for (text, style) in &line.spans {
@@ -550,6 +786,14 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/clear", "start a new conversation"),
     ("/model", "show the model; /model <id> switches to another"),
     ("/undo", "undo the agent's last change to a file"),
+    (
+        "/edit",
+        "edit the whole context in $EDITOR before the next request",
+    ),
+    (
+        "/provider",
+        "who ran the last reply, and what they publish about your data",
+    ),
 ];
 
 const KEYS: &[(&str, &str)] = &[
@@ -613,6 +857,29 @@ fn usage_text(u: Option<&Value>) -> String {
     parts.join(" · ") + " · "
 }
 
+/// `first 0.4s · 2.1s · 52 tok/s`: time to the first token, in all, and
+/// the output speed after the first token.
+fn timing_text(t: Option<(Option<Duration>, Duration)>, usage: Option<&Value>) -> String {
+    let Some((first, total)) = t else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    if let Some(f) = first {
+        parts.push(format!("first {:.1}s", f.as_secs_f64()));
+    }
+    parts.push(format!("{:.1}s", total.as_secs_f64()));
+    let out = usage
+        .and_then(|u| u.get("completion_tokens"))
+        .and_then(Value::as_u64);
+    if let (Some(f), Some(n)) = (first, out) {
+        let secs = (total - f).as_secs_f64();
+        if secs >= 0.1 && n > 1 {
+            parts.push(format!("{:.0} tok/s", (n - 1) as f64 / secs));
+        }
+    }
+    parts.join(" · ") + " · "
+}
+
 /// Puts the terminal into full-screen raw mode and restores it on drop,
 /// also when the program panics.
 struct TermGuard {
@@ -622,22 +889,7 @@ struct TermGuard {
 impl TermGuard {
     fn enter() -> io::Result<Self> {
         let keyboard = terminal::supports_keyboard_enhancement().unwrap_or(false);
-        terminal::enable_raw_mode()?;
-        let mut out = io::stdout();
-        execute!(
-            out,
-            terminal::EnterAlternateScreen,
-            event::EnableBracketedPaste,
-            event::EnableMouseCapture
-        )?;
-        if keyboard {
-            execute!(
-                out,
-                event::PushKeyboardEnhancementFlags(
-                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                )
-            )?;
-        }
+        setup(keyboard)?;
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             restore(keyboard);
@@ -651,6 +903,26 @@ impl Drop for TermGuard {
     fn drop(&mut self) {
         restore(self.keyboard);
     }
+}
+
+fn setup(keyboard: bool) -> io::Result<()> {
+    terminal::enable_raw_mode()?;
+    let mut out = io::stdout();
+    execute!(
+        out,
+        terminal::EnterAlternateScreen,
+        event::EnableBracketedPaste,
+        event::EnableMouseCapture
+    )?;
+    if keyboard {
+        execute!(
+            out,
+            event::PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        )?;
+    }
+    Ok(())
 }
 
 fn restore(keyboard: bool) {
@@ -682,5 +954,17 @@ mod tests {
             "in 1200 (1000 cached) · out 30 · $0.0001 · "
         );
         assert_eq!(usage_text(None), "");
+    }
+
+    #[test]
+    fn timing_line() {
+        let t = Some((
+            Some(Duration::from_millis(400)),
+            Duration::from_millis(2400),
+        ));
+        let u = json!({"completion_tokens": 101});
+        assert_eq!(timing_text(t, Some(&u)), "first 0.4s · 2.4s · 50 tok/s · ");
+        let none = Some((None, Duration::from_millis(1000)));
+        assert_eq!(timing_text(none, None), "1.0s · ");
     }
 }

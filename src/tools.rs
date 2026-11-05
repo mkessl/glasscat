@@ -33,8 +33,9 @@ struct Change {
     path: PathBuf,
     /// What the change was, in a few words: "the edit at line 3".
     what: String,
-    /// Hash of the file right after the change, to see later changes.
-    after: u64,
+    /// Hash of the file right after the change, to see later changes;
+    /// `None` when the change removed it.
+    after: Option<u64>,
     undo: Undo,
 }
 
@@ -44,6 +45,10 @@ enum Undo {
     Remove { dirs: Vec<PathBuf> },
     /// The file was overwritten: put these bytes back.
     Restore(Vec<u8>),
+    /// The file was deleted: write it again with its permissions.
+    Recreate(Vec<u8>, fs::Permissions),
+    /// The empty directory was deleted: make it again.
+    Mkdir,
     /// An edit: put `old` back at these byte offsets, where `new` stands.
     Replace {
         at: Vec<usize>,
@@ -131,6 +136,15 @@ pub fn specs() -> Vec<ToolSpec> {
                 "required": ["path", "old", "new"],
             }),
         ),
+        spec(
+            "delete",
+            "Delete a file or an empty directory.",
+            json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+            }),
+        ),
     ]
 }
 
@@ -166,7 +180,12 @@ impl Tools {
             .ok_or("No changes to undo.")?;
         let shown = self.access.show(&change.path);
         let now = fs::read(&change.path).ok();
-        if now.as_deref().map(fnv) != Some(change.after) {
+        let gone = fs::symlink_metadata(&change.path).is_err();
+        let same = match change.after {
+            Some(hash) => now.as_deref().map(fnv) == Some(hash),
+            None => gone,
+        };
+        if !same {
             return Err(format!(
                 "{shown} was changed after {}, so it was left as it is. /undo again goes one change further back.",
                 change.what
@@ -182,6 +201,14 @@ impl Tools {
                 }
             }
             Undo::Restore(bytes) => write_atomic(&change.path, bytes).map_err(io)?,
+            Undo::Recreate(bytes, perms) => {
+                if let Some(dir) = change.path.parent() {
+                    fs::create_dir_all(dir).map_err(io)?;
+                }
+                write_atomic(&change.path, bytes).map_err(io)?;
+                fs::set_permissions(&change.path, perms.clone()).map_err(io)?;
+            }
+            Undo::Mkdir => fs::create_dir_all(&change.path).map_err(io)?,
             Undo::Replace { at, old, new } => {
                 let mut bytes = now.expect("hash matched");
                 for &i in at.iter().rev() {
@@ -217,6 +244,7 @@ impl Tools {
             "search" => self.search(&args),
             "write" => self.write(&args),
             "edit" => self.edit(&args),
+            "delete" => self.delete(&args),
             _ => Err(format!("unknown tool {name}")),
         };
         result.unwrap_or_else(|e| format!("error: {e}"))
@@ -395,7 +423,7 @@ impl Tools {
                 "the creation"
             }
             .into(),
-            after: fnv(content.as_bytes()),
+            after: Some(fnv(content.as_bytes())),
             undo: match &old {
                 Some(bytes) => Undo::Restore(bytes.clone()),
                 None => Undo::Remove { dirs },
@@ -410,6 +438,54 @@ impl Tools {
             Some(_) => format!("wrote {path} ({lines} lines)"),
             None => format!("created {path} ({lines} lines)"),
         })
+    }
+
+    fn delete(&self, a: &Value) -> Result<String, String> {
+        let path = req(a, "path")?;
+        let real = self.access.resolve(path)?;
+        // The path resolves through links; deleting would hit the target.
+        let given = self.access.cwd().join(path);
+        if fs::symlink_metadata(&given).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!(
+                "{path} is a symbolic link; delete cannot remove links yet"
+            ));
+        }
+        if real == self.access.cwd() {
+            return Err("that is the working directory; it cannot be deleted".into());
+        }
+        let meta = fs::symlink_metadata(&real).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => not_found(path),
+            _ => io_err(path, e),
+        })?;
+        let (undo, what) = if meta.is_dir() {
+            fs::remove_dir(&real).map_err(|e| match e.kind() {
+                io::ErrorKind::DirectoryNotEmpty => {
+                    format!("{path} is not empty; delete what is in it first")
+                }
+                _ => io_err(path, e),
+            })?;
+            (Undo::Mkdir, "the deletion of the directory")
+        } else {
+            let bytes = fs::read(&real).map_err(|e| io_err(path, e))?;
+            fs::remove_file(&real).map_err(|e| io_err(path, e))?;
+            let old = String::from_utf8_lossy(&bytes).into_owned();
+            self.journal
+                .record(json!({ "tool": "delete", "path": real, "old": old }))
+                .map_err(|e| format!("deleted {path}, but could not record the change: {e}"))?;
+            (Undo::Recreate(bytes, meta.permissions()), "the deletion")
+        };
+        if meta.is_dir() {
+            self.journal
+                .record(json!({ "tool": "delete", "path": real, "dir": true }))
+                .map_err(|e| format!("deleted {path}, but could not record the change: {e}"))?;
+        }
+        self.remember(Change {
+            path: real,
+            what: what.into(),
+            after: None,
+            undo,
+        });
+        Ok(format!("deleted {path}"))
     }
 
     fn edit(&self, a: &Value) -> Result<String, String> {
@@ -467,7 +543,7 @@ impl Tools {
         self.remember(Change {
             path: real.clone(),
             what: format!("the edit at line {}", line_of(at[0])),
-            after: fnv(changed.as_bytes()),
+            after: Some(fnv(changed.as_bytes())),
             undo: Undo::Replace {
                 at: now_at,
                 old: old.clone(),
@@ -543,7 +619,7 @@ fn glob_matcher(pattern: &str) -> Result<globset::GlobMatcher, String> {
 
 /// Writes through a temporary file and a rename, so a reader never sees
 /// half a file; keeps the old file's permissions.
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy())
@@ -755,6 +831,41 @@ mod tests {
         );
         f.tools.undo().unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), orig);
+    }
+
+    #[test]
+    fn delete_and_undo() {
+        let f = fixture("delete");
+        let p = f.base.join("proj");
+        let lib = fs::read(p.join("src/lib.rs")).unwrap();
+        assert_eq!(
+            run(&f, "delete", json!({"path": "src/lib.rs"})),
+            "deleted src/lib.rs"
+        );
+        assert!(!p.join("src/lib.rs").exists());
+        assert!(run(&f, "delete", json!({"path": "src"})).contains("not empty"));
+        fs::create_dir(p.join("empty")).unwrap();
+        assert_eq!(run(&f, "delete", json!({"path": "empty"})), "deleted empty");
+        assert!(run(&f, "delete", json!({"path": "secret/key.rs"})).contains("no such file"));
+        assert!(run(&f, "delete", json!({"path": "."})).contains("working directory"));
+
+        assert_eq!(
+            f.tools.undo().unwrap(),
+            "Undid the deletion of the directory in empty."
+        );
+        assert!(p.join("empty").is_dir());
+        assert_eq!(f.tools.undo().unwrap(), "Undid the deletion in src/lib.rs.");
+        assert_eq!(fs::read(p.join("src/lib.rs")).unwrap(), lib);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_refuses_links() {
+        let f = fixture("delete-link");
+        let p = f.base.join("proj");
+        std::os::unix::fs::symlink(p.join("src/lib.rs"), p.join("link.rs")).unwrap();
+        assert!(run(&f, "delete", json!({"path": "link.rs"})).contains("symbolic link"));
+        assert!(p.join("src/lib.rs").exists());
     }
 
     #[test]

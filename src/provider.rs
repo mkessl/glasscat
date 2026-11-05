@@ -2,6 +2,7 @@
 
 use crate::Result;
 use crate::openai::Prefill;
+use crate::settings::Settings;
 
 pub struct Preset {
     pub name: &'static str,
@@ -73,16 +74,46 @@ pub const PRESETS: &[Preset] = &[
     },
 ];
 
-pub fn preset(name: &str) -> Result<&'static Preset> {
-    PRESETS
-        .iter()
-        .find(|p| p.name == name)
-        .ok_or_else(|| format!("unknown provider {name}").into())
+/// A provider to talk to: a built-in one or one from the settings.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Provider {
+    pub name: String,
+    pub base_url: String,
+    pub key_env: Option<String>,
+    pub default_model: String,
+    pub prefill: Prefill,
 }
 
-impl Preset {
+/// The provider called `name`; the settings may add providers or
+/// change built-in ones.
+pub fn find(name: &str, settings: &Settings) -> Result<Provider> {
+    if let Some(p) = settings.providers.get(name) {
+        return Ok(Provider {
+            name: name.into(),
+            base_url: p.base_url.clone(),
+            key_env: p.key_env.clone(),
+            default_model: p.model.clone(),
+            prefill: p.prefill,
+        });
+    }
+    let p = PRESETS.iter().find(|p| p.name == name).ok_or_else(|| {
+        format!(
+            "unknown provider {name}; add it under \"providers\" in {}",
+            crate::settings::path().display()
+        )
+    })?;
+    Ok(Provider {
+        name: p.name.into(),
+        base_url: p.base_url.into(),
+        key_env: p.key_env.map(Into::into),
+        default_model: p.default_model.into(),
+        prefill: p.prefill,
+    })
+}
+
+impl Provider {
     pub fn api_key(&self) -> Result<Option<String>> {
-        let Some(var) = self.key_env else {
+        let Some(var) = &self.key_env else {
             return Ok(None);
         };
         match std::env::var(var) {

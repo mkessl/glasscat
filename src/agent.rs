@@ -1,10 +1,13 @@
 //! The loop: send the context, stream the reply, run the tools it calls,
 //! add the results and go again until the model answers without tools.
 
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
 
 use crate::Result;
 use crate::context::{Item, Reply, ToolSpec};
+use crate::history;
 use crate::openai::{self, Event, Prefill};
 use crate::tools::{self, Tools};
 
@@ -20,6 +23,9 @@ pub struct Session {
     /// What the model should learn with the next message, such as a
     /// change the user undid.
     notes: Vec<String>,
+    /// Where the conversation is saved after each turn; `None` keeps it
+    /// in memory only.
+    pub log: Option<(PathBuf, String)>,
 }
 
 /// What a turn shows as it goes.
@@ -29,6 +35,14 @@ pub enum Shown<'a> {
     Stream(Event<'a>),
     /// The provider's usage report for the request just finished.
     Usage(&'a serde_json::Value),
+    /// Which model answered, and on which provider if a router says.
+    Served(&'a openai::Served),
+    /// How long the request took: to the first streamed token, if one
+    /// came, and in all.
+    Timing {
+        first: Option<Duration>,
+        total: Duration,
+    },
     /// Asked to continue a cut-off reply, the model wrote a new one; it
     /// replaces the cut-off one.
     StartedOver,
@@ -57,13 +71,24 @@ impl Session {
             tools,
             specs: tools::specs(),
             notes: Vec::new(),
+            log: None,
         }
+    }
+
+    /// Puts in a context edited by hand, and saves it.
+    pub fn set_items(&mut self, items: Vec<Item>) -> Result<()> {
+        self.items = items;
+        self.save(Ok(()))
     }
 
     /// Forgets the conversation; the system prompt stays.
     pub fn clear(&mut self) {
         self.items.truncate(1);
         self.notes.clear();
+        // The old conversation stays saved; the new one gets its own file.
+        if let Some((path, _)) = &mut self.log {
+            *path = history::new_path(self.tools.cwd());
+        }
     }
 
     /// Undoes the last file change the tools made; the model is told
@@ -88,7 +113,26 @@ impl Session {
             format!("{}\n\n{prompt}", std::mem::take(&mut self.notes).join("\n"))
         };
         self.items.push(Item::User(prompt));
-        self.run(cancel, on)
+        let r = self.run(cancel, on);
+        self.save(r)
+    }
+
+    /// Saves the conversation where `log` says, after a turn that ended
+    /// with `r`; a failed save turns into an error after a good turn.
+    fn save(&self, r: Result<()>) -> Result<()> {
+        let Some((path, provider)) = &self.log else {
+            return r;
+        };
+        let saved = history::Saved {
+            cwd: self.tools.cwd().to_path_buf(),
+            provider: provider.clone(),
+            model: self.model.clone(),
+            items: self.items.clone(),
+        };
+        match history::save(path, &saved) {
+            Err(e) if r.is_ok() => Err(format!("could not save the conversation: {e}").into()),
+            _ => r,
+        }
     }
 
     /// The last reply, if it was cut off before the model finished it.
@@ -121,13 +165,16 @@ impl Session {
         if self.cut_reply().is_some() && !self.continues_from_token() {
             self.items.pop();
         }
-        self.run(cancel, on)
+        let r = self.run(cancel, on);
+        self.save(r)
     }
 
     fn run(&mut self, cancel: &AtomicBool, mut on: impl FnMut(Shown)) -> Result<()> {
         loop {
             let body = openai::request_body(&self.model, &self.items, &self.specs, self.prefill);
             on(Shown::Request(&body));
+            let start = Instant::now();
+            let mut first = None;
             let Some(stream) =
                 openai::send(&self.base_url, self.api_key.as_deref(), &body, cancel)?
             else {
@@ -137,12 +184,22 @@ impl Session {
                 .continues_from_token()
                 .then(|| self.cut_reply().cloned().map(Continuation::new))
                 .flatten();
-            let outcome = openai::read_stream(stream, cancel, |e| match &mut continuation {
-                Some(c) => c.pass(e, &mut on),
-                None => on(Shown::Stream(e)),
+            let outcome = openai::read_stream(stream, cancel, |e| {
+                first.get_or_insert_with(|| start.elapsed());
+                match &mut continuation {
+                    Some(c) => c.pass(e, &mut on),
+                    None => on(Shown::Stream(e)),
+                }
+            });
+            on(Shown::Timing {
+                first,
+                total: start.elapsed(),
             });
             if let Some(u) = &outcome.usage {
                 on(Shown::Usage(u));
+            }
+            if let Some(s) = &outcome.served {
+                on(Shown::Served(s));
             }
             let cut = outcome.cut();
             let mut reply = outcome.reply;

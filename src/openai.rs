@@ -15,7 +15,8 @@ use crate::sse::Events;
 
 /// How a provider continues a cut-off assistant message from its last
 /// token. The message is sent last, as the start of the reply.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum Prefill {
     /// Not supported; the reply is asked for again instead.
     None,
@@ -23,8 +24,10 @@ pub enum Prefill {
     /// Groq, llama.cpp).
     Plain,
     /// `"prefix": true` on the message (DeepSeek beta, Mistral).
+    #[serde(rename = "prefix")]
     PrefixFlag,
     /// `"partial": true` on the message (Kimi).
+    #[serde(rename = "partial")]
     PartialFlag,
 }
 
@@ -120,6 +123,15 @@ pub struct Outcome {
     pub done: bool,
     /// The usage object exactly as the provider sent it.
     pub usage: Option<Value>,
+    /// The model that answered, as the stream names it.
+    pub served: Option<Served>,
+}
+
+/// Which model answered, and where: a router may pick either.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Served {
+    pub model: String,
+    pub provider: Option<String>,
 }
 
 impl Outcome {
@@ -137,6 +149,9 @@ impl Outcome {
 struct Chunk {
     #[serde(default)]
     choices: Vec<Choice>,
+    model: Option<String>,
+    /// Routers such as OpenRouter name the provider that ran the model.
+    provider: Option<String>,
     usage: Option<Value>,
     error: Option<Value>,
 }
@@ -235,6 +250,14 @@ pub fn read_stream(
         if chunk.usage.is_some() {
             out.usage = chunk.usage;
         }
+        if out.served.is_none()
+            && let Some(model) = chunk.model.filter(|m| !m.is_empty())
+        {
+            out.served = Some(Served {
+                model,
+                provider: chunk.provider,
+            });
+        }
         for choice in chunk.choices {
             let d = choice.delta;
             for r in [d.reasoning, d.reasoning_content].into_iter().flatten() {
@@ -322,14 +345,34 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(600);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
-fn post(base_url: &str, api_key: Option<&str>, body: &[u8]) -> Result<ureq::BodyReader<'static>> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_per_read(Some(READ_TIMEOUT))
         .timeout_per_write(Some(WRITE_TIMEOUT))
         .build()
-        .into();
+        .into()
+}
+
+/// Fetches a JSON document; no key is sent.
+pub fn get_json(url: &str) -> Result<Value> {
+    let mut resp = agent().get(url).call()?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        return Err(format!("{url}: HTTP {status}: {}", text.trim()).into());
+    }
+    let bytes = resp
+        .body_mut()
+        .with_config()
+        .limit(32 << 20)
+        .read_to_vec()?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn post(base_url: &str, api_key: Option<&str>, body: &[u8]) -> Result<ureq::BodyReader<'static>> {
+    let agent = agent();
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let mut req = agent.post(&url).content_type("application/json");
     if let Some(key) = api_key {

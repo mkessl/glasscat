@@ -7,7 +7,7 @@
 A fast terminal agent in Rust: a language model with tools, working on your computer.<br>
 Every byte sent to the model is yours to read, and every change it makes is yours to undo.
 
-[Build](#build) · [Use](#use) · [Providers](#providers) · [What you can see](#what-you-can-see) · [Support](#support-the-project)
+[Build](#build) · [Use](#use) · [Providers](#providers) · [Settings](#settings) · [What you can see](#what-you-can-see) · [Support](#support-the-project)
 
 <br>
 
@@ -36,10 +36,13 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
   and frames are synchronized, so nothing flickers.
 - **The exact context, live.** <kbd>Ctrl</kbd>+<kbd>T</kbd> shows the last request the model
   got, either split into labelled parts with their sizes or as the raw bytes.
+- **Edit the context by hand.** `/edit` opens the whole conversation in your editor as plain
+  text: the system prompt, every message, tool call and result. What you save is what the
+  model gets next.
 - **Stop and continue.** <kbd>Esc</kbd> stops a reply at once and keeps what was written.
   <kbd>Enter</kbd> on an empty line picks it up again. Where the provider allows it, the reply
   continues from its last token instead of starting over.
-- **File tools**: read, list, find, search, write and edit. Several reads run at the same time.
+- **File tools**: read, list, find, search, write, edit and delete. Several reads run at the same time.
   Edits keep a file's line endings and byte order mark.
 - **Undo.** Every change the agent makes is written to a journal. `/undo` takes changes back
   one at a time, and leaves alone a file you changed yourself in the meantime.
@@ -49,7 +52,8 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
 - **Reasoning** from thinking models streams in, then folds away; <kbd>Ctrl</kbd>+<kbd>O</kbd>
   opens it.
 - **Markdown** in replies is rendered: headings, lists, quotes, code, bold and italic.
-- **Usage and cost** of each request in the status bar, cache hits included.
+- **Usage, cost and speed** of each request in the status bar: cache hits, time to the first
+  token, and tokens per second.
 
 ## Build
 
@@ -70,10 +74,12 @@ This puts `glasscat` in `~/.cargo/bin`. To build without installing, run
 export OPENROUTER_API_KEY=sk-or-...
 glasscat                                  # full-screen session in this directory
 glasscat "what does src/main.rs do?"      # one answer, printed to stdout
+glasscat -c                               # pick up the last conversation held here
 ```
 
 | Option | Meaning |
 | --- | --- |
+| `-c`, `--continue` | pick up the last conversation held in this directory |
 | `--provider <name>` | where the model runs (default `openrouter`) |
 | `--model <id>` | the model to use; each provider has a default |
 | `--allow <dir>` | another folder the agent may work in (repeatable) |
@@ -91,6 +97,8 @@ Inside a session:
 | <kbd>Ctrl</kbd>+<kbd>O</kbd> | show or fold reasoning |
 | `/model <id>` | switch the model |
 | `/undo` | undo the agent's last file change |
+| `/edit` | change the context in `$EDITOR` before the next request |
+| `/provider` | who ran the last reply, and what they publish about your data |
 | `/clear` | start a new conversation |
 | `/help` | all commands and keys |
 
@@ -112,6 +120,35 @@ Any server that speaks the OpenAI chat completions API works. These are built in
 OpenRouter's default model, `openrouter/free`, costs nothing, so you can try glasscat with
 a free OpenRouter key.
 
+## Settings
+
+Settings live in `~/.config/glasscat/settings.json` (on Windows, `%APPDATA%\glasscat`).
+Every field is optional, and options on the command line win. Add any OpenAI-compatible
+server under `providers`:
+
+```json
+{
+  "provider": "vllm",
+  "providers": {
+    "vllm": {
+      "base_url": "http://localhost:8000/v1",
+      "model": "Qwen/Qwen3-8B",
+      "prefill": "none"
+    }
+  },
+  "hide": [".env", "secrets"]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `provider`, `model` | used when none is given |
+| `providers` | more providers by name, or changes to built-in ones: `base_url`, `model`, `key_env` (the variable holding the key), `prefill` |
+| `allow`, `hide` | like `--allow` and `--hide`, added to them |
+
+`prefill` says how the server continues a cut-off reply: `plain` (a trailing assistant
+message), `prefix` or `partial` (that flag on the message), or `none` to ask again.
+
 ## What you can see
 
 | | |
@@ -119,9 +156,14 @@ a free OpenRouter key.
 | The system prompt and tool definitions | <kbd>Ctrl</kbd>+<kbd>T</kbd>, word for word |
 | The exact bytes of each request | <kbd>Ctrl</kbd>+<kbd>T</kbd>, then <kbd>r</kbd>; or `--show-request` |
 | Size of each part of the context | <kbd>Ctrl</kbd>+<kbd>T</kbd> |
+| The whole context, to change as you like | `/edit` |
 | Tokens in and out, cache hits, cost | status bar |
+| Time to the first token, time in all, output speed | status bar |
+| Which model and provider ran each reply | status bar, when a router such as OpenRouter says |
+| That provider's quantization, data retention, location and privacy policy | `/provider` (OpenRouter) |
 | The model's reasoning | as it streams; <kbd>Ctrl</kbd>+<kbd>O</kbd> afterwards |
 | Every file change, old and new text | `~/.local/share/glasscat/edits/` |
+| Every conversation | `~/.local/share/glasscat/conversations/` |
 
 ## Support the project
 
