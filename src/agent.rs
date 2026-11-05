@@ -13,6 +13,10 @@ use crate::tools::{self, Tools};
 
 pub struct Session {
     pub base_url: String,
+    /// The proxy for requests to the provider, if one is set.
+    pub proxy: Option<String>,
+    /// Fields set in request bodies, beyond what the agent builds.
+    pub fields: Fields,
     pub model: String,
     pub api_key: Option<String>,
     /// How this provider continues a cut-off reply.
@@ -37,6 +41,13 @@ pub enum Shown<'a> {
     Usage(&'a serde_json::Value),
     /// Which model answered, and on which provider if a router says.
     Served(&'a openai::Served),
+    /// The provider answered with an error that may pass; the same request
+    /// goes again after `wait`.
+    Retrying {
+        error: &'a str,
+        wait: Duration,
+        attempt: u32,
+    },
     /// How long the request took: to the first streamed token, if one
     /// came, and in all.
     Timing {
@@ -50,6 +61,9 @@ pub enum Shown<'a> {
         name: &'a str,
         args: &'a str,
         result: &'a str,
+        /// What the tool kept from the model (hidden paths, paths outside
+        /// the allowed folders), for the user only.
+        withheld: Option<&'a str>,
     },
 }
 
@@ -64,6 +78,8 @@ impl Session {
         let items = vec![Item::System(system_prompt(&tools))];
         Self {
             base_url,
+            proxy: None,
+            fields: Fields::default(),
             model,
             api_key,
             prefill,
@@ -79,6 +95,30 @@ impl Session {
     pub fn set_items(&mut self, items: Vec<Item>) -> Result<()> {
         self.items = items;
         self.save(Ok(()))
+    }
+
+    /// Adds instruction files to the system prompt of a new conversation:
+    /// the user's own, then each project file, as (shown path, text).
+    pub fn add_instructions(
+        &mut self,
+        user: Option<(String, String)>,
+        project: Vec<(String, String)>,
+    ) {
+        let Some(Item::System(prompt)) = self.items.first_mut() else {
+            return;
+        };
+        for (whose, (path, text)) in user
+            .map(|u| ("the user", u))
+            .into_iter()
+            .chain(project.into_iter().map(|p| ("this project", p)))
+        {
+            let text = text.trim();
+            if !text.is_empty() {
+                prompt.push_str(&format!(
+                    "\n\nInstructions for {whose}, from {path}:\n{text}"
+                ));
+            }
+        }
     }
 
     /// Forgets the conversation; the system prompt stays.
@@ -171,15 +211,46 @@ impl Session {
 
     fn run(&mut self, cancel: &AtomicBool, mut on: impl FnMut(Shown)) -> Result<()> {
         loop {
-            let body = openai::request_body(&self.model, &self.items, &self.specs, self.prefill);
+            let body = openai::request_body(
+                &self.model,
+                &self.items,
+                &self.specs,
+                self.prefill,
+                &self.fields.for_model(&self.model),
+            );
             on(Shown::Request(&body));
-            let start = Instant::now();
-            let mut first = None;
-            let Some(stream) =
-                openai::send(&self.base_url, self.api_key.as_deref(), &body, cancel)?
-            else {
-                return Ok(());
+            let mut attempt = 0;
+            let (stream, start) = loop {
+                let start = Instant::now();
+                let sent = openai::send(
+                    &self.base_url,
+                    self.api_key.as_deref(),
+                    self.proxy.as_deref(),
+                    &body,
+                    cancel,
+                );
+                let e = match sent {
+                    Ok(Some(stream)) => break (stream, start),
+                    Ok(None) => return Ok(()),
+                    Err(e) => e,
+                };
+                let wait = e
+                    .downcast_ref::<openai::HttpError>()
+                    .and_then(|h| h.retry_wait(attempt));
+                let Some(wait) = wait.filter(|_| attempt < RETRIES) else {
+                    return Err(e);
+                };
+                attempt += 1;
+                on(Shown::Retrying {
+                    error: &e.to_string(),
+                    wait,
+                    attempt,
+                });
+                if !sleep_unless_cancelled(wait, cancel) {
+                    return Ok(());
+                }
             };
+            let mut first = None;
             let mut continuation = self
                 .continues_from_token()
                 .then(|| self.cut_reply().cloned().map(Continuation::new))
@@ -226,11 +297,12 @@ impl Session {
                 return Ok(());
             }
             let results = self.run_calls(&calls);
-            for (call, result) in calls.into_iter().zip(results) {
+            for (call, (result, withheld)) in calls.into_iter().zip(results) {
                 on(Shown::ToolDone {
                     name: &call.name,
                     args: &call.args,
                     result: &result,
+                    withheld: withheld.as_deref(),
                 });
                 self.items.push(Item::ToolResult {
                     call_id: call.id,
@@ -241,25 +313,84 @@ impl Session {
     }
 
     /// Calls that change nothing run at the same time; otherwise in order.
-    fn run_calls(&self, calls: &[crate::context::ToolCall]) -> Vec<String> {
+    fn run_calls(&self, calls: &[crate::context::ToolCall]) -> Vec<(String, Option<String>)> {
         let tools = &self.tools;
         if calls.len() > 1 && calls.iter().all(|c| tools::read_only(&c.name)) {
             std::thread::scope(|s| {
                 let handles: Vec<_> = calls
                     .iter()
-                    .map(|c| s.spawn(move || tools.run(&c.name, &c.args)))
+                    .map(|c| s.spawn(move || tools.run_noting(&c.name, &c.args)))
                     .collect();
                 handles
                     .into_iter()
                     .map(|h| {
                         h.join()
-                            .unwrap_or_else(|_| "error: the tool crashed".into())
+                            .unwrap_or_else(|_| ("error: the tool crashed".into(), None))
                     })
                     .collect()
             })
         } else {
-            calls.iter().map(|c| tools.run(&c.name, &c.args)).collect()
+            calls
+                .iter()
+                .map(|c| tools.run_noting(&c.name, &c.args))
+                .collect()
         }
+    }
+}
+
+type Map = serde_json::Map<String, serde_json::Value>;
+
+/// Tries of a request after the first, on errors that may pass.
+pub const RETRIES: u32 = 3;
+
+/// Waits unless cancelled first; false when cancelled.
+fn sleep_unless_cancelled(wait: Duration, cancel: &AtomicBool) -> bool {
+    let end = Instant::now() + wait;
+    while Instant::now() < end {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    !cancel.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Request fields in layers; a later layer wins.
+#[derive(Debug, Default)]
+pub struct Fields {
+    /// From the settings: the general ones, then the provider's.
+    pub settings: Map,
+    /// From the settings, by model id.
+    pub models: std::collections::BTreeMap<String, Map>,
+    /// Set with /set in this session.
+    pub session: Map,
+}
+
+impl Fields {
+    /// Each field sent with `model`, and which layer it comes from.
+    pub fn sources(&self, model: &str) -> Vec<(&str, &serde_json::Value, &'static str)> {
+        let mut out: Vec<(&str, &serde_json::Value, &'static str)> = Vec::new();
+        let layers = [
+            (Some(&self.settings), "settings"),
+            (self.models.get(model), "settings for this model"),
+            (Some(&self.session), "this session"),
+        ];
+        for (layer, from) in layers {
+            for (k, v) in layer.into_iter().flatten() {
+                match out.iter_mut().find(|f| f.0 == k) {
+                    Some(f) => *f = (k, v, from),
+                    None => out.push((k, v, from)),
+                }
+            }
+        }
+        out
+    }
+
+    pub fn for_model(&self, model: &str) -> Map {
+        self.sources(model)
+            .into_iter()
+            .map(|(k, v, _)| (k.to_string(), v.clone()))
+            .collect()
     }
 }
 
@@ -442,6 +573,87 @@ mod tests {
         assert_eq!(msgs[4]["content"], "beta\n");
         assert!(matches!(session.items.last(), Some(Item::Assistant(r)) if r.text == "done"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn instruction_files_join_the_system_prompt_unless_hidden() {
+        let dir =
+            std::env::temp_dir().join(format!("{}-instr-{}", crate::NAME, std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("AGENTS.md"), "Use tabs.\n").unwrap();
+        fs::write(dir.join("SECRET.md"), "hidden\n").unwrap();
+        let access =
+            Access::new(&dir, std::slice::from_ref(&dir), &[dir.join("SECRET.md")]).unwrap();
+        let tools = Tools::new(access, Journal::new(dir.join("j.jsonl")));
+        let mut session = Session::new("u".into(), "m".into(), None, Prefill::None, tools);
+        let names = ["AGENTS.md", "SECRET.md", "MISSING.md"].map(String::from);
+        let project = session.tools.read_visible(&names);
+        session.add_instructions(Some(("~/u.md".into(), "Be brief.".into())), project);
+        let Item::System(prompt) = &session.items[0] else {
+            panic!()
+        };
+        assert!(
+            prompt.ends_with(
+                "\n\nInstructions for the user, from ~/u.md:\nBe brief.\n\n\
+             Instructions for this project, from AGENTS.md:\nUse tabs."
+            ),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("hidden"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tries_again_after_a_passing_error() {
+        let busy =
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 4\r\n\r\nbusy";
+        let (url, server) = serve(vec![
+            busy.into(),
+            sse(&[r#"{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#]),
+        ]);
+        let (mut session, dir) = session(url, Prefill::None);
+        let mut retried = Vec::new();
+        session
+            .turn("hi".into(), &AtomicBool::new(false), |s| {
+                if let Shown::Retrying { error, attempt, .. } = s {
+                    retried.push((error.to_string(), attempt));
+                }
+            })
+            .unwrap();
+        assert_eq!(retried.len(), 1);
+        assert!(
+            retried[0].0.ends_with("HTTP 429 Too Many Requests: busy"),
+            "{:?}",
+            retried
+        );
+        assert!(matches!(session.items.last(), Some(Item::Assistant(r)) if r.text == "ok"));
+        assert_eq!(server.join().unwrap().len(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn request_fields_in_layers() {
+        let map = |v: serde_json::Value| v.as_object().unwrap().clone();
+        let mut f = Fields {
+            settings: map(serde_json::json!({"temperature": 0.6, "top_p": 0.9})),
+            ..Fields::default()
+        };
+        f.models
+            .insert("r1".into(), map(serde_json::json!({"temperature": 0.2})));
+        f.session = map(serde_json::json!({"top_p": null}));
+        let shown: Vec<String> = f
+            .sources("r1")
+            .iter()
+            .map(|(k, v, from)| format!("{k}={v} ({from})"))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "temperature=0.2 (settings for this model)",
+                "top_p=null (this session)"
+            ]
+        );
+        assert_eq!(f.for_model("other")["temperature"], 0.6);
     }
 
     fn session(url: String, prefill: Prefill) -> (Session, std::path::PathBuf) {

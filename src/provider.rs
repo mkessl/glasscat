@@ -82,6 +82,10 @@ pub struct Provider {
     pub key_env: Option<String>,
     pub default_model: String,
     pub prefill: Prefill,
+    pub proxy: Option<String>,
+    /// Request fields: the general ones from the settings, then this
+    /// provider's own over them.
+    pub request: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The provider called `name`; the settings may add providers or
@@ -94,6 +98,13 @@ pub fn find(name: &str, settings: &Settings) -> Result<Provider> {
             key_env: p.key_env.clone(),
             default_model: p.model.clone(),
             prefill: p.prefill,
+            proxy: p.proxy.clone().or_else(|| settings.proxy.clone()),
+            request: settings
+                .request
+                .clone()
+                .into_iter()
+                .chain(p.request.clone())
+                .collect(),
         });
     }
     let p = PRESETS.iter().find(|p| p.name == name).ok_or_else(|| {
@@ -108,6 +119,8 @@ pub fn find(name: &str, settings: &Settings) -> Result<Provider> {
         key_env: p.key_env.map(Into::into),
         default_model: p.default_model.into(),
         prefill: p.prefill,
+        proxy: settings.proxy.clone(),
+        request: settings.request.clone(),
     })
 }
 

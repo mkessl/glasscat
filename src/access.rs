@@ -2,7 +2,27 @@
 //! inside a hidden one, does not exist for the model: every tool answers
 //! for it exactly as for a missing file.
 
+use std::cell::RefCell;
 use std::path::{Component, Path, PathBuf};
+
+thread_local! {
+    /// What was kept from the model on this thread, to tell the user.
+    static WITHHELD: RefCell<(Vec<String>, usize)> = const { RefCell::new((Vec::new(), 0)) };
+}
+
+/// What was kept from the model on this thread since the last call: the
+/// paths it asked for and was refused, and how many entries were left out
+/// of listings. For the user; the model never sees this.
+pub fn take_withheld() -> Option<String> {
+    let (paths, entries) = WITHHELD.with(|w| std::mem::take(&mut *w.borrow_mut()));
+    let mut parts = paths;
+    match entries {
+        0 => {}
+        1 => parts.push("1 entry left out of a listing".into()),
+        n => parts.push(format!("{n} entries left out of listings")),
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
 
 pub struct Access {
     cwd: PathBuf,
@@ -35,10 +55,25 @@ impl Access {
     pub fn resolve(&self, path: &str) -> Result<PathBuf, String> {
         let real = real(&self.cwd.join(path));
         if self.visible(&real) {
-            Ok(real)
-        } else {
-            Err(not_found(path))
+            return Ok(real);
         }
+        let why = if self.allowed.iter().any(|a| real.starts_with(a)) {
+            "hidden"
+        } else {
+            "outside the folders the agent may use"
+        };
+        WITHHELD.with(|w| w.borrow_mut().0.push(format!("{path} ({why})")));
+        Err(not_found(path))
+    }
+
+    /// Like `visible`, for entries of a listing: those left out are counted
+    /// for the user.
+    pub fn listed(&self, real: &Path) -> bool {
+        let shown = self.visible(real);
+        if !shown {
+            WITHHELD.with(|w| w.borrow_mut().1 += 1);
+        }
+        shown
     }
 
     /// Whether a real path may be shown to the model.
@@ -131,6 +166,26 @@ mod tests {
         assert!(a.resolve(base.join("outside/x").to_str().unwrap()).is_err());
         #[cfg(unix)]
         assert!(a.resolve("link/x").is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn tells_the_user_what_was_withheld() {
+        let (base, a) = tree("withheld");
+        take_withheld();
+        assert!(a.resolve("a.txt").is_ok());
+        assert_eq!(take_withheld(), None);
+        assert!(a.resolve("secret/key").is_err());
+        assert!(a.resolve("../outside/x").is_err());
+        assert!(!a.listed(&base.join("proj/secret")));
+        assert_eq!(
+            take_withheld().as_deref(),
+            Some(
+                "secret/key (hidden); ../outside/x (outside the folders the agent may use); \
+                 1 entry left out of a listing"
+            )
+        );
+        assert_eq!(take_withheld(), None);
         fs::remove_dir_all(base).unwrap();
     }
 

@@ -30,6 +30,16 @@ impl Input {
         self.text.is_empty()
     }
 
+    /// Puts earlier prompts before the history of this run.
+    pub fn add_older(&mut self, mut older: Vec<String>) {
+        older.dedup();
+        if self.hist.is_some() {
+            return;
+        }
+        older.append(&mut self.history);
+        self.history = older;
+    }
+
     /// Takes the text out for sending and remembers it in history.
     pub fn take(&mut self) -> String {
         let text = std::mem::take(&mut self.text);

@@ -2,6 +2,7 @@
 name = "agent"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -18,7 +19,7 @@ regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 unicode-width = "0.2.3"
-ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
+ureq = { version = "3.5.1", default-features = false, features = ["rustls", "socks-proxy"] }
 
 [profile.dev]
 debug = 0

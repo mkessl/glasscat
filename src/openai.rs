@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::Result;
 use crate::context::{Item, Reply, ToolCall, ToolSpec};
@@ -32,7 +32,15 @@ pub enum Prefill {
 }
 
 /// The exact request body. The bytes built here are the bytes sent.
-pub fn request_body(model: &str, items: &[Item], tools: &[ToolSpec], prefill: Prefill) -> Vec<u8> {
+/// The JSON body of a request. `extra` fields are set last, over what is
+/// built here; a `null` there removes the field.
+pub fn request_body(
+    model: &str,
+    items: &[Item],
+    tools: &[ToolSpec],
+    prefill: Prefill,
+    extra: &Map<String, Value>,
+) -> Vec<u8> {
     let mut messages: Vec<Value> = items.iter().map(message).collect();
     let continuing = prefill != Prefill::None
         && matches!(items.last(), Some(Item::Assistant(r)) if r.cut && !r.text.is_empty());
@@ -64,6 +72,15 @@ pub fn request_body(model: &str, items: &[Item], tools: &[ToolSpec], prefill: Pr
             })
             .collect();
         body["tools"] = Value::Array(tools);
+    }
+    if let Value::Object(fields) = &mut body {
+        for (k, v) in extra {
+            if v.is_null() {
+                fields.remove(k);
+            } else {
+                fields.insert(k.clone(), v.clone());
+            }
+        }
     }
     serde_json::to_vec(&body).expect("a JSON value always serializes")
 }
@@ -312,17 +329,19 @@ pub fn read_stream(
 pub fn send(
     base_url: &str,
     api_key: Option<&str>,
+    proxy: Option<&str>,
     body: &[u8],
     cancel: &AtomicBool,
 ) -> Result<Option<impl Read + Send + use<>>> {
     let (tx, rx) = mpsc::sync_channel(1);
-    let (url, key, body) = (
+    let (url, key, proxy, body) = (
         base_url.to_string(),
         api_key.map(str::to_string),
+        proxy.map(str::to_string),
         body.to_vec(),
     );
     std::thread::spawn(move || {
-        let _ = tx.send(post(&url, key.as_deref(), &body));
+        let _ = tx.send(post(&url, key.as_deref(), proxy.as_deref(), &body));
     });
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -345,19 +364,32 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(600);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
-fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+/// An HTTP client; with no proxy given, the usual `HTTPS_PROXY`,
+/// `ALL_PROXY` and `NO_PROXY` variables apply.
+fn agent(proxy: Option<&str>) -> Result<ureq::Agent> {
+    let mut config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_per_read(Some(READ_TIMEOUT))
-        .timeout_per_write(Some(WRITE_TIMEOUT))
-        .build()
-        .into()
+        .timeout_per_write(Some(WRITE_TIMEOUT));
+    if let Some(p) = proxy {
+        config = config.proxy(Some(parse_proxy(p)?));
+    }
+    Ok(config.build().into())
 }
 
-/// Fetches a JSON document; no key is sent.
-pub fn get_json(url: &str) -> Result<Value> {
-    let mut resp = agent().get(url).call()?;
+/// A proxy such as `socks5://127.0.0.1:1080` or `http://user:pass@host:8080`.
+pub fn parse_proxy(p: &str) -> Result<ureq::Proxy> {
+    ureq::Proxy::new(p).map_err(|e| format!("proxy {p}: {e}").into())
+}
+
+/// Fetches a JSON document.
+pub fn get_json(url: &str, api_key: Option<&str>, proxy: Option<&str>) -> Result<Value> {
+    let mut req = agent(proxy)?.get(url);
+    if let Some(key) = api_key {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+    let mut resp = req.call()?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.body_mut().read_to_string().unwrap_or_default();
@@ -371,22 +403,71 @@ pub fn get_json(url: &str) -> Result<Value> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn post(base_url: &str, api_key: Option<&str>, body: &[u8]) -> Result<ureq::BodyReader<'static>> {
-    let agent = agent();
+fn post(
+    base_url: &str,
+    api_key: Option<&str>,
+    proxy: Option<&str>,
+    body: &[u8],
+) -> Result<ureq::BodyReader<'static>> {
+    let agent = agent(proxy)?;
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let mut req = agent.post(&url).content_type("application/json");
     if let Some(key) = api_key {
         req = req.header("Authorization", format!("Bearer {key}"));
     }
-    let resp = req.send(body)?;
+    let resp = req.send(body).map_err(|e| match proxy {
+        Some(p) => format!("{url} through the proxy {p}: {e}"),
+        None => format!("{url}: {e}"),
+    })?;
     let status = resp.status();
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
+        .map(Duration::from_secs);
     let reader = resp.into_body().into_reader();
     if !status.is_success() {
         let mut text = String::new();
         reader.take(64 * 1024).read_to_string(&mut text).ok();
-        return Err(format!("{url}: HTTP {status}: {}", text.trim()).into());
+        return Err(Box::new(HttpError {
+            status: status.as_u16(),
+            retry_after,
+            message: format!("{url}: HTTP {status}: {}", text.trim()),
+        }));
     }
     Ok(reader)
+}
+
+/// A provider's answer with an error status.
+#[derive(Debug)]
+pub struct HttpError {
+    pub status: u16,
+    /// The wait the provider asked for, in whole seconds.
+    pub retry_after: Option<Duration>,
+    pub message: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+impl HttpError {
+    /// How long to wait before trying again, if the error may pass:
+    /// the provider's own wait if it gave one, else 2, 4, 8 seconds.
+    pub fn retry_wait(&self, attempt: u32) -> Option<Duration> {
+        if !matches!(self.status, 408 | 429 | 500 | 502 | 503 | 504 | 529) {
+            return None;
+        }
+        let wait = self
+            .retry_after
+            .unwrap_or(Duration::from_secs(2 << attempt.min(5)));
+        (wait <= Duration::from_secs(60)).then_some(wait)
+    }
 }
 
 #[cfg(test)]
@@ -411,8 +492,14 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{sse}",
             sse.len()
         ));
-        let body = request_body("m", &[Item::User("hi".into())], &[], Prefill::None);
-        let stream = send(&url, Some("k"), &body, &AtomicBool::new(false))
+        let body = request_body(
+            "m",
+            &[Item::User("hi".into())],
+            &[],
+            Prefill::None,
+            &Map::new(),
+        );
+        let stream = send(&url, Some("k"), None, &body, &AtomicBool::new(false))
             .unwrap()
             .unwrap();
         let out = read_stream(stream, &AtomicBool::new(false), |_| {});
@@ -438,7 +525,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(100));
                 cancel.store(true, Ordering::Relaxed);
             });
-            assert!(send(&url, None, b"{}", &cancel).unwrap().is_none());
+            assert!(send(&url, None, None, b"{}", &cancel).unwrap().is_none());
         });
         assert!(started.elapsed() < Duration::from_secs(2));
         drop(held.join());
@@ -451,7 +538,7 @@ mod tests {
             "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\n\r\n{msg}",
             msg.len()
         ));
-        let err = send(&url, None, b"{}", &AtomicBool::new(false))
+        let err = send(&url, None, None, b"{}", &AtomicBool::new(false))
             .err()
             .unwrap()
             .to_string();
@@ -495,8 +582,14 @@ mod tests {
             description: "Read a file".into(),
             parameters: json!({ "type": "object" }),
         }];
-        let body: Value =
-            serde_json::from_slice(&request_body("m", &items, &tools, Prefill::None)).unwrap();
+        let body: Value = serde_json::from_slice(&request_body(
+            "m",
+            &items,
+            &tools,
+            Prefill::None,
+            &Map::new(),
+        ))
+        .unwrap();
         assert_eq!(body["model"], "m");
         assert_eq!(body["stream"], true);
         let msgs = body["messages"].as_array().unwrap();
@@ -520,7 +613,8 @@ mod tests {
         };
         let last = |items: &[Item], prefill| {
             let body: Value =
-                serde_json::from_slice(&request_body("m", items, &[], prefill)).unwrap();
+                serde_json::from_slice(&request_body("m", items, &[], prefill, &Map::new()))
+                    .unwrap();
             body["messages"].as_array().unwrap().last().unwrap().clone()
         };
         let items = [Item::User("hi".into()), cut(true)];
@@ -537,8 +631,23 @@ mod tests {
     #[test]
     fn no_tools_key_without_tools() {
         let body: Value =
-            serde_json::from_slice(&request_body("m", &[], &[], Prefill::None)).unwrap();
+            serde_json::from_slice(&request_body("m", &[], &[], Prefill::None, &Map::new()))
+                .unwrap();
         assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn extra_fields_set_and_remove() {
+        let extra = json!({"temperature": 0.2, "stream_options": null, "model": "other"});
+        let Value::Object(extra) = extra else {
+            panic!()
+        };
+        let body: Value =
+            serde_json::from_slice(&request_body("m", &[], &[], Prefill::None, &extra)).unwrap();
+        assert_eq!(body["temperature"], 0.2);
+        assert_eq!(body["model"], "other");
+        assert!(body.get("stream_options").is_none());
+        assert_eq!(body["stream"], true);
     }
 
     #[test]

@@ -43,6 +43,18 @@ enum Msg {
     Done(Box<Session>, Option<String>),
     /// A result that arrived on its own, such as a policy lookup.
     Block(Block),
+    /// The context window of a model, looked up on the side.
+    Window(String, Option<u64>),
+    /// Prompts from earlier conversations held here, for the input history.
+    History(Vec<String>),
+}
+
+/// Where the provider is, for lookups made beside the conversation.
+#[derive(Clone)]
+struct Api {
+    base_url: String,
+    api_key: Option<String>,
+    proxy: Option<String>,
 }
 
 enum AgentMsg {
@@ -54,10 +66,12 @@ enum AgentMsg {
         name: String,
         args: String,
         result: String,
+        withheld: Option<String>,
     },
     Usage(Value),
     Served(Served),
     Timing(Option<Duration>, Duration),
+    Retrying(String, Duration, u32),
     StartedOver,
 }
 
@@ -82,6 +96,9 @@ struct App {
     served: Option<Served>,
     /// The last request's time to first token and in all.
     timing: Option<(Option<Duration>, Duration)>,
+    api: Api,
+    /// The model whose context window was looked up, and the window.
+    window: Option<(String, Option<u64>)>,
     cancel: Arc<AtomicBool>,
     tx: Sender<Msg>,
     /// Where the input was drawn: first screen row and first text row shown.
@@ -127,6 +144,11 @@ pub fn run(session: Session) -> Result<()> {
         }
     });
     let cwd = session.tools.cwd().display().to_string();
+    let api = Api {
+        base_url: session.base_url.clone(),
+        api_key: session.api_key.clone(),
+        proxy: session.proxy.clone(),
+    };
     let mut app = App {
         model: session.model.clone(),
         session: Some(Box::new(session)),
@@ -148,7 +170,20 @@ pub fn run(session: Session) -> Result<()> {
         kept_edit: None,
         served: None,
         timing: None,
+        api,
+        window: None,
     };
+    let model = app.model.clone();
+    app.look_up_window(&model);
+    let (dir, tx) = (
+        app.session.as_ref().map(|s| s.tools.cwd().to_path_buf()),
+        app.tx.clone(),
+    );
+    std::thread::spawn(move || {
+        if let Some(dir) = dir {
+            let _ = tx.send(Msg::History(crate::history::recent_prompts(&dir, 20)));
+        }
+    });
     app.transcript.push(Block::Info(format!(
         "{} · {} · /help lists commands and keys",
         crate::NAME,
@@ -222,6 +257,12 @@ impl App {
             Msg::Term(_) => {}
             Msg::Agent(a) => self.agent(a),
             Msg::Block(b) => self.transcript.push(b),
+            Msg::History(h) => self.input.add_older(h),
+            Msg::Window(model, n) => {
+                if self.window.as_ref().is_some_and(|w| w.0 == model) {
+                    self.window = Some((model, n));
+                }
+            }
             Msg::Done(session, err) => {
                 self.session = Some(session);
                 self.busy = None;
@@ -232,6 +273,25 @@ impl App {
                 self.hint_unanswered(cancelled);
             }
         }
+    }
+
+    /// Asks the provider for the context window of `model` on a thread,
+    /// unless that model's is known or on its way.
+    fn look_up_window(&mut self, model: &str) {
+        if self.window.as_ref().is_some_and(|w| w.0 == model) {
+            return;
+        }
+        self.window = Some((model.to_string(), None));
+        let (api, model, tx) = (self.api.clone(), model.to_string(), self.tx.clone());
+        std::thread::spawn(move || {
+            let n = crate::models::context_window(
+                &api.base_url,
+                api.api_key.as_deref(),
+                api.proxy.as_deref(),
+                &model,
+            );
+            let _ = tx.send(Msg::Window(model, n.ok().flatten()));
+        });
     }
 
     /// Opens the context in the user's editor and takes back the result.
@@ -344,12 +404,34 @@ impl App {
                 self.transcript.stream(&t, true);
             }
             AgentMsg::Calling(name) => self.busy = Some(format!("calling {name}")),
-            AgentMsg::Tool { name, args, result } => {
+            AgentMsg::Tool {
+                name,
+                args,
+                result,
+                withheld,
+            } => {
                 self.transcript.push(Block::Tool { name, args, result });
+                if let Some(w) = withheld {
+                    self.transcript
+                        .push(Block::Info(format!("Kept from the model: {w}.")));
+                }
             }
             AgentMsg::Usage(u) => self.usage = Some(u),
-            AgentMsg::Served(s) => self.served = Some(s),
+            AgentMsg::Served(s) => {
+                self.look_up_window(&s.model);
+                self.served = Some(s);
+            }
             AgentMsg::Timing(first, total) => self.timing = Some((first, total)),
+            AgentMsg::Retrying(error, wait, attempt) => {
+                let error = text::clip(error.lines().next().unwrap_or(""), 300);
+                self.transcript.push(Block::Info(format!(
+                    "{error}\nTrying again in {}s (try {} of {}); Esc stops.",
+                    wait.as_secs(),
+                    attempt + 1,
+                    crate::agent::RETRIES + 1
+                )));
+                self.busy = Some(format!("waiting {}s to try again", wait.as_secs()));
+            }
             AgentMsg::StartedOver => self.transcript.push(Block::Info(
                 "The model wrote the reply anew instead of continuing it; only the new one is kept.".into(),
             )),
@@ -398,20 +480,85 @@ impl App {
             "/model" => {
                 session.model = arg.to_string();
                 self.model = arg.to_string();
+                self.served = None;
+                self.look_up_window(arg);
                 self.transcript
                     .push(Block::Info(format!("The model is now {arg}.")));
             }
             "/edit" => self.edit_context(),
+            "/set" if arg.is_empty() => {
+                let sources = session.fields.sources(&session.model);
+                let text = if sources.is_empty() {
+                    "No request fields are set. /set NAME VALUE sets one for this session; \
+                     the settings file sets them for good."
+                        .to_string()
+                } else {
+                    let fields: Vec<String> = sources
+                        .iter()
+                        .map(|(k, v, from)| match v {
+                            Value::Null => format!("  {k}: left out, by {from}"),
+                            v => format!("  {k}: {v}, by {from}"),
+                        })
+                        .collect();
+                    format!("Set in every request:\n{}", fields.join("\n"))
+                };
+                self.transcript.push(Block::Info(text));
+            }
+            "/set" => {
+                let (key, value) = arg.split_once(' ').unwrap_or((arg, ""));
+                let value = value.trim();
+                let text = if value.is_empty() {
+                    session.fields.session.remove(key);
+                    let now = session.fields.sources(&session.model);
+                    match now.iter().find(|f| f.0 == key) {
+                        Some((_, v, from)) => format!("{key} is {v} again, by {from}."),
+                        None => format!("{key} is back to how {} sends it.", crate::NAME),
+                    }
+                } else {
+                    // JSON when it reads as JSON, otherwise a string.
+                    let value: Value =
+                        serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.into()));
+                    let text = if value.is_null() {
+                        format!("{key} is now left out of every request.")
+                    } else {
+                        format!("Every request now has {key}: {value}.")
+                    };
+                    session.fields.session.insert(key.to_string(), value);
+                    text
+                };
+                self.transcript.push(Block::Info(text));
+            }
+            "/copy" => {
+                let last = session.items.iter().rev().find_map(|i| match i {
+                    Item::Assistant(r) if !r.text.trim().is_empty() => Some(r.text.trim()),
+                    _ => None,
+                });
+                let Some(text) = last else {
+                    self.transcript
+                        .push(Block::Error("There is no reply to copy yet.".into()));
+                    return true;
+                };
+                // OSC 52: the terminal puts the text on the clipboard, also over SSH.
+                let mut out = io::stdout();
+                let _ = write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()));
+                let _ = out.flush();
+                self.transcript.push(Block::Info(format!(
+                    "Copied the last reply ({} characters) to the clipboard, if the terminal \
+                     allows it. In tmux that needs set-clipboard on.",
+                    text.chars().count()
+                )));
+            }
             "/provider" => {
                 let name = session.log.as_ref().map_or("unnamed", |l| l.1.as_str());
                 let base = session.base_url.clone();
+                let proxy = session.proxy.clone();
                 let mut text = format!("The provider is {name}, at {base}.");
                 match self.served.clone() {
                     Some(s) if crate::policy::known(&base) => {
                         text.push_str(" Asking OpenRouter about the last reply…");
                         let tx = self.tx.clone();
                         std::thread::spawn(move || {
-                            let b = match crate::policy::describe(&base, &s) {
+                            let b = match crate::policy::describe(&base, proxy.as_deref(), &s) {
                                 Ok(t) => Block::Info(t),
                                 Err(e) => Block::Error(format!("policy lookup failed: {e}")),
                             };
@@ -481,11 +628,22 @@ impl App {
                 Shown::Usage(u) => send(AgentMsg::Usage(u.clone())),
                 Shown::Served(s) => send(AgentMsg::Served(s.clone())),
                 Shown::Timing { first, total } => send(AgentMsg::Timing(first, total)),
+                Shown::Retrying {
+                    error,
+                    wait,
+                    attempt,
+                } => send(AgentMsg::Retrying(error.into(), wait, attempt)),
                 Shown::StartedOver => send(AgentMsg::StartedOver),
-                Shown::ToolDone { name, args, result } => send(AgentMsg::Tool {
+                Shown::ToolDone {
+                    name,
+                    args,
+                    result,
+                    withheld,
+                } => send(AgentMsg::Tool {
                     name: name.into(),
                     args: args.into(),
                     result: result.into(),
+                    withheld: withheld.map(Into::into),
                 }),
             };
             let r = match prompt {
@@ -682,7 +840,8 @@ impl App {
             left = format!("{left} · {b}");
         }
         // On a narrow screen the timing goes first, then the usage.
-        let usage = usage_text(self.usage.as_ref());
+        let window = self.window.as_ref().and_then(|w| w.1);
+        let usage = usage_text(self.usage.as_ref(), window);
         let timing = timing_text(self.timing, self.usage.as_ref());
         let right = [
             format!("{usage}{timing}ctrl+t context "),
@@ -790,6 +949,11 @@ const COMMANDS: &[(&str, &str)] = &[
         "/edit",
         "edit the whole context in $EDITOR before the next request",
     ),
+    ("/copy", "copy the last reply to the clipboard"),
+    (
+        "/set",
+        "request fields; /set NAME VALUE sets one (null leaves it out), /set NAME unsets",
+    ),
     (
         "/provider",
         "who ran the last reply, and what they publish about your data",
@@ -812,6 +976,10 @@ const KEYS: &[(&str, &str)] = &[
         "move between lines and through earlier messages",
     ),
     ("PageUp, PageDown, wheel", "scroll"),
+    (
+        "Shift+drag",
+        "select text in most terminals; /copy copies a whole reply",
+    ),
     ("Ctrl+A, Ctrl+E", "start, end of line"),
     (
         "Ctrl+U, Ctrl+K, Ctrl+W",
@@ -820,19 +988,23 @@ const KEYS: &[(&str, &str)] = &[
 ];
 
 fn help() -> String {
+    let width = |t: &[(&str, &str)]| t.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let (cw, kw) = (width(COMMANDS), width(KEYS));
     let mut out = String::from("Commands\n");
     for (name, what) in COMMANDS {
-        out += &format!("  {name:<8} {what}\n");
+        out += &format!("  {name:<cw$}  {what}\n");
     }
     out += "\nKeys\n";
     for (key, what) in KEYS {
-        out += &format!("  {key:<32} {what}\n");
+        out += &format!("  {key:<kw$}  {what}\n");
     }
     out.trim_end().to_string()
 }
 
 /// Tokens and cost from the provider's usage report.
-fn usage_text(u: Option<&Value>) -> String {
+/// `in 1200/128k (1000 cached) · out 30 · $0.0001`; the window is the
+/// model's context window, when the provider says.
+fn usage_text(u: Option<&Value>, window: Option<u64>) -> String {
     let Some(u) = u else { return String::new() };
     let n = |k: &str| u.get(k).and_then(Value::as_u64);
     let mut parts = Vec::new();
@@ -840,9 +1012,10 @@ fn usage_text(u: Option<&Value>) -> String {
         let cached = u
             .pointer("/prompt_tokens_details/cached_tokens")
             .and_then(Value::as_u64);
+        let of = window.map(|w| format!("/{}", short(w))).unwrap_or_default();
         match cached {
-            Some(c) if c > 0 => parts.push(format!("in {p} ({c} cached)")),
-            _ => parts.push(format!("in {p}")),
+            Some(c) if c > 0 => parts.push(format!("in {p}{of} ({c} cached)")),
+            _ => parts.push(format!("in {p}{of}")),
         }
     }
     if let Some(c) = n("completion_tokens") {
@@ -855,6 +1028,43 @@ fn usage_text(u: Option<&Value>) -> String {
         return String::new();
     }
     parts.join(" · ") + " · "
+}
+
+/// Standard base64 with padding.
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ABC[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// A token count in a few characters: 950, 8.2k, 131k, 1M, 1.5M.
+fn short(n: u64) -> String {
+    let f = |v: f64, unit: &str| {
+        let s = if v < 10.0 {
+            format!("{v:.1}")
+        } else {
+            format!("{v:.0}")
+        };
+        format!("{}{unit}", s.trim_end_matches(".0"))
+    };
+    match n {
+        0..1000 => n.to_string(),
+        1000..1_000_000 => f(n as f64 / 1000.0, "k"),
+        _ => f(n as f64 / 1_000_000.0, "M"),
+    }
 }
 
 /// `first 0.4s · 2.1s · 52 tok/s`: time to the first token, in all, and
@@ -950,10 +1160,24 @@ mod tests {
         let u = json!({"prompt_tokens": 1200, "completion_tokens": 30, "cost": 0.00012,
                        "prompt_tokens_details": {"cached_tokens": 1000}});
         assert_eq!(
-            usage_text(Some(&u)),
-            "in 1200 (1000 cached) · out 30 · $0.0001 · "
+            usage_text(Some(&u), Some(131_072)),
+            "in 1200/131k (1000 cached) · out 30 · $0.0001 · "
         );
-        assert_eq!(usage_text(None), "");
+        assert_eq!(usage_text(None, None), "");
+        let shorts: Vec<String> = [950, 8192, 131_072, 1_000_000, 1_500_000]
+            .into_iter()
+            .map(short)
+            .collect();
+        assert_eq!(shorts, ["950", "8.2k", "131k", "1M", "1.5M"]);
+    }
+
+    #[test]
+    fn base64_matches_the_standard() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64("héllo wörld".as_bytes()), "aMOpbGxvIHfDtnJsZA==");
     }
 
     #[test]

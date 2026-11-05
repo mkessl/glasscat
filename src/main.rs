@@ -3,6 +3,7 @@ mod agent;
 mod context;
 mod history;
 mod journal;
+mod models;
 mod openai;
 mod policy;
 mod provider;
@@ -33,6 +34,7 @@ streams the answer to stdout; tool calls go to stderr.
   --model ID        model id (default: the provider's default)
   --allow PATH      let the model see PATH too (the current directory always)
   --hide PATH       PATH does not exist for the model; repeatable
+  --proxy URL       send requests through URL (socks5://, http://)
   --show-request    print each exact request body to stderr before sending";
 
 struct Args {
@@ -41,6 +43,7 @@ struct Args {
     model: Option<String>,
     allow: Vec<PathBuf>,
     hide: Vec<PathBuf>,
+    proxy: Option<String>,
     show_request: bool,
     prompt: Option<String>,
 }
@@ -52,6 +55,7 @@ fn parse_args() -> Result<Args> {
         model: None,
         allow: Vec::new(),
         hide: Vec::new(),
+        proxy: None,
         show_request: false,
         prompt: None,
     };
@@ -69,6 +73,7 @@ fn parse_args() -> Result<Args> {
             "--model" => args.model = Some(value()?),
             "--allow" => args.allow.push(value()?.into()),
             "--hide" => args.hide.push(value()?.into()),
+            "--proxy" => args.proxy = Some(value()?),
             "--show-request" => args.show_request = true,
             "--" => words.extend(it.by_ref()),
             s if s.starts_with("--") => {
@@ -93,6 +98,8 @@ fn usage() -> String {
 fn run() -> Result<()> {
     let args = parse_args()?;
     let settings = settings::load()?;
+    let instruction_files = settings.instruction_files();
+    let model_settings = settings.models.clone();
     let cwd = std::env::current_dir()?;
     let (saved, log) = if args.resume {
         let path =
@@ -132,9 +139,25 @@ fn run() -> Result<()> {
     let access = access::Access::new(&cwd, &allowed, &hidden)?;
     let tools = tools::Tools::new(access, journal::Journal::for_session());
     let mut session = agent::Session::new(provider.base_url, model, key, provider.prefill, tools);
+    session.proxy = args.proxy.or(provider.proxy);
+    session.fields.settings = provider.request;
+    session.fields.models = model_settings
+        .into_iter()
+        .map(|(id, m)| (id, m.request))
+        .collect();
+    if let Some(p) = &session.proxy {
+        openai::parse_proxy(p)?;
+    }
     session.log = Some((log, name));
     if let Some(saved) = saved {
         session.items = saved.items;
+    } else {
+        let path = settings::dir().join("AGENTS.md");
+        let user = std::fs::read_to_string(&path)
+            .ok()
+            .map(|t| (path.display().to_string(), t));
+        let project = session.tools.read_visible(&instruction_files);
+        session.add_instructions(user, project);
     }
     let Some(prompt) = args.prompt else {
         use std::io::IsTerminal;
@@ -165,7 +188,12 @@ fn run() -> Result<()> {
                 at_line_start = t.ends_with('\n');
                 out.write_all(t.as_bytes()).and_then(|_| out.flush())
             }
-            agent::Shown::ToolDone { name, args, result } => {
+            agent::Shown::ToolDone {
+                name,
+                args,
+                result,
+                withheld,
+            } => {
                 fresh = true;
                 if !at_line_start {
                     at_line_start = true;
@@ -178,8 +206,19 @@ fn run() -> Result<()> {
                 } else {
                     String::new()
                 };
-                writeln!(std::io::stderr(), "› {name} {args}\n  {first}{more}")
+                let withheld = withheld
+                    .map(|w| format!("\n  kept from the model: {w}"))
+                    .unwrap_or_default();
+                writeln!(
+                    std::io::stderr(),
+                    "› {name} {args}\n  {first}{more}{withheld}"
+                )
             }
+            agent::Shown::Retrying { error, wait, .. } => writeln!(
+                std::io::stderr(),
+                "{error}\ntrying again in {}s",
+                wait.as_secs()
+            ),
             _ => Ok(()),
         };
         if let Err(e) = r {

@@ -41,19 +41,24 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
   model gets next.
 - **Stop and continue.** <kbd>Esc</kbd> stops a reply at once and keeps what was written.
   <kbd>Enter</kbd> on an empty line picks it up again. Where the provider allows it, the reply
-  continues from its last token instead of starting over.
+  continues from its last token instead of starting over. Errors that may pass, such as rate
+  limits and overloaded servers, are retried up to three times, in plain view.
 - **File tools**: read, list, find, search, write, edit and delete. Several reads run at the same time.
   Edits keep a file's line endings and byte order mark.
 - **Undo.** Every change the agent makes is written to a journal. `/undo` takes changes back
   one at a time, and leaves alone a file you changed yourself in the meantime.
+- **Instructions.** `AGENTS.md` in the working directory and your own
+  `~/.config/glasscat/AGENTS.md` go into the system prompt of a new conversation, where
+  <kbd>Ctrl</kbd>+<kbd>T</kbd> shows them. A hidden `AGENTS.md` stays out.
 - **Hidden paths.** Paths given with `--hide` do not exist as far as the model can tell. It
   gets the same answer as for a missing file. Nothing outside the working directory and the
-  folders you allow can be reached, through symlinks or `..` either.
+  folders you allow can be reached, through symlinks or `..` either. You are told each time
+  something was kept from the model, and why.
 - **Reasoning** from thinking models streams in, then folds away; <kbd>Ctrl</kbd>+<kbd>O</kbd>
   opens it.
 - **Markdown** in replies is rendered: headings, lists, quotes, code, bold and italic.
-- **Usage, cost and speed** of each request in the status bar: cache hits, time to the first
-  token, and tokens per second.
+- **Usage, cost and speed** of each request in the status bar: the context used out of the
+  model's window, cache hits, time to the first token, and tokens per second.
 
 ## Build
 
@@ -84,6 +89,7 @@ glasscat -c                               # pick up the last conversation held h
 | `--model <id>` | the model to use; each provider has a default |
 | `--allow <dir>` | another folder the agent may work in (repeatable) |
 | `--hide <path>` | a path the model must not see (repeatable) |
+| `--proxy <url>` | send requests through a proxy: `socks5://host:port`, `http://user:pass@host:port` |
 | `--show-request` | print each exact request to stderr |
 
 Inside a session:
@@ -91,13 +97,17 @@ Inside a session:
 | Key or command | Does |
 | --- | --- |
 | <kbd>Enter</kbd> | send; on an empty line, continue a reply that did not finish |
-| <kbd>Shift</kbd>+<kbd>Enter</kbd> or <kbd>Ctrl</kbd>+<kbd>J</kbd> | new line |
+| <kbd>Shift</kbd>+<kbd>Enter</kbd>, <kbd>Alt</kbd>+<kbd>Enter</kbd> or <kbd>Ctrl</kbd>+<kbd>J</kbd> | new line |
+| <kbd>↑</kbd> <kbd>↓</kbd> | earlier messages, also from past conversations held here |
 | <kbd>Esc</kbd> | stop the reply |
 | <kbd>Ctrl</kbd>+<kbd>T</kbd> | the exact context sent to the model |
 | <kbd>Ctrl</kbd>+<kbd>O</kbd> | show or fold reasoning |
+| <kbd>Shift</kbd>+drag | select text (in most terminals) |
 | `/model <id>` | switch the model |
 | `/undo` | undo the agent's last file change |
 | `/edit` | change the context in `$EDITOR` before the next request |
+| `/copy` | copy the last reply to the clipboard |
+| `/set <name> <value>` | set a request field for this session, such as `temperature 0.3`; `/set` lists them |
 | `/provider` | who ran the last reply, and what they publish about your data |
 | `/clear` | start a new conversation |
 | `/help` | all commands and keys |
@@ -143,11 +153,17 @@ server under `providers`:
 | Field | Meaning |
 | --- | --- |
 | `provider`, `model` | used when none is given |
-| `providers` | more providers by name, or changes to built-in ones: `base_url`, `model`, `key_env` (the variable holding the key), `prefill` |
+| `providers` | more providers by name, or changes to built-in ones: `base_url`, `model`, `key_env` (the variable holding the key), `prefill`, `proxy`, `request` |
 | `allow`, `hide` | like `--allow` and `--hide`, added to them |
+| `request` | fields set in every request body, such as `temperature` or `reasoning`; `null` removes one |
+| `models` | settings for one model by its id; for now its own `request` fields, over the others |
+| `instructions` | files in the working directory added to the system prompt (default `["AGENTS.md"]`) |
+| `proxy` | a proxy for every provider; a provider's own `proxy` wins, and `--proxy` wins over both |
 
 `prefill` says how the server continues a cut-off reply: `plain` (a trailing assistant
 message), `prefix` or `partial` (that flag on the message), or `none` to ask again.
+
+With no proxy set, the usual `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` variables apply.
 
 ## What you can see
 
@@ -157,7 +173,9 @@ message), `prefix` or `partial` (that flag on the message), or `none` to ask aga
 | The exact bytes of each request | <kbd>Ctrl</kbd>+<kbd>T</kbd>, then <kbd>r</kbd>; or `--show-request` |
 | Size of each part of the context | <kbd>Ctrl</kbd>+<kbd>T</kbd> |
 | The whole context, to change as you like | `/edit` |
+| What a tool kept from the model, and why | under the tool call |
 | Tokens in and out, cache hits, cost | status bar |
+| How much of the model's context window is used | status bar, when the provider's model list says |
 | Time to the first token, time in all, output speed | status bar |
 | Which model and provider ran each reply | status bar, when a router such as OpenRouter says |
 | That provider's quantization, data retention, location and privacy policy | `/provider` (OpenRouter) |

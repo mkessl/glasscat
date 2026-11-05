@@ -227,6 +227,27 @@ impl Tools {
         self.access.cwd()
     }
 
+    /// The text of each of these files in the working directory that
+    /// exists and is not hidden, with the path as shown to the model.
+    pub fn read_visible(&self, names: &[String]) -> Vec<(String, String)> {
+        names
+            .iter()
+            .filter_map(|name| {
+                let real = self.access.resolve(name).ok()?;
+                let text = fs::read_to_string(&real).ok()?;
+                Some((self.access.show(&real), text))
+            })
+            .collect()
+    }
+
+    /// Runs a tool; returns what the model gets back, and for the user,
+    /// what was kept from the model.
+    pub fn run_noting(&self, name: &str, args: &str) -> (String, Option<String>) {
+        crate::access::take_withheld();
+        let result = self.run(name, args);
+        (result, crate::access::take_withheld())
+    }
+
     /// Runs a tool and returns what the model gets back.
     pub fn run(&self, name: &str, args: &str) -> String {
         let args: Value = if args.trim().is_empty() {
@@ -304,7 +325,7 @@ impl Tools {
         })?;
         let mut names: Vec<String> = entries
             .flatten()
-            .filter(|e| self.access.visible(&e.path()))
+            .filter(|e| self.access.listed(&e.path()))
             .map(|e| {
                 let mut name = e.file_name().to_string_lossy().into_owned();
                 if e.file_type().is_ok_and(|t| t.is_dir()) {
@@ -577,7 +598,7 @@ impl Tools {
             .flatten()
             .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
             .map(|e| e.into_path())
-            .filter(|p| self.access.visible(p))
+            .filter(|p| self.access.listed(p))
             .collect())
     }
 }

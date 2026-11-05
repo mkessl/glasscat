@@ -45,6 +45,41 @@ pub fn latest(cwd: &Path) -> Option<PathBuf> {
         .max_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
 }
 
+/// What the user wrote in the last `files` conversations held in `cwd`,
+/// oldest first, without the agent's bracketed notes in front.
+pub fn recent_prompts(cwd: &Path, files: usize) -> Vec<String> {
+    let Ok(dir) = fs::read_dir(dir_for(cwd)) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<(std::time::SystemTime, PathBuf)> = dir
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|p| Some((fs::metadata(&p).and_then(|m| m.modified()).ok()?, p)))
+        .collect();
+    paths.sort();
+    let start = paths.len().saturating_sub(files);
+    let mut out = Vec::new();
+    for (_, p) in &paths[start..] {
+        let Ok(saved) = load(p) else { continue };
+        for item in saved.items {
+            if let Item::User(text) = item {
+                out.push(without_notes(&text).to_string());
+            }
+        }
+    }
+    out
+}
+
+/// A prompt without the `[...]` note lines the agent put in front of it.
+fn without_notes(text: &str) -> &str {
+    if let Some((head, rest)) = text.split_once("\n\n")
+        && head.lines().all(|l| l.starts_with('[') && l.ends_with(']'))
+    {
+        return rest;
+    }
+    text
+}
+
 pub fn save(path: &Path, saved: &Saved) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
@@ -94,6 +129,12 @@ mod tests {
         save(&path, &saved).unwrap();
         assert_eq!(load(&path).unwrap(), saved);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn prompts_without_notes() {
+        assert_eq!(without_notes("[The user undid it.]\n\nfix it"), "fix it");
+        assert_eq!(without_notes("plain\n\ntext"), "plain\n\ntext");
     }
 
     #[test]

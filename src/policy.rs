@@ -14,7 +14,7 @@ pub fn known(base_url: &str) -> bool {
 }
 
 /// What OpenRouter publishes about the provider that served `s`.
-pub fn describe(base_url: &str, s: &Served) -> Result<String> {
+pub fn describe(base_url: &str, proxy: Option<&str>, s: &Served) -> Result<String> {
     let Some(provider) = &s.provider else {
         return Ok(format!(
             "The reply came from {}; the stream did not say which provider ran it.",
@@ -22,9 +22,9 @@ pub fn describe(base_url: &str, s: &Served) -> Result<String> {
         ));
     };
     let base = base_url.trim_end_matches('/');
-    let endpoints = get_json(&format!("{base}/models/{}/endpoints", s.model))?;
-    let providers = get_json(&format!("{base}/providers"))?;
-    let zdr = get_json(&format!("{base}/endpoints/zdr"))?;
+    let endpoints = get_json(&format!("{base}/models/{}/endpoints", s.model), None, proxy)?;
+    let providers = get_json(&format!("{base}/providers"), None, proxy)?;
+    let zdr = get_json(&format!("{base}/endpoints/zdr"), None, proxy)?;
     Ok(lines(&s.model, provider, &endpoints, &providers, &zdr))
 }
 
