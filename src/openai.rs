@@ -433,7 +433,13 @@ fn post(
         return Err(Box::new(HttpError {
             status: status.as_u16(),
             retry_after,
-            message: format!("{url}: HTTP {status}: {}", text.trim()),
+            message: match status.as_u16() {
+                401 => format!(
+                    "{url}: HTTP {status}: {}\nThe provider refused the API key, or got none.",
+                    text.trim()
+                ),
+                _ => format!("{url}: HTTP {status}: {}", text.trim()),
+            },
         }));
     }
     Ok(reader)

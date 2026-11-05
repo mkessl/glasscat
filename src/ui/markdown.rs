@@ -1,6 +1,6 @@
 //! The markdown models write, laid out for the terminal: headings, lists,
-//! quotes, rules, code blocks, and `code`, **bold** and *italic* inside
-//! lines. Anything else stays as written.
+//! quotes, rules, code blocks, tables, and `code`, **bold** and *italic*
+//! inside lines. Anything else stays as written.
 
 use crossterm::style::Color;
 
@@ -14,8 +14,28 @@ const QUOTE: Style = Style::dim();
 pub fn lines(text: &str, width: usize) -> Vec<Line> {
     let mut out = Vec::new();
     let mut fence: Option<String> = None;
-    for line in text.trim_end().split('\n') {
-        let line = line.strip_suffix('\r').unwrap_or(line);
+    let all: Vec<&str> = text
+        .trim_end()
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+    let mut i = 0;
+    while i < all.len() {
+        let line = all[i];
+        i += 1;
+        if fence.is_none()
+            && line.contains('|')
+            && let Some(align) = all.get(i).and_then(|l| table_rule(l))
+        {
+            let mut rows = vec![cells(line)];
+            i += 1;
+            while i < all.len() && all[i].contains('|') && !all[i].trim().is_empty() {
+                rows.push(cells(all[i]));
+                i += 1;
+            }
+            table(&mut out, &rows, &align, width);
+            continue;
+        }
         let trimmed = line.trim_start();
         if let Some(open) = &fence {
             if trimmed.starts_with(open.as_str())
@@ -88,6 +108,151 @@ fn block(out: &mut Vec<Line>, first: &str, next: &str, spans: Vec<Span>, width: 
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+/// The line under a table's header, `|---|:-:|--:|`: how each column is
+/// aligned.
+fn table_rule(s: &str) -> Option<Vec<Align>> {
+    if !s.contains('-') {
+        return None;
+    }
+    cells(s)
+        .iter()
+        .map(|c| {
+            let dashes = c.trim_matches(':');
+            if dashes.is_empty() || !dashes.chars().all(|c| c == '-') {
+                return None;
+            }
+            Some(match (c.starts_with(':'), c.ends_with(':')) {
+                (true, true) => Align::Center,
+                (false, true) => Align::Right,
+                _ => Align::Left,
+            })
+        })
+        .collect()
+}
+
+/// The cells of a table row; `\|` is a pipe inside a cell.
+fn cells(s: &str) -> Vec<String> {
+    let s = s.trim();
+    let s = s.strip_prefix('|').unwrap_or(s);
+    let s = s
+        .strip_suffix('|')
+        .filter(|r| !r.ends_with('\\'))
+        .unwrap_or(s);
+    let mut out = vec![String::new()];
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'|') => {
+                out.last_mut().expect("never empty").push('|');
+                chars.next();
+            }
+            '|' => out.push(String::new()),
+            c => out.last_mut().expect("never empty").push(c),
+        }
+    }
+    out.iter().map(|c| c.trim().to_string()).collect()
+}
+
+/// A table in columns as wide as their text, narrowed to `width` by
+/// wrapping the widest cells.
+fn table(out: &mut Vec<Line>, rows: &[Vec<String>], align: &[Align], width: usize) {
+    const SEP: &str = " │ ";
+    let n = align.len();
+    let grid: Vec<Vec<Vec<Span>>> = rows
+        .iter()
+        .enumerate()
+        .map(|(r, row)| {
+            let base = if r == 0 {
+                Style::default().bold()
+            } else {
+                Style::default()
+            };
+            (0..n)
+                .map(|c| inline(row.get(c).map_or("", String::as_str), base))
+                .collect()
+        })
+        .collect();
+    let span_width = |s: &[Span]| s.iter().map(|(t, _)| super::text::width(t)).sum::<usize>();
+    let natural: Vec<usize> = (0..n)
+        .map(|c| {
+            grid.iter()
+                .map(|r| span_width(&r[c]))
+                .max()
+                .unwrap_or(0)
+                .max(1)
+        })
+        .collect();
+    let room = width.saturating_sub(super::text::width(SEP) * n.saturating_sub(1));
+    if room < n * 3 {
+        // Too narrow for columns: the rows as written.
+        for row in rows {
+            block(
+                out,
+                "",
+                "",
+                inline(&row.join(" | "), Style::default()),
+                width,
+            );
+        }
+        return;
+    }
+    // Narrow columns keep their width; the rest share what is left.
+    let mut widths = natural.clone();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&c| natural[c]);
+    let mut left = room;
+    for (k, &c) in order.iter().enumerate() {
+        let fair = left / (n - k);
+        widths[c] = natural[c].min(fair);
+        left -= widths[c];
+    }
+    let rule = |out: &mut Vec<Line>| {
+        let parts: Vec<String> = widths.iter().map(|&w| "─".repeat(w)).collect();
+        out.push(Line::new(parts.join("─┼─"), Style::dim()));
+    };
+    for (r, row) in grid.iter().enumerate() {
+        let wrapped: Vec<Vec<Vec<Span>>> = row
+            .iter()
+            .zip(&widths)
+            .map(|(cell, &w)| wrap_spans(cell, w))
+            .collect();
+        let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+        for l in 0..height {
+            let mut line: Vec<Span> = Vec::new();
+            for c in 0..n {
+                if c > 0 {
+                    line.push((SEP.into(), Style::dim()));
+                }
+                let piece = wrapped[c].get(l).cloned().unwrap_or_default();
+                let gap = widths[c].saturating_sub(span_width(&piece));
+                let (before, after) = match align[c] {
+                    Align::Left => (0, gap),
+                    Align::Right => (gap, 0),
+                    Align::Center => (gap / 2, gap - gap / 2),
+                };
+                if before > 0 {
+                    line.push((" ".repeat(before), Style::default()));
+                }
+                line.extend(piece);
+                if after > 0 && c + 1 < n {
+                    line.push((" ".repeat(after), Style::default()));
+                }
+            }
+            out.push(Line { spans: line });
+        }
+        if r == 0 {
+            rule(out);
+        }
+    }
+}
+
 fn fence_marker(s: &str) -> Option<String> {
     for c in ['`', '~'] {
         let n = s.chars().take_while(|&x| x == c).count();
@@ -129,7 +294,8 @@ fn list_item(s: &str) -> Option<(String, &str)> {
     None
 }
 
-/// `code`, **bold**, __bold__ and *italic* in one line of text.
+/// `code`, **bold**, __bold__, *italic* and [links](url) in one line of
+/// text; a link shows its text, then its address dimmed.
 fn inline(s: &str, base: Style) -> Vec<Span> {
     let mut out: Vec<Span> = Vec::new();
     let mut push = |text: &str, style: Style| match out.last_mut() {
@@ -167,6 +333,16 @@ fn inline(s: &str, base: Style) -> Vec<Span> {
             rest = &rest[ticks..];
             continue;
         }
+        if c == '['
+            && let Some((text, url, len)) = link(rest)
+        {
+            push(text, style(bold, italic).underline());
+            if url != text {
+                push(&format!(" ({url})"), Style::dim());
+            }
+            rest = &rest[len..];
+            continue;
+        }
         let toggles = |m: &str, on: bool, rest: &str| -> bool {
             let after = &rest[m.len()..];
             if on {
@@ -194,6 +370,21 @@ fn inline(s: &str, base: Style) -> Vec<Span> {
     out
 }
 
+/// `[text](url)` at the start of `s`: the text, the address, and the
+/// length of the whole.
+fn link(s: &str) -> Option<(&str, &str, usize)> {
+    let close = s.find("](")?;
+    let text = &s[1..close];
+    let after = &s[close + 2..];
+    let end = after.find(')')?;
+    let url = &after[..end];
+    (!text.is_empty() && !text.contains('[') && !url.contains(char::is_whitespace)).then_some((
+        text,
+        url,
+        close + 2 + end + 1,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +409,35 @@ mod tests {
             ]
         );
         assert_eq!(inline("snake_case_name", Style::default()).len(), 1);
+        let l: String = inline(
+            "see [the docs](https://d.x) or [a](b c) [u](u)",
+            Style::default(),
+        )
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
+        assert_eq!(l, "see the docs (https://d.x) or [a](b c) u");
+    }
+
+    #[test]
+    fn tables() {
+        let md = "| Tool | What |\n|---|--:|\n| `read` | reads a file |\n| a \\| b | 2 |";
+        assert_eq!(
+            texts(md, 40),
+            [
+                "Tool  │         What",
+                "──────┼─────────────",
+                "read  │ reads a file",
+                "a | b │            2",
+            ]
+        );
+        // Narrower than the table: the widest column wraps.
+        assert_eq!(
+            texts("|a|b|\n|-|-|\n|x|one two three|", 12),
+            ["a │ b", "──┼─────────", "x │ one two", "  │ three"]
+        );
+        // A pipe without a rule under it is plain text.
+        assert_eq!(texts("a | b", 20), ["a | b"]);
     }
 
     #[test]

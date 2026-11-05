@@ -24,7 +24,8 @@ const SEARCH_LINE_CHARS: usize = 300;
 const SEARCH_FILE_MAX: u64 = 10 * 1024 * 1024;
 
 pub struct Tools {
-    access: Access,
+    /// What the model may see; the user may change it as it runs.
+    pub access: Access,
     journal: Journal,
     /// This run's changes, last at the end, for /undo.
     changes: Mutex<Vec<Change>>,
@@ -184,10 +185,11 @@ impl Tools {
     }
 
     /// Adds the user's own tools; none may take a built-in tool's name.
-    pub fn with_custom(
-        mut self,
+    /// Puts in the user's own tools, in place of any before.
+    pub fn set_custom(
+        &mut self,
         custom: std::collections::BTreeMap<String, CustomTool>,
-    ) -> Result<Self, String> {
+    ) -> Result<(), String> {
         let builtin = specs();
         if let Some(name) = custom
             .keys()
@@ -198,7 +200,7 @@ impl Tools {
             ));
         }
         self.custom = custom;
-        Ok(self)
+        Ok(())
     }
 
     /// The definitions given to the model: built-in tools, then the user's.

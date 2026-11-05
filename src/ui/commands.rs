@@ -10,23 +10,35 @@ use crate::context::Item;
 
 impl App {
     /// Runs the input as a command when it names one; false otherwise.
+    /// What a command only shows opens in a panel that leaves the chat
+    /// where it was; what it does goes into the chat, scrolled down.
     pub(super) fn command(&mut self) -> bool {
         let text = self.input.text().trim().to_string();
         let (name, arg) = text.split_once(' ').unwrap_or((&text, ""));
-        let arg = arg.trim();
         if !COMMANDS.iter().any(|(n, _)| *n == name) {
             return false;
         }
         self.input.take();
-        self.scroll = 0;
+        self.panel = None;
+        self.run_command(name, arg.trim());
+        if self.panel.is_none() {
+            self.scroll = 0;
+        }
+        true
+    }
+
+    fn show(&mut self, text: String) {
+        self.panel = Some((text, 0));
+    }
+
+    fn run_command(&mut self, name: &str, arg: &str) {
         if name == "/help" {
-            self.transcript.push(Block::Info(help()));
-            return true;
+            return self.show(help());
         }
         let Some(session) = self.session.as_mut() else {
             self.transcript
                 .push(Block::Error("Still working; Esc stops it first.".into()));
-            return true;
+            return;
         };
         match name {
             "/clear" => {
@@ -35,13 +47,17 @@ impl App {
                 self.usage = None;
                 self.served = None;
                 self.timing = None;
+                self.cache_last = None;
                 self.last_request.clear();
                 self.transcript
                     .push(Block::Info("A new conversation.".into()));
             }
             "/model" if arg.is_empty() => {
-                self.transcript
-                    .push(Block::Info(format!("The model is {}.", session.model)));
+                let text = format!(
+                    "The model is {}. /model ID switches to another; /models WORDS finds ids.",
+                    session.model
+                );
+                self.show(text);
             }
             "/model" => {
                 session.model = arg.to_string();
@@ -52,6 +68,7 @@ impl App {
                     .push(Block::Info(format!("The model is now {arg}.")));
             }
             "/edit" => self.edit_context(),
+            "/settings" => self.edit_settings(),
             "/models" => {
                 let (api, filter, tx) = (self.api.clone(), arg.to_string(), self.tx.clone());
                 std::thread::spawn(move || {
@@ -67,6 +84,7 @@ impl App {
                     };
                     let _ = tx.send(Msg::Block(block));
                 });
+                self.show("Asking the provider for its models…".into());
             }
             "/set" if arg.is_empty() => {
                 let sources = session.fields.sources(&session.model);
@@ -84,7 +102,7 @@ impl App {
                         .collect();
                     format!("Set in every request:\n{}", fields.join("\n"))
                 };
-                self.transcript.push(Block::Info(text));
+                self.show(text);
             }
             "/set" => {
                 let (key, value) = arg.split_once(' ').unwrap_or((arg, ""));
@@ -118,7 +136,7 @@ impl App {
                 let Some(text) = last else {
                     self.transcript
                         .push(Block::Error("There is no reply to copy yet.".into()));
-                    return true;
+                    return;
                 };
                 // OSC 52: the terminal puts the text on the clipboard, also over SSH.
                 let mut out = io::stdout();
@@ -137,11 +155,12 @@ impl App {
                 let mut text = format!("The provider is {name}, at {base}.");
                 match self.served.clone() {
                     Some(s) if crate::policy::known(&base) => {
-                        text.push_str(" Asking OpenRouter about the last reply…");
                         let tx = self.tx.clone();
+                        let first = text.clone();
+                        text.push_str(" Asking OpenRouter about the last reply…");
                         std::thread::spawn(move || {
                             let b = match crate::policy::describe(&base, proxy.as_deref(), &s) {
-                                Ok(t) => Block::Info(t),
+                                Ok(t) => Block::Info(format!("{first}\n\n{t}")),
                                 Err(e) => Block::Error(format!("policy lookup failed: {e}")),
                             };
                             let _ = tx.send(Msg::Block(b));
@@ -161,9 +180,12 @@ impl App {
                         crate::NAME
                     )),
                 }
-                self.transcript.push(Block::Info(text));
+                self.show(text);
             }
-            "/tools" => self.transcript.push(Block::Info(session.tools.summary())),
+            "/tools" => {
+                let text = session.tools.summary();
+                self.show(text);
+            }
             "/report" => {
                 let dir = &session.tools.reports;
                 let text = crate::report::latest(dir).and_then(|p| std::fs::read_to_string(p).ok());
@@ -173,7 +195,7 @@ impl App {
                          one up with its report tool; you can also ask it to.",
                         crate::NAME
                     )));
-                    return true;
+                    return;
                 };
                 let url = crate::report::issue_url(&text);
                 let block = match crate::report::open(&url) {
@@ -188,35 +210,209 @@ impl App {
                 };
                 self.transcript.push(block);
             }
+            "/access" => {
+                let (verb, path) = arg.split_once(' ').unwrap_or((arg, ""));
+                let path = std::path::Path::new(path.trim());
+                let access = &mut session.tools.access;
+                let block = match verb {
+                    "" => {
+                        let text = access.describe();
+                        return self.show(text);
+                    }
+                    _ if path.as_os_str().is_empty() => {
+                        Block::Error(format!("/access {verb} needs a path."))
+                    }
+                    "hide" if access.hide(path) => Block::Info(format!(
+                        "{} is hidden from the model from now on, for this session. What it \
+                         already read stays in the context; /edit can take it out.",
+                        path.display()
+                    )),
+                    "hide" => Block::Info(format!("{} is already hidden.", path.display())),
+                    "show" if access.unhide(path) => Block::Info(format!(
+                        "{} is no longer hidden, for this session.",
+                        path.display()
+                    )),
+                    "show" => Block::Error(format!(
+                        "{} is not hidden by that path; /access lists what is.",
+                        path.display()
+                    )),
+                    "allow" => match access.allow(path) {
+                        Ok(true) => Block::Info(format!(
+                            "The model may use {} too, for this session.",
+                            path.display()
+                        )),
+                        Ok(false) => {
+                            Block::Info(format!("The model may already use {}.", path.display()))
+                        }
+                        Err(e) => Block::Error(format!("{}: {e}", path.display())),
+                    },
+                    _ => Block::Error("/access takes hide, show or allow, and a path.".into()),
+                };
+                self.transcript.push(block);
+            }
+            "/retry" => {
+                let Some(dropped) = session.drop_answer() else {
+                    self.transcript
+                        .push(Block::Error("There is no message to answer again.".into()));
+                    return;
+                };
+                let changed = dropped.iter().any(|i| match i {
+                    Item::Assistant(r) => {
+                        r.calls.iter().any(|c| !session.tools.reads_only(&c.name))
+                    }
+                    _ => false,
+                });
+                let mut text = format!("Asking {} again.", session.model);
+                if changed {
+                    text += " What the dropped answer changed in files stays; /undo takes it back.";
+                }
+                let items = session.items.clone();
+                self.transcript.clear();
+                super::replay(&items, &mut self.transcript);
+                self.transcript.push(Block::Info(text));
+                self.start(None);
+            }
+            "/resume" => {
+                let cwd = session.tools.cwd().to_path_buf();
+                let now = std::time::SystemTime::now();
+                let current = session.log.as_ref().map(|l| l.0.clone());
+                let list: Vec<_> = crate::history::list(&cwd)
+                    .into_iter()
+                    .filter(|(p, _)| Some(p) != current.as_ref())
+                    .take(30)
+                    .collect();
+                if arg.is_empty() {
+                    let lines: Vec<String> = list
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, (p, t))| {
+                            let saved = crate::history::load(p).ok()?;
+                            let ago = now.duration_since(*t).unwrap_or_default();
+                            let line = crate::history::describe(&saved, ago);
+                            Some(format!("{:>2}. {}", i + 1, super::text::clip(&line, 200)))
+                        })
+                        .collect();
+                    let text = if lines.is_empty() {
+                        "No other conversation was held in this directory.".to_string()
+                    } else {
+                        format!(
+                            "Earlier conversations here; /resume N picks one up:\n{}",
+                            lines.join("\n")
+                        )
+                    };
+                    return self.show(text);
+                }
+                let picked = arg
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| list.get(n.wrapping_sub(1)));
+                let Some((path, _)) = picked else {
+                    self.transcript.push(Block::Error(format!(
+                        "There is no conversation {arg}; /resume lists them."
+                    )));
+                    return;
+                };
+                let saved = match crate::history::load(path) {
+                    Ok(s) => s,
+                    Err(e) => return self.transcript.push(Block::Error(e.to_string())),
+                };
+                let provider = session
+                    .log
+                    .as_ref()
+                    .map(|l| l.1.clone())
+                    .unwrap_or_default();
+                let mut text =
+                    String::from("Picked up the conversation; it is saved where it was.");
+                if saved.provider == provider {
+                    session.model = saved.model.clone();
+                } else {
+                    text += &format!(
+                        " It was held with {} on {}, and goes on with {} on {provider}.",
+                        saved.model, saved.provider, session.model
+                    );
+                }
+                session.items = saved.items;
+                if let Some(log) = &mut session.log {
+                    log.0 = path.clone();
+                }
+                let (items, model) = (session.items.clone(), session.model.clone());
+                self.model = model.clone();
+                self.served = None;
+                self.usage = None;
+                self.timing = None;
+                self.cache_last = None;
+                self.last_request.clear();
+                self.look_up_window(&model);
+                self.transcript.clear();
+                super::replay(&items, &mut self.transcript);
+                self.transcript.push(Block::Info(text));
+                self.hint_unanswered(false);
+            }
             "/undo" => match session.undo() {
                 Ok(done) => self.transcript.push(Block::Info(done)),
                 Err(e) => self.transcript.push(Block::Error(e)),
             },
             _ => unreachable!("listed in COMMANDS"),
         }
-        true
     }
+}
+
+/// The commands that start with what is typed, while it is a command
+/// name: a `/` and no space yet.
+pub(super) fn completions(typed: &str) -> Vec<(&'static str, &'static str)> {
+    if !typed.starts_with('/') || typed.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    COMMANDS
+        .iter()
+        .copied()
+        .filter(|(n, _)| n.starts_with(typed))
+        .collect()
+}
+
+/// What Tab adds to `typed`: the rest of the name its completions share,
+/// and a space when only one is left.
+pub(super) fn complete(typed: &str) -> String {
+    let found = completions(typed);
+    let Some(((first, _), rest)) = found.split_first() else {
+        return String::new();
+    };
+    if rest.is_empty() {
+        return format!("{} ", &first[typed.len()..]);
+    }
+    let shared = rest.iter().fold(first.len(), |n, (other, _)| {
+        first
+            .bytes()
+            .zip(other.bytes())
+            .take(n)
+            .take_while(|(a, b)| a == b)
+            .count()
+    });
+    first[typed.len()..shared].to_string()
 }
 
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "this list"),
     ("/clear", "start a new conversation"),
-    ("/model", "show the model; /model <id> switches to another"),
     (
-        "/models",
-        "the provider's models; /models WORDS finds ids with them",
+        "/resume",
+        "earlier conversations held here; /resume N picks one up",
     ),
-    ("/tools", "the tools the model has, and what each one runs"),
+    (
+        "/retry",
+        "drop the last answer and ask again, also after /model",
+    ),
     ("/undo", "undo the agent's last change to a file"),
-    (
-        "/report",
-        "open the model's last report about a fault of the agent as a new issue",
-    ),
     (
         "/edit",
         "edit the whole context in $EDITOR before the next request",
     ),
     ("/copy", "copy the last reply to the clipboard"),
+    ("/model", "show the model; /model <id> switches to another"),
+    (
+        "/models",
+        "the provider's models; /models WORDS finds ids with them",
+    ),
     (
         "/set",
         "request fields; /set NAME VALUE sets one (null leaves it out), /set NAME unsets",
@@ -224,6 +420,19 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "/provider",
         "who ran the last reply, and what they publish about your data",
+    ),
+    ("/tools", "the tools the model has, and what each one runs"),
+    (
+        "/access",
+        "what the model may see; /access hide|show|allow PATH changes it",
+    ),
+    (
+        "/settings",
+        "edit the settings file; what can change applies at once",
+    ),
+    (
+        "/report",
+        "open the model's last report about a fault of the agent as a new issue",
     ),
 ];
 
@@ -233,6 +442,7 @@ const KEYS: &[(&str, &str)] = &[
         "send; on an empty line, pick up a reply that did not finish",
     ),
     ("Shift+Enter, Alt+Enter, Ctrl+J", "new line"),
+    ("Tab", "complete a command name; / lists the commands"),
     ("Esc", "stop the reply"),
     ("Ctrl+C", "stop, clear the input, or quit"),
     ("Ctrl+D", "quit on an empty line"),
@@ -291,6 +501,17 @@ fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completes_command_names() {
+        assert_eq!(complete("/he"), "lp ");
+        assert_eq!(complete("/mo"), "del");
+        assert_eq!(complete("/model"), "");
+        assert_eq!(completions("/model").len(), 2);
+        assert_eq!(complete("/x"), "");
+        assert!(completions("/model x").is_empty());
+        assert!(completions("hi").is_empty());
+    }
 
     #[test]
     fn base64_matches_the_standard() {

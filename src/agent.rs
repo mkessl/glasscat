@@ -30,6 +30,8 @@ pub struct Session {
     /// Where the conversation is saved after each turn; `None` keeps it
     /// in memory only.
     pub log: Option<(PathBuf, String)>,
+    /// What the command line set, which the settings do not override.
+    pub launch: crate::settings::Launch,
 }
 
 /// What a turn shows as it goes.
@@ -90,7 +92,18 @@ impl Session {
             specs,
             notes: Vec::new(),
             log: None,
+            launch: Default::default(),
         }
+    }
+
+    /// Puts in the user's own tools, in place of any before.
+    pub fn set_custom(
+        &mut self,
+        custom: std::collections::BTreeMap<String, crate::custom::CustomTool>,
+    ) -> std::result::Result<(), String> {
+        self.tools.set_custom(custom)?;
+        self.specs = self.tools.all_specs();
+        Ok(())
     }
 
     /// Puts in a context edited by hand, and saves it.
@@ -131,6 +144,17 @@ impl Session {
         if let Some((path, _)) = &mut self.log {
             *path = history::new_path(self.tools.cwd());
         }
+    }
+
+    /// Drops all that came after the last user message, so the model is
+    /// asked for its answer again; returns what was dropped, or None if
+    /// there is no user message.
+    pub fn drop_answer(&mut self) -> Option<Vec<Item>> {
+        let last = self
+            .items
+            .iter()
+            .rposition(|i| matches!(i, Item::User(_)))?;
+        Some(self.items.split_off(last + 1))
     }
 
     /// Undoes the last file change the tools made; the model is told
@@ -211,15 +235,20 @@ impl Session {
         self.save(r)
     }
 
+    /// The request body for the context as it stands.
+    pub fn body(&self) -> Vec<u8> {
+        openai::request_body(
+            &self.model,
+            &self.items,
+            &self.specs,
+            self.prefill,
+            &self.fields.for_model(&self.model),
+        )
+    }
+
     fn run(&mut self, cancel: &AtomicBool, mut on: impl FnMut(Shown)) -> Result<()> {
         loop {
-            let body = openai::request_body(
-                &self.model,
-                &self.items,
-                &self.specs,
-                self.prefill,
-                &self.fields.for_model(&self.model),
-            );
+            let body = self.body();
             on(Shown::Request(&body));
             let mut attempt = 0;
             let (stream, start) = loop {
@@ -268,11 +297,11 @@ impl Session {
                 first,
                 total: start.elapsed(),
             });
-            if let Some(u) = &outcome.usage {
-                on(Shown::Usage(u));
-            }
             if let Some(s) = &outcome.served {
                 on(Shown::Served(s));
+            }
+            if let Some(u) = &outcome.usage {
+                on(Shown::Usage(u));
             }
             let cut = outcome.cut();
             let mut reply = outcome.reply;
@@ -639,6 +668,38 @@ mod tests {
         );
         assert!(matches!(session.items.last(), Some(Item::Assistant(r)) if r.text == "ok"));
         assert_eq!(server.join().unwrap().len(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn drops_the_last_answer() {
+        let dir = std::env::temp_dir().join(format!("agent-retry-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let access = Access::new(&dir, std::slice::from_ref(&dir), &[]).unwrap();
+        let tools = Tools::new(access, Journal::new(dir.join("j.jsonl")));
+        let mut session = Session::new("u".into(), "m".into(), None, Prefill::None, tools);
+        assert_eq!(session.drop_answer(), None);
+        let reply = |t: &str| {
+            Item::Assistant(Reply {
+                text: t.into(),
+                ..Default::default()
+            })
+        };
+        session.items.extend([
+            Item::User("a".into()),
+            reply("1"),
+            Item::User("b".into()),
+            reply("2"),
+            Item::ToolResult {
+                call_id: "c".into(),
+                content: "r".into(),
+            },
+            reply("3"),
+        ]);
+        assert_eq!(session.drop_answer().map(|d| d.len()), Some(3));
+        assert_eq!(session.items.len(), 4);
+        assert_eq!(session.items.last(), Some(&Item::User("b".into())));
+        assert!(session.unanswered());
         fs::remove_dir_all(dir).unwrap();
     }
 

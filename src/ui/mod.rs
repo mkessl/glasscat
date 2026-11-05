@@ -91,6 +91,13 @@ struct App {
     /// Lines scrolled up from the bottom of the transcript.
     scroll: usize,
     last_request: Vec<u8>,
+    /// What a command shows over the chat, and how far it is scrolled.
+    panel: Option<(String, usize)>,
+    /// When the last request went out.
+    sent_at: Instant,
+    /// The last request that reported usage, and when it ended, to see
+    /// why the cache missed.
+    cache_last: Option<(crate::cache::Sent, Instant)>,
     busy: Option<String>,
     usage: Option<Value>,
     /// Cost of every request in this run, and how many reported one.
@@ -163,6 +170,9 @@ pub fn run(session: Session) -> Result<()> {
         view: View::Chat,
         scroll: 0,
         last_request: Vec::new(),
+        panel: None,
+        sent_at: Instant::now(),
+        cache_last: None,
         busy: None,
         usage: None,
         spent: (0.0, 0),
@@ -247,8 +257,15 @@ impl App {
                 }
             }
             Msg::Term(Event::Mouse(m)) => match m.kind {
-                MouseEventKind::ScrollUp => self.scroll_by(WHEEL_LINES as isize),
-                MouseEventKind::ScrollDown => self.scroll_by(-(WHEEL_LINES as isize)),
+                // The wheel scrolls the panel while one is open.
+                MouseEventKind::ScrollUp => match &mut self.panel {
+                    Some((_, s)) => *s = s.saturating_sub(WHEEL_LINES),
+                    None => self.scroll_by(WHEEL_LINES as isize),
+                },
+                MouseEventKind::ScrollDown => match &mut self.panel {
+                    Some((_, s)) => *s += WHEEL_LINES,
+                    None => self.scroll_by(-(WHEEL_LINES as isize)),
+                },
                 MouseEventKind::Down(_) if matches!(self.view, View::Chat) => {
                     let (y0, top) = self.input_at;
                     let prompt = text::width(PROMPT) as u16;
@@ -263,7 +280,13 @@ impl App {
             Msg::Term(Event::Resize(w, h)) => self.screen.resize(w, h),
             Msg::Term(_) => {}
             Msg::Agent(a) => self.agent(a),
-            Msg::Block(b) => self.transcript.push(b),
+            // A command's answer that took a while: shown like the quick ones.
+            Msg::Block(Block::Info(t)) => self.panel = Some((t, 0)),
+            Msg::Block(b) => {
+                self.panel = None;
+                self.transcript.push(b);
+                self.scroll = 0;
+            }
             Msg::History(h) => self.input.add_older(h),
             Msg::Window(model, n) => {
                 if self.window.as_ref().is_some_and(|w| w.0 == model) {
@@ -321,6 +344,43 @@ impl App {
                 &model,
             );
             let _ = tx.send(Msg::Window(model, n.ok().flatten()));
+        });
+    }
+
+    /// Opens the settings file in the user's editor, then applies what can
+    /// change while the agent runs.
+    fn edit_settings(&mut self) {
+        let path = crate::settings::path();
+        if !path.exists() {
+            // A start with the fields people change most, all empty.
+            let start =
+                "{\n  \"request\": {},\n  \"hide\": [],\n  \"allow\": [],\n  \"tools\": {}\n}\n";
+            let made = std::fs::create_dir_all(crate::settings::dir())
+                .and_then(|()| std::fs::write(&path, start));
+            if let Err(e) = made {
+                self.transcript
+                    .push(Block::Error(format!("{}: {e}", path.display())));
+                return;
+            }
+        }
+        if let Err(e) = self.run_outside(|| editor(&path)) {
+            self.transcript.push(Block::Error(e));
+            return;
+        }
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let applied = crate::settings::load().and_then(|s| crate::settings::apply(session, &s));
+        self.transcript.push(match applied {
+            Ok(()) => Block::Info(
+                "Settings applied: request fields, proxy, allowed and hidden paths, and your \
+                 tools. The provider, its address and key, and the default model change at the \
+                 next start; /model switches now."
+                    .into(),
+            ),
+            Err(e) => Block::Error(format!(
+                "{e}\nNothing was changed; /settings opens the file again."
+            )),
         });
     }
 
@@ -423,6 +483,7 @@ impl App {
         match a {
             AgentMsg::Request(body) => {
                 self.last_request = body;
+                self.sent_at = Instant::now();
                 self.busy = Some("waiting for the model".into());
             }
             AgentMsg::Text(t) => {
@@ -452,6 +513,37 @@ impl App {
             AgentMsg::Usage(u) => {
                 if let Some(c) = u.get("cost").and_then(Value::as_f64) {
                     self.spent = (self.spent.0 + c, self.spent.1 + 1);
+                }
+                if let Some((last, ended)) = &self.cache_last {
+                    let gap = self.sent_at.saturating_duration_since(*ended);
+                    let why = crate::cache::explain_miss(
+                        last,
+                        &self.last_request,
+                        &u,
+                        self.served.as_ref(),
+                        gap,
+                        crate::policy::known(&self.api.base_url),
+                    );
+                    if let Some(mut why) = why {
+                        let on = self.served.as_ref().and_then(|s| s.provider.clone());
+                        if why.contains("each provider keeps")
+                            && let Some(on) = on.filter(|_| crate::policy::known(&self.api.base_url))
+                        {
+                            why += &format!(
+                                " /set provider {{\"order\": [\"{on}\"]}} asks OpenRouter to \
+                                 keep to one."
+                            );
+                        }
+                        self.transcript.push(Block::Info(why));
+                    }
+                }
+                if let Some(p) = u.get("prompt_tokens").and_then(Value::as_u64) {
+                    let sent = crate::cache::Sent {
+                        body: self.last_request.clone(),
+                        prompt_tokens: p,
+                        served: self.served.clone(),
+                    };
+                    self.cache_last = Some((sent, Instant::now()));
                 }
                 self.usage = Some(u);
                 self.warn_if_full();
@@ -492,10 +584,10 @@ impl App {
         if empty && !resume {
             return;
         }
-        let Some(mut session) = self.session.take() else {
+        if self.session.is_none() {
             self.busy = Some("still working; Esc stops it".into());
             return;
-        };
+        }
         let prompt = if resume {
             self.input.clear();
             None
@@ -503,6 +595,14 @@ impl App {
             let p = self.input.take();
             self.transcript.push(Block::User(p.clone()));
             Some(p)
+        };
+        self.start(prompt);
+    }
+
+    /// Runs a turn with `prompt`, or picks up the unanswered one.
+    fn start(&mut self, prompt: Option<String>) {
+        let Some(mut session) = self.session.take() else {
+            return;
         };
         self.scroll = 0;
         self.busy = Some("sending".into());
@@ -552,10 +652,24 @@ impl App {
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         let width = self.input_width();
+        let page = self.page();
+        if let Some((_, scroll)) = &mut self.panel {
+            match k.code {
+                KeyCode::Esc => return self.panel = None,
+                KeyCode::PageUp => return *scroll = scroll.saturating_sub(page),
+                KeyCode::PageDown => return *scroll += page,
+                // Anything else closes it and does what it does.
+                _ => self.panel = None,
+            }
+        }
         match k.code {
             KeyCode::Enter if shift || alt => self.input.insert("\n"),
             KeyCode::Char('j') if ctrl => self.input.insert("\n"),
             KeyCode::Enter => self.send(),
+            KeyCode::Tab if self.input.at_end() => {
+                let rest = commands::complete(self.input.text());
+                self.input.insert(&rest);
+            }
             KeyCode::Esc => self.stop(),
             KeyCode::Char('c') if ctrl => {
                 if self.session.is_none() {
@@ -695,6 +809,43 @@ impl App {
             put_line(&mut self.screen, (pad + i) as u16, w, line);
         }
 
+        // What a command shows, over the bottom of the chat.
+        if let Some((text, scroll)) = &mut self.panel {
+            let lines = text::wrap(text, (w as usize).saturating_sub(2).max(1));
+            let room = (sep_y as usize).saturating_sub(1);
+            let shown = lines.len().min(room);
+            *scroll = (*scroll).min(lines.len() - shown);
+            let top = sep_y - shown as u16 - 1;
+            let more = if shown < lines.len() {
+                " · PageUp PageDown for more"
+            } else {
+                ""
+            };
+            let head = format!("── Esc closes{more} ");
+            let fill = "─".repeat((w as usize).saturating_sub(text::width(&head)));
+            self.screen.put(0, top, w, &(head + &fill), Style::dim());
+            for (i, line) in lines[*scroll..*scroll + shown].iter().enumerate() {
+                let y = top + 1 + i as u16;
+                self.screen
+                    .put(0, y, w, &" ".repeat(w as usize), Style::default());
+                self.screen.put(2, y, w, line, Style::default());
+            }
+        }
+
+        // While a command name is typed, the commands it may become.
+        let found = commands::completions(self.input.text());
+        let room = (sep_y as usize).min(found.len());
+        let nw = found.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+        for (i, (name, what)) in found[..room].iter().enumerate() {
+            let y = sep_y - room as u16 + i as u16;
+            self.screen
+                .put(0, y, w, &" ".repeat(w as usize), Style::default());
+            let x = self
+                .screen
+                .put(2, y, w, &format!("{name:<nw$}  "), Style::fg(Color::Cyan));
+            self.screen.put(x, y, w, what, Style::dim());
+        }
+
         let sep = if self.scroll > 0 {
             format!("── {} lines below · PageDown or wheel ", self.scroll)
         } else {
@@ -719,41 +870,63 @@ impl App {
         self.screen
             .set_cursor(Some((px + col as u16, input_y + (row - top) as u16)));
 
-        // Status.
-        let mut left = self.model.clone();
+        // Status: who answers on the left, numbers on the right. When they
+        // do not fit, the left drops the model asked for, then the right
+        // drops the timing, the sum spent, and the usage, in that order.
+        let mut lefts = vec![self.model.clone()];
         if let Some(s) = &self.served {
-            if s.model != self.model {
-                left = format!("{left} → {}", s.model);
-            }
-            if let Some(p) = &s.provider {
-                left = format!("{left} on {p}");
-            }
+            let on = s
+                .provider
+                .as_ref()
+                .map(|p| format!(" on {p}"))
+                .unwrap_or_default();
+            lefts = if s.model == self.model {
+                vec![format!("{}{on}", s.model), s.model.clone()]
+            } else {
+                vec![
+                    format!("{} → {}{on}", self.model, s.model),
+                    format!("{}{on}", s.model),
+                    s.model.clone(),
+                ]
+            };
         }
         if let Some(b) = &self.busy {
-            left = format!("{left} · {b}");
+            lefts = lefts.into_iter().map(|l| format!("{l} · {b}")).collect();
         }
-        // On a narrow screen the timing goes first, then the usage.
         let window = self.window.as_ref().and_then(|w| w.1);
-        let spent = (self.spent.1 > 1).then_some(self.spent.0);
-        let usage = usage_text(self.usage.as_ref(), window, spent);
-        let timing = timing_text(self.timing, self.usage.as_ref());
-        let right = [
-            format!("{usage}{timing}ctrl+t context "),
-            format!("{usage}ctrl+t context "),
-            "ctrl+t context ".to_string(),
-        ]
-        .into_iter()
-        .find(|r| text::width(r) <= w as usize * 2 / 3)
-        .unwrap_or_default();
-        let rx = w.saturating_sub(text::width(&right) as u16);
+        let spent = (self.spent.1 > 1 && self.spent.0 > 0.0).then_some(self.spent.0);
+        let usage = self.usage.as_ref();
+        let (all, one) = (
+            usage_text(usage, window, spent),
+            usage_text(usage, window, None),
+        );
+        let timing = timing_text(self.timing, usage);
+        let hint = "ctrl+t context ";
+        let rights = [
+            format!("{all}{timing}{hint}"),
+            format!("{all}{hint}"),
+            format!("{one}{hint}"),
+            hint.to_string(),
+        ];
+        let (left, right) = fit(&lefts, &rights, w as usize);
+        let rx = w.saturating_sub(text::width(right) as u16);
         self.screen
-            .put(0, status_y, rx.saturating_sub(1), &left, Style::dim());
-        self.screen.put(rx, status_y, w, &right, Style::dim());
+            .put(0, status_y, rx.saturating_sub(1), left, Style::dim());
+        self.screen.put(rx, status_y, w, right, Style::dim());
     }
 
     fn draw_context(&mut self, raw: bool, scroll: usize) {
         let (w, h) = (self.screen.width(), self.screen.height());
-        let lines = context::lines(&self.last_request, raw, w as usize);
+        // Before the first request, what the next one starts with.
+        let preview = match &self.session {
+            Some(s) if self.last_request.is_empty() => s.body(),
+            _ => Vec::new(),
+        };
+        let lines = if preview.is_empty() {
+            context::lines(&self.last_request, raw, w as usize, true)
+        } else {
+            context::lines(&preview, raw, w as usize, false)
+        };
         let height = h as usize - 1;
         let scroll = scroll.min(lines.len().saturating_sub(height));
         if let View::Context { scroll: s, .. } = &mut self.view {
@@ -832,6 +1005,21 @@ fn put_line(screen: &mut Screen, y: u16, w: u16, line: &transcript::Line) {
     for (text, style) in &line.spans {
         x = screen.put(x, y, w, text, *style);
     }
+}
+
+/// The first pair, richest right first and then richest left, that fits
+/// in `width` with a space between; else the shortest of each, the left
+/// cut by the screen.
+fn fit<'a>(lefts: &'a [String], rights: &'a [String], width: usize) -> (&'a str, &'a str) {
+    for r in rights {
+        for l in lefts {
+            if text::width(l) + 1 + text::width(r) <= width {
+                return (l, r);
+            }
+        }
+    }
+    let last = |v: &'a [String]| v.last().map_or("", String::as_str);
+    (last(lefts), last(rights))
 }
 
 /// Tokens and cost from the provider's usage report.
@@ -975,6 +1163,24 @@ mod tests {
             .map(crate::models::short)
             .collect();
         assert_eq!(shorts, ["950", "8.2k", "131k", "1M", "1.5M"]);
+    }
+
+    #[test]
+    fn status_fits_the_most_it_can() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let lefts = s(&["free → m on P", "m on P", "m"]);
+        let rights = s(&["in 1 · first 1s · hint", "in 1 · hint", "hint"]);
+        assert_eq!(
+            fit(&lefts, &rights, 40),
+            ("free → m on P", "in 1 · first 1s · hint")
+        );
+        assert_eq!(
+            fit(&lefts, &rights, 30),
+            ("m on P", "in 1 · first 1s · hint")
+        );
+        assert_eq!(fit(&lefts, &rights, 20), ("m on P", "in 1 · hint"));
+        assert_eq!(fit(&lefts, &rights, 8), ("m", "hint"));
+        assert_eq!(fit(&lefts, &rights, 3), ("m", "hint"));
     }
 
     #[test]

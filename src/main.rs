@@ -1,5 +1,6 @@
 mod access;
 mod agent;
+mod cache;
 mod context;
 mod custom;
 mod history;
@@ -101,8 +102,6 @@ fn run() -> Result<()> {
     let args = parse_args()?;
     let settings = settings::load()?;
     let instruction_files = settings.instruction_files();
-    let model_settings = settings.models.clone();
-    let custom_tools = settings.tools.clone();
     let cwd = std::env::current_dir()?;
     let (saved, log) = if args.resume {
         let path =
@@ -134,25 +133,17 @@ fn run() -> Result<()> {
         })
         .unwrap_or_else(|| provider.default_model.clone());
 
-    let mut allowed = vec![cwd.clone()];
-    allowed.extend(args.allow);
-    allowed.extend(settings.allow);
-    let mut hidden = args.hide;
-    hidden.extend(settings.hide);
-    let access = access::Access::new(&cwd, &allowed, &hidden)?;
-    let tools = tools::Tools::new(access, journal::Journal::for_session())
-        .with_custom(custom_tools)
-        .map_err(|e| format!("{}: {e}", settings::path().display()))?;
+    // Only the working directory until the settings are applied.
+    let access = access::Access::new(&cwd, std::slice::from_ref(&cwd), &[])?;
+    let tools = tools::Tools::new(access, journal::Journal::for_session());
     let mut session = agent::Session::new(provider.base_url, model, key, provider.prefill, tools);
-    session.proxy = args.proxy.or(provider.proxy);
-    session.fields.settings = provider.request;
-    session.fields.models = model_settings
-        .into_iter()
-        .map(|(id, m)| (id, m.request))
-        .collect();
-    if let Some(p) = &session.proxy {
-        openai::parse_proxy(p)?;
-    }
+    session.launch = settings::Launch {
+        provider: name.clone(),
+        allow: args.allow,
+        hide: args.hide,
+        proxy: args.proxy,
+    };
+    settings::apply(&mut session, &settings)?;
     session.log = Some((log, name));
     if let Some(saved) = saved {
         session.items = saved.items;

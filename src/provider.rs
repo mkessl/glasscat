@@ -131,7 +131,28 @@ impl Provider {
         };
         match std::env::var(var) {
             Ok(k) if !k.trim().is_empty() => Ok(Some(k.trim().to_string())),
-            _ => Err(format!("{} needs an API key in {var}", self.name).into()),
+            _ => {
+                let mut e = format!("{} needs an API key in {var}", self.name);
+                if let Some(page) = keys_page(&self.name) {
+                    e += &format!("; get one at {page}");
+                }
+                if self.name == "openrouter" {
+                    e += " (its free models, the default, need no credit)";
+                }
+                Err(e.into())
+            }
         }
     }
+}
+
+/// Where a preset provider hands out API keys.
+fn keys_page(provider: &str) -> Option<&'static str> {
+    Some(match provider {
+        "openrouter" => "https://openrouter.ai/keys",
+        "groq" => "https://console.groq.com/keys",
+        "deepseek" => "https://platform.deepseek.com/api_keys",
+        "mistral" => "https://console.mistral.ai/api-keys",
+        "kimi" => "https://platform.kimi.ai/console/api-keys",
+        _ => return None,
+    })
 }

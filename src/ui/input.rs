@@ -22,6 +22,10 @@ pub struct Row {
 }
 
 impl Input {
+    pub fn at_end(&self) -> bool {
+        self.cur == self.text.len()
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }

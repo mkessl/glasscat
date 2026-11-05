@@ -15,6 +15,7 @@ pub struct Style {
     pub bold: bool,
     pub dim: bool,
     pub italic: bool,
+    pub underline: bool,
     pub reverse: bool,
 }
 
@@ -26,6 +27,7 @@ impl Style {
             bold: false,
             dim: false,
             italic: false,
+            underline: false,
             reverse: false,
         }
     }
@@ -36,6 +38,7 @@ impl Style {
             bold: false,
             dim: true,
             italic: false,
+            underline: false,
             reverse: false,
         }
     }
@@ -45,6 +48,10 @@ impl Style {
     }
     pub const fn italic(mut self) -> Self {
         self.italic = true;
+        self
+    }
+    pub const fn underline(mut self) -> Self {
+        self.underline = true;
         self
     }
 }
@@ -105,6 +112,7 @@ const BLANK: Cell = Cell {
         bold: false,
         dim: false,
         italic: false,
+        underline: false,
         reverse: false,
     },
 };
@@ -248,6 +256,9 @@ fn set_style(out: &mut impl Write, s: Style) -> io::Result<()> {
     }
     if s.italic {
         queue!(out, SetAttribute(Attribute::Italic))?;
+    }
+    if s.underline {
+        queue!(out, SetAttribute(Attribute::Underlined))?;
     }
     if s.reverse {
         queue!(out, SetAttribute(Attribute::Reverse))?;

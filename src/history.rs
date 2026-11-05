@@ -38,28 +38,57 @@ pub fn new_path(cwd: &Path) -> PathBuf {
 
 /// The conversation in `cwd` saved last.
 pub fn latest(cwd: &Path) -> Option<PathBuf> {
-    fs::read_dir(dir_for(cwd))
-        .ok()?
+    list(cwd).into_iter().next().map(|(p, _)| p)
+}
+
+/// The conversations held in `cwd`, newest first, with when each was
+/// saved last.
+pub fn list(cwd: &Path) -> Vec<(PathBuf, std::time::SystemTime)> {
+    let Ok(dir) = fs::read_dir(dir_for(cwd)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(PathBuf, std::time::SystemTime)> = dir
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .max_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+        .filter_map(|p| {
+            let t = fs::metadata(&p).and_then(|m| m.modified()).ok()?;
+            Some((p, t))
+        })
+        .collect();
+    out.sort_by_key(|e| std::cmp::Reverse(e.1));
+    out
+}
+
+/// One line about a saved conversation: how long ago, the model, how many
+/// messages the user wrote, and the first of them.
+pub fn describe(saved: &Saved, ago: std::time::Duration) -> String {
+    let prompts: Vec<&str> = saved
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::User(t) => Some(without_notes(t)),
+            _ => None,
+        })
+        .collect();
+    let first = prompts
+        .first()
+        .map_or("", |p| p.lines().next().unwrap_or(""));
+    let ago = match ago.as_secs() {
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{} min ago", s / 60),
+        s if s < 86_400 => format!("{} h ago", s / 3600),
+        s => format!("{} days ago", s / 86_400),
+    };
+    let n = prompts.len();
+    let s = if n == 1 { "" } else { "s" };
+    format!("{ago} · {} · {n} message{s} · {first}", saved.model)
 }
 
 /// What the user wrote in the last `files` conversations held in `cwd`,
 /// oldest first, without the agent's bracketed notes in front.
 pub fn recent_prompts(cwd: &Path, files: usize) -> Vec<String> {
-    let Ok(dir) = fs::read_dir(dir_for(cwd)) else {
-        return Vec::new();
-    };
-    let mut paths: Vec<(std::time::SystemTime, PathBuf)> = dir
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .filter_map(|p| Some((fs::metadata(&p).and_then(|m| m.modified()).ok()?, p)))
-        .collect();
-    paths.sort();
-    let start = paths.len().saturating_sub(files);
     let mut out = Vec::new();
-    for (_, p) in &paths[start..] {
+    for (p, _) in list(cwd).iter().take(files).rev() {
         let Ok(saved) = load(p) else { continue };
         for item in saved.items {
             if let Item::User(text) = item {
@@ -98,6 +127,25 @@ pub fn load(path: &Path) -> Result<Saved> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn describes_a_conversation() {
+        let saved = Saved {
+            cwd: "/x".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            items: vec![
+                Item::System("s".into()),
+                Item::User("[You were stopped.]\n\nfix the bug\nin main".into()),
+                Item::User("thanks".into()),
+            ],
+        };
+        let ago = std::time::Duration::from_secs(7300);
+        assert_eq!(
+            describe(&saved, ago),
+            "2 h ago · m · 2 messages · fix the bug"
+        );
+    }
     use crate::context::{Reply, ToolCall};
 
     #[test]

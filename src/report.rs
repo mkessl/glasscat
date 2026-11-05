@@ -14,11 +14,11 @@ pub fn spec() -> ToolSpec {
     ToolSpec {
         name: TOOL.into(),
         description: format!(
-            "Report a fault of {} itself, the agent you run in, to its developers: a tool that \
-             misbehaves, an error that should not happen, something it lacks to do the work. Not \
-             for faults in the user's work. The report is saved for the user, who decides whether \
-             to send it. Give only what the fault needs: no file contents, paths or personal \
-             details unless the fault cannot be understood without them.",
+            "Report a fault of {} itself, the agent you run in, to its developers. A fault is a \
+             tool that misbehaves, an error that should not happen, or something it lacks for the \
+             work; not a fault in the user's work. The report is saved for the user, who decides \
+             whether to send it. Give only what the fault needs: no file contents, paths or \
+             personal details unless the fault cannot be understood without them.",
             crate::NAME
         ),
         parameters: json!({
@@ -106,21 +106,25 @@ fn encode(s: &str) -> String {
 
 /// Opens `url` in the user's browser.
 pub fn open(url: &str) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    // Not `cmd /C start`: cmd would read the `&` in the link as its own.
     let mut cmd = if cfg!(windows) {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", ""]);
+        let mut c = Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
         c
     } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open")
+        Command::new("open")
     } else {
-        std::process::Command::new("xdg-open")
+        Command::new("xdg-open")
     };
-    cmd.arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(|_| ())
+    let mut child = cmd
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
 }
 
 #[cfg(test)]

@@ -36,7 +36,11 @@ impl Access {
         let cwd = cwd.canonicalize()?;
         let allowed = allowed
             .iter()
-            .map(|p| cwd.join(p).canonicalize())
+            .map(|p| {
+                cwd.join(p)
+                    .canonicalize()
+                    .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", p.display())))
+            })
             .collect::<std::io::Result<_>>()?;
         let hidden = hidden.iter().map(|p| real(&cwd.join(p))).collect();
         Ok(Self {
@@ -48,6 +52,51 @@ impl Access {
 
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// Hides `path` from now on; false if it already was.
+    pub fn hide(&mut self, path: &Path) -> bool {
+        let real = real(&self.cwd.join(path));
+        if self.hidden.contains(&real) {
+            return false;
+        }
+        self.hidden.push(real);
+        true
+    }
+
+    /// Stops hiding `path`; false if it was not hidden by that path.
+    pub fn unhide(&mut self, path: &Path) -> bool {
+        let real = real(&self.cwd.join(path));
+        let before = self.hidden.len();
+        self.hidden.retain(|h| *h != real);
+        self.hidden.len() < before
+    }
+
+    /// Lets the model use the folder `path` too.
+    pub fn allow(&mut self, path: &Path) -> std::io::Result<bool> {
+        let real = self.cwd.join(path).canonicalize()?;
+        if self.allowed.contains(&real) {
+            return Ok(false);
+        }
+        self.allowed.push(real);
+        Ok(true)
+    }
+
+    /// The rules in words, one per line.
+    pub fn describe(&self) -> String {
+        let mut out = String::from("The model may use:");
+        for a in &self.allowed {
+            out += &format!("\n  {}", a.display());
+        }
+        if self.hidden.is_empty() {
+            out += "\nNothing in them is hidden.";
+        } else {
+            out += "\nExcept, as if they did not exist:";
+            for h in &self.hidden {
+                out += &format!("\n  {}", h.display());
+            }
+        }
+        out
     }
 
     /// The real path a model-given path stands for, if the model may use it.
@@ -195,6 +244,26 @@ mod tests {
         let p = a.resolve("a.txt").unwrap();
         assert_eq!(a.show(&p), "a.txt");
         assert_eq!(a.show(a.cwd()), ".");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn rules_change_while_running() {
+        let (base, mut a) = tree("change");
+        assert!(a.hide(Path::new("a.txt")));
+        assert!(!a.hide(Path::new("./a.txt")));
+        assert!(a.resolve("a.txt").is_err());
+        assert!(a.unhide(Path::new("a.txt")));
+        assert!(a.resolve("a.txt").is_ok());
+        assert!(a.unhide(Path::new("secret")));
+        assert!(a.resolve("secret/key").is_ok());
+        assert!(!a.unhide(Path::new("secret")));
+        assert!(a.resolve("../outside/x").is_err());
+        assert!(a.allow(Path::new("../outside")).unwrap());
+        assert!(!a.allow(Path::new("../outside")).unwrap());
+        assert!(a.resolve("../outside/x").is_ok());
+        assert!(a.allow(Path::new("no-such-dir")).is_err());
+        assert!(a.describe().contains("outside"), "{}", a.describe());
         fs::remove_dir_all(base).unwrap();
     }
 }

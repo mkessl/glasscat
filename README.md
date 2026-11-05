@@ -56,13 +56,16 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
 - **Hidden paths.** Paths given with `--hide` do not exist as far as the model can tell. It
   gets the same answer as for a missing file. Nothing outside the working directory and the
   folders you allow can be reached, through symlinks or `..` either. You are told each time
-  something was kept from the model, and why.
+  something was kept from the model, and why. `/access` shows the rules and changes them as
+  you work: `/access hide PATH`, `/access show PATH`, `/access allow PATH`.
 - **Reasoning** from thinking models streams in, then folds away; <kbd>Ctrl</kbd>+<kbd>O</kbd>
   opens it.
-- **Markdown** in replies is rendered: headings, lists, quotes, code, bold and italic.
+- **Markdown** in replies is rendered: headings, lists, quotes, code, tables, links, bold and italic.
+  A table too wide for the screen wraps its widest cells.
 - **Usage, cost and speed** of each request in the status bar: the context used out of the
   model's window, cache hits, time to the first token, tokens per second, and what all the
-  requests so far cost together.
+  requests so far cost together. When the provider's cache gives back much less than the last
+  request sent, you are told what changed: the request, the provider it ran on, or nothing.
 - **Reports, not telemetry.** When the model meets a fault of glasscat itself, it can write it
   up with only what the fault needs. The report is saved on your machine and nothing is sent;
   `/report` opens it as a new GitHub issue that you read and send yourself.
@@ -109,21 +112,29 @@ Inside a session:
 | <kbd>Enter</kbd> | send; on an empty line, continue a reply that did not finish |
 | <kbd>Shift</kbd>+<kbd>Enter</kbd>, <kbd>Alt</kbd>+<kbd>Enter</kbd> or <kbd>Ctrl</kbd>+<kbd>J</kbd> | new line |
 | <kbd>↑</kbd> <kbd>↓</kbd> | earlier messages, also from past conversations held here |
+| <kbd>Tab</kbd> | complete a command; typing `/` lists them |
 | <kbd>Esc</kbd> | stop the reply |
 | <kbd>Ctrl</kbd>+<kbd>T</kbd> | the exact context sent to the model |
 | <kbd>Ctrl</kbd>+<kbd>O</kbd> | show or fold reasoning |
 | <kbd>Shift</kbd>+drag | select text (in most terminals) |
 | `/model <id>` | switch the model |
+| `/resume` | earlier conversations held in this directory; `/resume N` picks one up |
+| `/retry` | drop the last answer and ask again, say after switching the model |
 | `/models <words>` | find models by id, with context window and price |
 | `/undo` | undo the agent's last file change |
+| `/access` | what the model may see; `hide`, `show` or `allow` a path for this session |
 | `/tools` | the model's tools: which only read, and what your own ones run |
 | `/report` | open the model's last report about a glasscat fault as a new issue |
 | `/edit` | change the context in `$EDITOR` before the next request |
 | `/copy` | copy the last reply to the clipboard |
+| `/settings` | edit the settings file; most of it applies at once |
 | `/set <name> <value>` | set a request field for this session, such as `temperature 0.3`; `/set` lists them |
 | `/provider` | who ran the last reply, and what they publish about your data |
 | `/clear` | start a new conversation |
 | `/help` | all commands and keys |
+
+What a command only shows, such as `/help` or `/tools`, opens over the chat; <kbd>Esc</kbd>
+closes it and leaves the chat where you had scrolled it.
 
 ## Providers
 
@@ -146,8 +157,10 @@ a free OpenRouter key.
 ## Settings
 
 Settings live in `~/.config/glasscat/settings.json` (on Windows, `%APPDATA%\glasscat`).
-Every field is optional, and options on the command line win. Add any OpenAI-compatible
-server under `providers`:
+Every field is optional, and options on the command line win. `/settings` opens the file in
+your editor and applies it when you close it, without a restart: request fields, proxies,
+allowed and hidden paths, and your own tools. Add any OpenAI-compatible server under
+`providers`:
 
 ```json
 {
@@ -220,13 +233,14 @@ it changes: it does exactly what the program does.
 
 | | |
 | --- | --- |
-| The system prompt and tool definitions | <kbd>Ctrl</kbd>+<kbd>T</kbd>, word for word |
+| The system prompt and tool definitions | <kbd>Ctrl</kbd>+<kbd>T</kbd>, word for word, before the first request too |
 | Which tools the model has, and what each one runs | `/tools` |
 | The exact bytes of each request | <kbd>Ctrl</kbd>+<kbd>T</kbd>, then <kbd>r</kbd>; or `--show-request` |
 | Size of each part of the context | <kbd>Ctrl</kbd>+<kbd>T</kbd> |
 | The whole context, to change as you like | `/edit` |
 | What a tool kept from the model, and why | under the tool call |
 | Tokens in and out, cache hits, cost, and the sum of it so far | status bar |
+| Why the cache missed | under the reply, when it gave back less than half |
 | How much of the model's context window is used | status bar, when the provider's model list says |
 | Time to the first token, time in all, output speed | status bar |
 | Which model and provider ran each reply | status bar, when a router such as OpenRouter says |

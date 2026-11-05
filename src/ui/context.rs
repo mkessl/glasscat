@@ -10,7 +10,9 @@ use super::transcript::Line;
 
 const HEAD: Style = Style::fg(Color::Yellow);
 
-pub fn lines(body: &[u8], raw: bool, width: usize) -> Vec<Line> {
+/// `sent` tells whether the body went out or is what the next request
+/// will start with.
+pub fn lines(body: &[u8], raw: bool, width: usize, sent: bool) -> Vec<Line> {
     let mut out = Vec::new();
     let mut add = |text: String, style: Style| out.push(Line::new(text, style));
     if body.is_empty() {
@@ -19,7 +21,12 @@ pub fn lines(body: &[u8], raw: bool, width: usize) -> Vec<Line> {
     }
     add(
         format!(
-            "Exact request: {} · about {} tokens (bytes / 4) · {} for {}",
+            "{}: {} · about {} tokens (bytes / 4) · {} for {}",
+            if sent {
+                "Exact request"
+            } else {
+                "Not sent yet, the next request so far"
+            },
             bytes(body.len()),
             body.len() / 4,
             if raw { "raw bytes" } else { "parts" },
@@ -94,8 +101,8 @@ pub fn lines(body: &[u8], raw: bool, width: usize) -> Vec<Line> {
             for l in wrap(&line, width) {
                 add(l, Style::default());
             }
-            for l in wrap(&format!("  {}", f["parameters"]), width) {
-                add(l, Style::dim());
+            for l in wrap(&f["parameters"].to_string(), width.saturating_sub(2).max(1)) {
+                add(format!("  {l}"), Style::dim());
             }
         }
     }
@@ -139,7 +146,7 @@ mod tests {
     #[test]
     fn shows_parts_with_sizes() {
         let body = br#"{"model":"m","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"read","description":"Read a file","parameters":{}}}],"stream":true}"#;
-        let text: Vec<String> = lines(body, false, 40)
+        let text: Vec<String> = lines(body, false, 40, true)
             .into_iter()
             .map(|l| l.text())
             .collect();
@@ -156,7 +163,7 @@ mod tests {
 
     #[test]
     fn raw_shows_the_bytes() {
-        let text: Vec<String> = lines(b"{\"a\":1}", true, 40)
+        let text: Vec<String> = lines(b"{\"a\":1}", true, 40, false)
             .into_iter()
             .map(|l| l.text())
             .collect();
