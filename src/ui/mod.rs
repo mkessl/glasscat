@@ -2,6 +2,7 @@
 
 mod context;
 mod input;
+mod markdown;
 mod screen;
 mod text;
 mod transcript;
@@ -91,10 +92,11 @@ pub fn run(session: Session) -> Result<()> {
             }
         }
     });
+    let cwd = session.tools.cwd().display().to_string();
     let mut app = App {
         model: session.model.clone(),
         session: Some(Box::new(session)),
-        transcript: Transcript::default(),
+        transcript: Transcript::new(cwd),
         input: Input::default(),
         screen: Screen::new(w, h),
         view: View::Chat,
@@ -476,8 +478,7 @@ impl App {
         let start = end.saturating_sub(height);
         let pad = height - (end - start);
         for (i, line) in lines[start..end].iter().enumerate() {
-            self.screen
-                .put(0, (pad + i) as u16, w, &line.text, line.style);
+            put_line(&mut self.screen, (pad + i) as u16, w, line);
         }
 
         let sep = if self.scroll > 0 {
@@ -525,7 +526,7 @@ impl App {
             *s = scroll;
         }
         for (i, line) in lines.iter().skip(scroll).take(height).enumerate() {
-            self.screen.put(0, i as u16, w, &line.text, line.style);
+            put_line(&mut self.screen, i as u16, w, line);
         }
         let status = format!(
             "context · lines {}-{} of {} · r raw/parts · ↑↓ PgUp PgDn · Esc back",
@@ -537,7 +538,13 @@ impl App {
     }
 }
 
-/// Tokens and cost from the provider's usage report.
+fn put_line(screen: &mut Screen, y: u16, w: u16, line: &transcript::Line) {
+    let mut x = 0;
+    for (text, style) in &line.spans {
+        x = screen.put(x, y, w, text, *style);
+    }
+}
+
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "this list"),
     ("/clear", "start a new conversation"),
@@ -580,6 +587,7 @@ fn help() -> String {
     out.trim_end().to_string()
 }
 
+/// Tokens and cost from the provider's usage report.
 fn usage_text(u: Option<&Value>) -> String {
     let Some(u) = u else { return String::new() };
     let n = |k: &str| u.get(k).and_then(Value::as_u64);

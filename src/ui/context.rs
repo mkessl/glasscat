@@ -12,7 +12,7 @@ const HEAD: Style = Style::fg(Color::Yellow);
 
 pub fn lines(body: &[u8], raw: bool, width: usize) -> Vec<Line> {
     let mut out = Vec::new();
-    let mut add = |text: String, style: Style| out.push(Line { text, style });
+    let mut add = |text: String, style: Style| out.push(Line::new(text, style));
     if body.is_empty() {
         add("Nothing has been sent yet.".into(), Style::dim());
         return out;
@@ -139,7 +139,10 @@ mod tests {
     #[test]
     fn shows_parts_with_sizes() {
         let body = br#"{"model":"m","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"read","description":"Read a file","parameters":{}}}],"stream":true}"#;
-        let text: Vec<String> = lines(body, false, 40).into_iter().map(|l| l.text).collect();
+        let text: Vec<String> = lines(body, false, 40)
+            .into_iter()
+            .map(|l| l.text())
+            .collect();
         assert!(text[0].starts_with(&format!("Exact request: {} B", body.len())));
         assert!(
             text.iter().any(|l| l.starts_with("── system · 38 B ")),
@@ -155,7 +158,7 @@ mod tests {
     fn raw_shows_the_bytes() {
         let text: Vec<String> = lines(b"{\"a\":1}", true, 40)
             .into_iter()
-            .map(|l| l.text)
+            .map(|l| l.text())
             .collect();
         assert_eq!(text[2], "{\"a\":1}");
     }

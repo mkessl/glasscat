@@ -4,8 +4,9 @@
 use crossterm::style::Color;
 use serde_json::Value;
 
+use super::markdown;
 use super::screen::Style;
-use super::text::{clip, wrap};
+use super::text::{Span, clip, wrap};
 
 pub enum Block {
     User(String),
@@ -20,13 +21,26 @@ pub enum Block {
     Info(String),
 }
 
+/// One screen line: runs of styled text.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Line {
-    pub text: String,
-    pub style: Style,
+    pub spans: Vec<Span>,
+}
+
+impl Line {
+    pub fn new(text: String, style: Style) -> Self {
+        Self {
+            spans: vec![(text, style)],
+        }
+    }
+
+    #[cfg(test)]
+    pub fn text(&self) -> String {
+        self.spans.iter().map(|(t, _)| t.as_str()).collect()
+    }
 }
 
 const USER: Style = Style::fg(Color::Cyan);
-const CODE: Style = Style::fg(Color::Green);
 const TOOL: Style = Style::fg(Color::Yellow);
 const ERROR: Style = Style::fg(Color::Red);
 
@@ -37,12 +51,21 @@ pub struct Transcript {
     width: usize,
     /// Reasoning shown in full rather than folded.
     reasoning_open: bool,
+    /// The working directory, left out of paths in tool calls.
+    cwd: String,
 }
 
 /// Lines of reasoning shown while the model is still thinking.
 const THINKING_TAIL: usize = 3;
 
 impl Transcript {
+    pub fn new(cwd: String) -> Self {
+        Self {
+            cwd,
+            ..Self::default()
+        }
+    }
+
     pub fn push(&mut self, b: Block) {
         // The block before was laid out as the last one.
         if let Some(c) = self.cache.last_mut() {
@@ -92,51 +115,38 @@ impl Transcript {
         for (i, (b, c)) in self.blocks.iter().zip(self.cache.iter_mut()).enumerate() {
             if c.is_none() {
                 let open = self.reasoning_open;
-                *c = Some(layout(b, width, open, i + 1 == n));
+                *c = Some(layout(b, width, open, i + 1 == n, &self.cwd));
             }
         }
         let mut out = Vec::new();
-        for (i, c) in self.cache.iter().enumerate() {
-            if i > 0 {
+        for c in &self.cache {
+            let c = c.as_ref().expect("laid out above");
+            if c.is_empty() {
+                continue;
+            }
+            if !out.is_empty() {
                 out.push(&BLANK);
             }
-            out.extend(c.as_ref().expect("laid out above"));
+            out.extend(c);
         }
         out
     }
 }
 
-static BLANK: Line = Line {
-    text: String::new(),
-    style: Style::dim(),
-};
+static BLANK: Line = Line { spans: Vec::new() };
 
-fn layout(b: &Block, width: usize, reasoning_open: bool, last: bool) -> Vec<Line> {
+fn layout(b: &Block, width: usize, reasoning_open: bool, last: bool, cwd: &str) -> Vec<Line> {
     let mut out = Vec::new();
-    let mut add = |text: String, style: Style| out.push(Line { text, style });
+    let mut add = |text: String, style: Style| out.push(Line::new(text, style));
     match b {
         Block::User(t) => {
             for (i, l) in wrap(t, width.saturating_sub(2)).into_iter().enumerate() {
                 add(format!("{} {l}", if i == 0 { '›' } else { ' ' }), USER);
             }
         }
-        Block::Text(t) => {
-            let mut code = false;
-            for line in t.trim_end().split('\n') {
-                let fence = line.trim_start().starts_with("```");
-                let style = if fence {
-                    Style::dim()
-                } else if code {
-                    CODE
-                } else {
-                    Style::default()
-                };
-                for l in wrap(line, width) {
-                    add(l, style);
-                }
-                code ^= fence;
-            }
-        }
+        // A block that so far holds only whitespace takes no room.
+        Block::Text(t) | Block::Reasoning(t) if t.trim().is_empty() => {}
+        Block::Text(t) => return markdown::lines(t, width),
         Block::Reasoning(t) => {
             let lines = wrap(t.trim(), width);
             let skip = if reasoning_open {
@@ -160,10 +170,13 @@ fn layout(b: &Block, width: usize, reasoning_open: bool, last: bool) -> Vec<Line
             }
         }
         Block::Tool { name, args, result } => {
-            add(clip(&format!("▸ {name} {}", summary(args)), width), TOOL);
+            add(
+                clip(&format!("▸ {name} {}", summary(args, cwd)), width),
+                TOOL,
+            );
             let failed = result.starts_with("error:");
             let mut lines = result.lines();
-            let first = lines.next().unwrap_or("");
+            let first = lines.next().unwrap_or("").trim();
             let more = lines.count();
             let tail = if more > 0 {
                 format!("  (+{more} lines)")
@@ -189,15 +202,24 @@ fn layout(b: &Block, width: usize, reasoning_open: bool, last: bool) -> Vec<Line
 
 /// A tool call's arguments in a few words: the path or pattern when there
 /// is one, otherwise the JSON on one line.
-fn summary(args: &str) -> String {
+fn summary(args: &str, cwd: &str) -> String {
     let Ok(Value::Object(m)) = serde_json::from_str::<Value>(args) else {
         return args.replace('\n', " ");
     };
     let get = |k: &str| m.get(k).and_then(Value::as_str);
+    let rel = |p: &str| -> String {
+        if cwd.is_empty() || p == cwd {
+            return if p == cwd { ".".into() } else { p.into() };
+        }
+        p.strip_prefix(cwd)
+            .and_then(|r| r.strip_prefix(['/', '\\']))
+            .unwrap_or(p)
+            .into()
+    };
     match (get("pattern"), get("path")) {
-        (Some(p), Some(path)) => format!("{p} in {path}"),
+        (Some(p), Some(path)) => format!("{p} in {}", rel(path)),
         (Some(p), None) => p.to_string(),
-        (None, Some(path)) => path.to_string(),
+        (None, Some(path)) => rel(path),
         (None, None) => Value::Object(m.clone()).to_string(),
     }
 }
@@ -207,7 +229,7 @@ mod tests {
     use super::*;
 
     fn texts(t: &mut Transcript, w: usize) -> Vec<String> {
-        t.lines(w).iter().map(|l| l.text.clone()).collect()
+        t.lines(w).iter().map(|l| l.text()).collect()
     }
 
     #[test]
@@ -221,6 +243,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_blocks_take_no_room() {
+        let mut t = Transcript::default();
+        t.push(Block::User("hi".into()));
+        t.stream("\n\n", true);
+        t.stream("  ", false);
+        t.push(Block::Info("x".into()));
+        assert_eq!(texts(&mut t, 20), ["› hi", "", "x"]);
+    }
+
+    #[test]
     fn tool_block_summarises() {
         let mut t = Transcript::default();
         t.push(Block::Tool {
@@ -229,6 +261,13 @@ mod tests {
             result: "a\nb\nc".into(),
         });
         assert_eq!(texts(&mut t, 40), ["▸ read src/main.rs", "  a  (+2 lines)"]);
+        t.cwd = "/p".into();
+        t.push(Block::Tool {
+            name: "find".into(),
+            args: r#"{"pattern":"*.rs","path":"/p/src"}"#.into(),
+            result: String::new(),
+        });
+        assert_eq!(texts(&mut t, 40)[3], "▸ find *.rs in src");
     }
 
     #[test]
@@ -246,22 +285,5 @@ mod tests {
         );
         t.toggle_reasoning();
         assert_eq!(texts(&mut t, 40), ["a", "b", "c", "d", "", "answer"]);
-    }
-
-    #[test]
-    fn code_fences_are_styled() {
-        let mut t = Transcript::default();
-        t.stream("x\n```\ncode\n```\ny", false);
-        let styles: Vec<Style> = t.lines(20).iter().map(|l| l.style).collect();
-        assert_eq!(
-            styles,
-            [
-                Style::default(),
-                Style::dim(),
-                CODE,
-                Style::dim(),
-                Style::default()
-            ]
-        );
     }
 }
