@@ -3,8 +3,6 @@
 
 use serde_json::Value;
 
-// Only `User` is built outside tests until the tool loop lands.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Item {
     System(String),

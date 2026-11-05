@@ -227,8 +227,7 @@ pub fn send(base_url: &str, api_key: Option<&str>, body: &[u8]) -> Result<impl R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, Write};
-    use std::net::TcpListener;
+    use std::io::BufRead;
 
     fn stream_of(chunks: &[&str]) -> impl BufRead + use<> {
         let mut s = String::new();
@@ -240,39 +239,10 @@ mod tests {
         std::io::Cursor::new(s.into_bytes())
     }
 
-    /// Serves one HTTP response on a local port and returns its base URL
-    /// and the request it received.
-    fn serve_once(response: String) -> (String, std::thread::JoinHandle<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/v1", listener.local_addr().unwrap());
-        let handle = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(sock.try_clone().unwrap());
-            let mut head = String::new();
-            let mut len = 0;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    len = v.trim().parse().unwrap();
-                }
-                head.push_str(&line);
-                if line == "\r\n" {
-                    break;
-                }
-            }
-            let mut body = vec![0; len];
-            reader.read_exact(&mut body).unwrap();
-            sock.write_all(response.as_bytes()).unwrap();
-            head + &String::from_utf8(body).unwrap()
-        });
-        (url, handle)
-    }
-
     #[test]
     fn sends_exact_bytes_and_streams_back() {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
-        let (url, server) = serve_once(format!(
+        let (url, server) = crate::test_server::serve_once(format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{sse}",
             sse.len()
         ));
@@ -292,7 +262,7 @@ mod tests {
     #[test]
     fn error_status_carries_the_body() {
         let msg = r#"{"error":{"message":"No auth credentials found"}}"#;
-        let (url, server) = serve_once(format!(
+        let (url, server) = crate::test_server::serve_once(format!(
             "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\n\r\n{msg}",
             msg.len()
         ));
