@@ -8,6 +8,7 @@ mod sse;
 #[cfg(test)]
 mod test_server;
 mod tools;
+mod ui;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -18,10 +19,11 @@ pub type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::
 /// The program's name, taken from the binary name in `Cargo.toml`.
 pub const NAME: &str = env!("CARGO_BIN_NAME");
 
-const USAGE: &str = "usage: NAME [OPTIONS] PROMPT...
+const USAGE: &str = "usage: NAME [OPTIONS] [PROMPT...]
 
-Gives PROMPT to the model, lets it work with its tools in the current
-directory, and streams the answer to stdout. Tool calls go to stderr.
+Without PROMPT, opens the full-screen interface. With PROMPT, gives it to
+the model, lets it work with its tools in the current directory, and
+streams the answer to stdout; tool calls go to stderr.
 
   --provider NAME   one of: PROVIDERS (default: openrouter)
   --model ID        model id (default: the provider's default)
@@ -35,7 +37,7 @@ struct Args {
     allow: Vec<PathBuf>,
     hide: Vec<PathBuf>,
     show_request: bool,
-    prompt: String,
+    prompt: Option<String>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -45,7 +47,7 @@ fn parse_args() -> Result<Args> {
         allow: Vec::new(),
         hide: Vec::new(),
         show_request: false,
-        prompt: String::new(),
+        prompt: None,
     };
     let mut words = Vec::new();
     let mut it = std::env::args().skip(1);
@@ -68,10 +70,9 @@ fn parse_args() -> Result<Args> {
             _ => words.push(a),
         }
     }
-    if words.is_empty() {
-        return Err(usage().into());
+    if !words.is_empty() {
+        args.prompt = Some(words.join(" "));
     }
-    args.prompt = words.join(" ");
     Ok(args)
 }
 
@@ -94,12 +95,19 @@ fn run() -> Result<()> {
     let access = access::Access::new(&cwd, &allowed, &args.hide)?;
     let tools = tools::Tools::new(access, journal::Journal::for_session());
     let mut session = agent::Session::new(preset.base_url.into(), model, key, tools);
+    let Some(prompt) = args.prompt else {
+        use std::io::IsTerminal;
+        if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+            return Err(format!("no prompt given and not a terminal\n\n{}", usage()).into());
+        }
+        return ui::run(session);
+    };
 
     let show_request = args.show_request;
     let mut out = std::io::stdout().lock();
     let mut write_err = None;
     let mut at_line_start = true;
-    session.turn(args.prompt, &AtomicBool::new(false), |shown| {
+    session.turn(prompt, &AtomicBool::new(false), |shown| {
         let r = match shown {
             agent::Shown::Request(body) if show_request => {
                 let mut err = std::io::stderr().lock();

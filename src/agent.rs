@@ -22,6 +22,8 @@ pub enum Shown<'a> {
     /// The exact bytes about to be sent.
     Request(&'a [u8]),
     Stream(Event<'a>),
+    /// The provider's usage report for the request just finished.
+    Usage(&'a serde_json::Value),
     ToolDone {
         name: &'a str,
         args: &'a str,
@@ -55,6 +57,9 @@ impl Session {
             on(Shown::Request(&body));
             let stream = openai::send(&self.base_url, self.api_key.as_deref(), &body)?;
             let outcome = openai::read_stream(stream, cancel, |e| on(Shown::Stream(e)))?;
+            if let Some(u) = &outcome.usage {
+                on(Shown::Usage(u));
+            }
             let mut reply = outcome.reply;
             for (n, call) in reply.calls.iter_mut().enumerate() {
                 if call.id.is_empty() {
@@ -110,7 +115,7 @@ fn system_prompt(tools: &Tools) -> String {
 The user owns you and can see everything you are given, this text included; \
 answer questions about yourself plainly.\n\
 Working directory: {cwd}\n\
-Date: {date}",
+Date (UTC): {date}",
         name = crate::NAME,
         cwd = tools.cwd().display(),
         date = today(),
