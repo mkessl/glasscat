@@ -45,6 +45,9 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
   limits and overloaded servers, are retried up to three times, in plain view.
 - **File tools**: read, list, find, search, write, edit and delete. Several reads run at the same time.
   Edits keep a file's line endings and byte order mark.
+- **Tools of your own.** Give the model any program to run, such as your build or tests,
+  with its arguments put into the command line and no shell in between
+  ([how](#tools-of-your-own)).
 - **Undo.** Every change the agent makes is written to a journal. `/undo` takes changes back
   one at a time, and leaves alone a file you changed yourself in the meantime.
 - **Instructions.** `AGENTS.md` in the working directory and your own
@@ -58,7 +61,11 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
   opens it.
 - **Markdown** in replies is rendered: headings, lists, quotes, code, bold and italic.
 - **Usage, cost and speed** of each request in the status bar: the context used out of the
-  model's window, cache hits, time to the first token, and tokens per second.
+  model's window, cache hits, time to the first token, tokens per second, and what all the
+  requests so far cost together.
+- **Reports, not telemetry.** When the model meets a fault of glasscat itself, it can write it
+  up with only what the fault needs. The report is saved on your machine and nothing is sent;
+  `/report` opens it as a new GitHub issue that you read and send yourself.
 
 ## Build
 
@@ -82,6 +89,9 @@ glasscat "what does src/main.rs do?"      # one answer, printed to stdout
 glasscat -c                               # pick up the last conversation held here
 ```
 
+With a prompt, the answer goes to stdout; tool calls, retries and the cost of the run go to
+stderr.
+
 | Option | Meaning |
 | --- | --- |
 | `-c`, `--continue` | pick up the last conversation held in this directory |
@@ -104,7 +114,10 @@ Inside a session:
 | <kbd>Ctrl</kbd>+<kbd>O</kbd> | show or fold reasoning |
 | <kbd>Shift</kbd>+drag | select text (in most terminals) |
 | `/model <id>` | switch the model |
+| `/models <words>` | find models by id, with context window and price |
 | `/undo` | undo the agent's last file change |
+| `/tools` | the model's tools: which only read, and what your own ones run |
+| `/report` | open the model's last report about a glasscat fault as a new issue |
 | `/edit` | change the context in `$EDITOR` before the next request |
 | `/copy` | copy the last reply to the clipboard |
 | `/set <name> <value>` | set a request field for this session, such as `temperature 0.3`; `/set` lists them |
@@ -157,6 +170,7 @@ server under `providers`:
 | `allow`, `hide` | like `--allow` and `--hide`, added to them |
 | `request` | fields set in every request body, such as `temperature` or `reasoning`; `null` removes one |
 | `models` | settings for one model by its id; for now its own `request` fields, over the others |
+| `tools` | tools of your own: programs the model may run, see below |
 | `instructions` | files in the working directory added to the system prompt (default `["AGENTS.md"]`) |
 | `proxy` | a proxy for every provider; a provider's own `proxy` wins, and `--proxy` wins over both |
 
@@ -165,16 +179,54 @@ message), `prefix` or `partial` (that flag on the message), or `none` to ask aga
 
 With no proxy set, the usual `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` variables apply.
 
+### Tools of your own
+
+Give the model a program to run, and only that program:
+
+```json
+{
+  "tools": {
+    "check": {
+      "description": "Compile the project and report errors.",
+      "command": ["cargo", "check", "--message-format=short"],
+      "read_only": true
+    },
+    "grep": {
+      "description": "Search files for a regular expression.",
+      "command": ["rg", "-n", "{pattern}", "{paths}"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": { "type": "string" },
+          "paths": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["pattern"]
+      }
+    }
+  }
+}
+```
+
+`{name}` in the command becomes the model's argument of that name; a list becomes several
+arguments, and a missing one is left out. No shell is involved, so nothing in an argument is
+run as a command. The program runs in the working directory and is stopped after `timeout`
+seconds (default 120) or when you press <kbd>Esc</kbd>; the model gets the exit status and
+the output. `read_only` lets it run at the same time as other reading calls.
+
+A tool of your own is outside the rules for hidden paths, and `/undo` cannot take back what
+it changes: it does exactly what the program does.
+
 ## What you can see
 
 | | |
 | --- | --- |
 | The system prompt and tool definitions | <kbd>Ctrl</kbd>+<kbd>T</kbd>, word for word |
+| Which tools the model has, and what each one runs | `/tools` |
 | The exact bytes of each request | <kbd>Ctrl</kbd>+<kbd>T</kbd>, then <kbd>r</kbd>; or `--show-request` |
 | Size of each part of the context | <kbd>Ctrl</kbd>+<kbd>T</kbd> |
 | The whole context, to change as you like | `/edit` |
 | What a tool kept from the model, and why | under the tool call |
-| Tokens in and out, cache hits, cost | status bar |
+| Tokens in and out, cache hits, cost, and the sum of it so far | status bar |
 | How much of the model's context window is used | status bar, when the provider's model list says |
 | Time to the first token, time in all, output speed | status bar |
 | Which model and provider ran each reply | status bar, when a router such as OpenRouter says |
@@ -182,6 +234,7 @@ With no proxy set, the usual `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` variables
 | The model's reasoning | as it streams; <kbd>Ctrl</kbd>+<kbd>O</kbd> afterwards |
 | Every file change, old and new text | `~/.local/share/glasscat/edits/` |
 | Every conversation | `~/.local/share/glasscat/conversations/` |
+| Reports the model wrote about faults of glasscat | `~/.local/share/glasscat/reports/` |
 
 ## Support the project
 

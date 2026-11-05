@@ -30,6 +30,8 @@ pub struct Settings {
     pub request: Map<String, Value>,
     /// Settings for one model, by its id.
     pub models: BTreeMap<String, Model>,
+    /// Tools of the user's own: programs the model may run.
+    pub tools: BTreeMap<String, crate::custom::CustomTool>,
     /// Files in the working directory whose text goes into the system
     /// prompt; `AGENTS.md` when not set.
     pub instructions: Option<Vec<String>>,

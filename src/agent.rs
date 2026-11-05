@@ -9,7 +9,7 @@ use crate::Result;
 use crate::context::{Item, Reply, ToolSpec};
 use crate::history;
 use crate::openai::{self, Event, Prefill};
-use crate::tools::{self, Tools};
+use crate::tools::Tools;
 
 pub struct Session {
     pub base_url: String,
@@ -61,9 +61,10 @@ pub enum Shown<'a> {
         name: &'a str,
         args: &'a str,
         result: &'a str,
-        /// What the tool kept from the model (hidden paths, paths outside
-        /// the allowed folders), for the user only.
-        withheld: Option<&'a str>,
+        /// For the user only: what the tool kept from the model (hidden
+        /// paths, paths outside the allowed folders), or where a report
+        /// was saved.
+        note: Option<&'a str>,
     },
 }
 
@@ -76,6 +77,7 @@ impl Session {
         tools: Tools,
     ) -> Self {
         let items = vec![Item::System(system_prompt(&tools))];
+        let specs = tools.all_specs();
         Self {
             base_url,
             proxy: None,
@@ -85,7 +87,7 @@ impl Session {
             prefill,
             items,
             tools,
-            specs: tools::specs(),
+            specs,
             notes: Vec::new(),
             log: None,
         }
@@ -296,13 +298,13 @@ impl Session {
             if cut || calls.is_empty() {
                 return Ok(());
             }
-            let results = self.run_calls(&calls);
-            for (call, (result, withheld)) in calls.into_iter().zip(results) {
+            let results = self.run_calls(&calls, cancel);
+            for (call, (result, note)) in calls.into_iter().zip(results) {
                 on(Shown::ToolDone {
                     name: &call.name,
                     args: &call.args,
                     result: &result,
-                    withheld: withheld.as_deref(),
+                    note: note.as_deref(),
                 });
                 self.items.push(Item::ToolResult {
                     call_id: call.id,
@@ -313,13 +315,17 @@ impl Session {
     }
 
     /// Calls that change nothing run at the same time; otherwise in order.
-    fn run_calls(&self, calls: &[crate::context::ToolCall]) -> Vec<(String, Option<String>)> {
+    fn run_calls(
+        &self,
+        calls: &[crate::context::ToolCall],
+        cancel: &AtomicBool,
+    ) -> Vec<(String, Option<String>)> {
         let tools = &self.tools;
-        if calls.len() > 1 && calls.iter().all(|c| tools::read_only(&c.name)) {
+        if calls.len() > 1 && calls.iter().all(|c| tools.reads_only(&c.name)) {
             std::thread::scope(|s| {
                 let handles: Vec<_> = calls
                     .iter()
-                    .map(|c| s.spawn(move || tools.run_noting(&c.name, &c.args)))
+                    .map(|c| s.spawn(move || tools.run_noting(&c.name, &c.args, cancel)))
                     .collect();
                 handles
                     .into_iter()
@@ -332,7 +338,7 @@ impl Session {
         } else {
             calls
                 .iter()
-                .map(|c| tools.run_noting(&c.name, &c.args))
+                .map(|c| tools.run_noting(&c.name, &c.args, cancel))
                 .collect()
         }
     }
@@ -398,11 +404,16 @@ fn system_prompt(tools: &Tools) -> String {
     format!(
         "You are {name}, an AI agent working on the user's computer through your tools. \
 The user owns you and can see everything you are given, this text included; \
-answer questions about yourself plainly.\n\
+answer questions about yourself plainly. \
+You may call several tools in one reply; those that only read run at the same time. \
+You can run only what your tools offer; the built-in ones work on files, and cannot run \
+programs, builds or tests. Say what is unchecked instead of claiming it works.\n\
 Working directory: {cwd}\n\
+System: {os}\n\
 Date (UTC): {date}",
         name = crate::NAME,
         cwd = tools.cwd().display(),
+        os = std::env::consts::OS,
         date = today(),
     )
 }

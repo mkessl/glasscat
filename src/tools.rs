@@ -5,11 +5,13 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 
 use serde_json::{Value, json};
 
 use crate::access::{Access, not_found};
 use crate::context::ToolSpec;
+use crate::custom::CustomTool;
 use crate::journal::Journal;
 
 const READ_MAX_LINES: usize = 2000;
@@ -26,6 +28,10 @@ pub struct Tools {
     journal: Journal,
     /// This run's changes, last at the end, for /undo.
     changes: Mutex<Vec<Change>>,
+    /// The user's own tools, from the settings.
+    custom: std::collections::BTreeMap<String, CustomTool>,
+    /// Where reports to the developers are saved.
+    pub reports: PathBuf,
 }
 
 /// One change to a file and what it takes to undo it.
@@ -145,6 +151,7 @@ pub fn specs() -> Vec<ToolSpec> {
                 "required": ["path"],
             }),
         ),
+        crate::report::spec(),
     ]
 }
 
@@ -153,13 +160,81 @@ pub fn read_only(name: &str) -> bool {
     matches!(name, "read" | "list" | "find" | "search")
 }
 
+/// The text up to the first full stop that ends a sentence, without it.
+fn first_sentence(s: &str) -> &str {
+    let mut from = 0;
+    while let Some(i) = s[from..].find(". ").map(|i| i + from) {
+        if !(s[..i].ends_with("e.g") || s[..i].ends_with("i.e")) {
+            return &s[..i];
+        }
+        from = i + 2;
+    }
+    s.trim_end().trim_end_matches('.')
+}
+
 impl Tools {
     pub fn new(access: Access, journal: Journal) -> Self {
         Self {
             access,
             journal,
             changes: Mutex::new(Vec::new()),
+            custom: Default::default(),
+            reports: crate::journal::data_dir().join("reports"),
         }
+    }
+
+    /// Adds the user's own tools; none may take a built-in tool's name.
+    pub fn with_custom(
+        mut self,
+        custom: std::collections::BTreeMap<String, CustomTool>,
+    ) -> Result<Self, String> {
+        let builtin = specs();
+        if let Some(name) = custom
+            .keys()
+            .find(|n| builtin.iter().any(|s| &s.name == *n))
+        {
+            return Err(format!(
+                "the tool {name} in the settings has a built-in tool's name"
+            ));
+        }
+        self.custom = custom;
+        Ok(self)
+    }
+
+    /// The definitions given to the model: built-in tools, then the user's.
+    pub fn all_specs(&self) -> Vec<ToolSpec> {
+        let mut all = specs();
+        all.extend(self.custom.iter().map(|(n, t)| crate::custom::spec(n, t)));
+        all
+    }
+
+    /// The tools the model has, one per line: whether each only reads,
+    /// the first sentence it is described with, and for a tool of the
+    /// user's own the program it runs.
+    pub fn summary(&self) -> String {
+        let specs = self.all_specs();
+        let width = specs.iter().map(|t| t.name.len()).max().unwrap_or(0);
+        let mut out = String::from("The model's tools:");
+        for t in &specs {
+            let kind = if t.name == crate::report::TOOL {
+                "saves  "
+            } else if self.reads_only(&t.name) {
+                "reads  "
+            } else {
+                "changes"
+            };
+            let first = first_sentence(&t.description);
+            out += &format!("\n  {:<width$}  {kind}  {first}", t.name);
+            if let Some(c) = self.custom.get(&t.name) {
+                out += &format!(" (runs {})", c.command.join(" "));
+            }
+        }
+        out
+    }
+
+    /// Whether a call only reads, so it may run beside others.
+    pub fn reads_only(&self, name: &str) -> bool {
+        read_only(name) || self.custom.get(name).is_some_and(|t| t.read_only)
     }
 
     fn remember(&self, change: Change) {
@@ -240,12 +315,49 @@ impl Tools {
             .collect()
     }
 
-    /// Runs a tool; returns what the model gets back, and for the user,
-    /// what was kept from the model.
-    pub fn run_noting(&self, name: &str, args: &str) -> (String, Option<String>) {
+    /// Runs a tool; returns what the model gets back, and a note for the
+    /// user only: what was kept from the model, or where a report went.
+    pub fn run_noting(
+        &self,
+        name: &str,
+        args: &str,
+        cancel: &AtomicBool,
+    ) -> (String, Option<String>) {
+        if name == crate::report::TOOL {
+            let args = serde_json::from_str(args).unwrap_or(Value::Null);
+            return match crate::report::save(&self.reports, &args) {
+                Ok((back, note)) => (back, Some(note)),
+                Err(e) => (format!("error: {e}"), None),
+            };
+        }
         crate::access::take_withheld();
-        let result = self.run(name, args);
-        (result, crate::access::take_withheld())
+        let result = match self.custom.get(name) {
+            Some(t) => self.run_custom(name, t, args, cancel),
+            None => self.run(name, args),
+        };
+        let kept = crate::access::take_withheld();
+        (result, kept.map(|w| format!("Kept from the model: {w}.")))
+    }
+
+    fn run_custom(&self, name: &str, t: &CustomTool, args: &str, cancel: &AtomicBool) -> String {
+        let args: Value = if args.trim().is_empty() {
+            json!({})
+        } else {
+            match serde_json::from_str(args) {
+                Ok(v) => v,
+                Err(e) => return format!("error: arguments are not valid JSON: {e}"),
+            }
+        };
+        let cmd = match crate::custom::command_line(t, &args) {
+            Ok(c) => c,
+            Err(e) => return format!("error: {e}"),
+        };
+        let result = crate::custom::run(t, &cmd, self.cwd(), cancel);
+        let ended = result.lines().next().unwrap_or_default();
+        let _ = self
+            .journal
+            .record(json!({ "tool": name, "command": cmd, "ended": ended }));
+        result
     }
 
     /// Runs a tool and returns what the model gets back.
@@ -1010,5 +1122,32 @@ mod tests {
         );
         let journal = fs::read_to_string(f.base.join("journal.jsonl")).unwrap();
         assert_eq!(journal.lines().count(), 2);
+    }
+
+    #[test]
+    fn summary_names_each_tool() {
+        let mut f = fixture("summary");
+        let check: CustomTool = serde_json::from_value(json!({
+            "description": "Builds the project. Takes no arguments.",
+            "command": ["cargo", "check"]
+        }))
+        .unwrap();
+        f.tools.custom.insert("check".into(), check);
+        let s = f.tools.summary();
+        let line = |name: &str| {
+            s.lines()
+                .find(|l| l.trim_start().starts_with(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("{name} missing: {s}"))
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert!(line("read").starts_with("read reads "), "{s}");
+        assert!(line("find").contains("e.g. "), "{s}");
+        assert!(line("write").starts_with("write changes "), "{s}");
+        assert_eq!(
+            line("check"),
+            "check changes Builds the project (runs cargo check)"
+        );
     }
 }

@@ -1,12 +1,14 @@
 mod access;
 mod agent;
 mod context;
+mod custom;
 mod history;
 mod journal;
 mod models;
 mod openai;
 mod policy;
 mod provider;
+mod report;
 mod settings;
 mod sse;
 #[cfg(test)]
@@ -100,6 +102,7 @@ fn run() -> Result<()> {
     let settings = settings::load()?;
     let instruction_files = settings.instruction_files();
     let model_settings = settings.models.clone();
+    let custom_tools = settings.tools.clone();
     let cwd = std::env::current_dir()?;
     let (saved, log) = if args.resume {
         let path =
@@ -137,7 +140,9 @@ fn run() -> Result<()> {
     let mut hidden = args.hide;
     hidden.extend(settings.hide);
     let access = access::Access::new(&cwd, &allowed, &hidden)?;
-    let tools = tools::Tools::new(access, journal::Journal::for_session());
+    let tools = tools::Tools::new(access, journal::Journal::for_session())
+        .with_custom(custom_tools)
+        .map_err(|e| format!("{}: {e}", settings::path().display()))?;
     let mut session = agent::Session::new(provider.base_url, model, key, provider.prefill, tools);
     session.proxy = args.proxy.or(provider.proxy);
     session.fields.settings = provider.request;
@@ -173,6 +178,8 @@ fn run() -> Result<()> {
     let mut at_line_start = true;
     // Blank lines a reply starts with are left out.
     let mut fresh = true;
+    // What the requests cost together, and how many reported a cost.
+    let mut spent = (0.0, 0);
     let turn = session.turn(prompt, &AtomicBool::new(false), |shown| {
         let r = match shown {
             agent::Shown::Request(body) if show_request => {
@@ -192,7 +199,7 @@ fn run() -> Result<()> {
                 name,
                 args,
                 result,
-                withheld,
+                note,
             } => {
                 fresh = true;
                 if !at_line_start {
@@ -206,13 +213,14 @@ fn run() -> Result<()> {
                 } else {
                     String::new()
                 };
-                let withheld = withheld
-                    .map(|w| format!("\n  kept from the model: {w}"))
-                    .unwrap_or_default();
-                writeln!(
-                    std::io::stderr(),
-                    "› {name} {args}\n  {first}{more}{withheld}"
-                )
+                let note = note.map(|n| format!("\n  {n}")).unwrap_or_default();
+                writeln!(std::io::stderr(), "› {name} {args}\n  {first}{more}{note}")
+            }
+            agent::Shown::Usage(u) => {
+                if let Some(c) = u.get("cost").and_then(serde_json::Value::as_f64) {
+                    spent = (spent.0 + c, spent.1 + 1);
+                }
+                Ok(())
             }
             agent::Shown::Retrying { error, wait, .. } => writeln!(
                 std::io::stderr(),
@@ -227,6 +235,10 @@ fn run() -> Result<()> {
     });
     if !at_line_start {
         writeln!(out)?;
+    }
+    if spent.1 > 0 {
+        let s = if spent.1 == 1 { "" } else { "s" };
+        eprintln!("cost ${:.4} for {} request{s}", spent.0, spent.1);
     }
     turn?;
     if let Some(e) = write_err {

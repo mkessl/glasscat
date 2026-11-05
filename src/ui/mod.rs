@@ -1,5 +1,6 @@
 //! The full-screen terminal interface.
 
+mod commands;
 mod context;
 mod input;
 mod markdown;
@@ -66,7 +67,7 @@ enum AgentMsg {
         name: String,
         args: String,
         result: String,
-        withheld: Option<String>,
+        note: Option<String>,
     },
     Usage(Value),
     Served(Served),
@@ -92,6 +93,8 @@ struct App {
     last_request: Vec<u8>,
     busy: Option<String>,
     usage: Option<Value>,
+    /// Cost of every request in this run, and how many reported one.
+    spent: (f64, u32),
     /// Who answered last, as the stream said.
     served: Option<Served>,
     /// The last request's time to first token and in all.
@@ -99,6 +102,8 @@ struct App {
     api: Api,
     /// The model whose context window was looked up, and the window.
     window: Option<(String, Option<u64>)>,
+    /// Whether the user was told the context is nearly full.
+    warned_full: bool,
     cancel: Arc<AtomicBool>,
     tx: Sender<Msg>,
     /// Where the input was drawn: first screen row and first text row shown.
@@ -160,6 +165,7 @@ pub fn run(session: Session) -> Result<()> {
         last_request: Vec::new(),
         busy: None,
         usage: None,
+        spent: (0.0, 0),
         cancel: Arc::new(AtomicBool::new(false)),
         tx,
         input_at: (0, 0),
@@ -172,6 +178,7 @@ pub fn run(session: Session) -> Result<()> {
         timing: None,
         api,
         window: None,
+        warned_full: false,
     };
     let model = app.model.clone();
     app.look_up_window(&model);
@@ -261,6 +268,7 @@ impl App {
             Msg::Window(model, n) => {
                 if self.window.as_ref().is_some_and(|w| w.0 == model) {
                     self.window = Some((model, n));
+                    self.warn_if_full();
                 }
             }
             Msg::Done(session, err) => {
@@ -272,6 +280,28 @@ impl App {
                 }
                 self.hint_unanswered(cancelled);
             }
+        }
+    }
+
+    /// Says once when the last request filled most of the model's window.
+    fn warn_if_full(&mut self) {
+        let used = self
+            .usage
+            .as_ref()
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(Value::as_u64);
+        let Some((used, window)) = used.zip(self.window.as_ref().and_then(|w| w.1)) else {
+            return;
+        };
+        let full = used * 100 / window.max(1);
+        if full < 80 {
+            self.warned_full = false;
+        } else if !self.warned_full {
+            self.warned_full = true;
+            self.transcript.push(Block::Info(format!(
+                "The context is at {full}% of the model's window. /edit can cut it down; \
+                 /clear starts anew."
+            )));
         }
     }
 
@@ -408,15 +438,24 @@ impl App {
                 name,
                 args,
                 result,
-                withheld,
+                note,
             } => {
+                let report = name == crate::report::TOOL;
                 self.transcript.push(Block::Tool { name, args, result });
-                if let Some(w) = withheld {
-                    self.transcript
-                        .push(Block::Info(format!("Kept from the model: {w}.")));
+                if let Some(mut n) = note {
+                    if report {
+                        n += " /report opens it as a new issue on the project's page, for you to send.";
+                    }
+                    self.transcript.push(Block::Info(n));
                 }
             }
-            AgentMsg::Usage(u) => self.usage = Some(u),
+            AgentMsg::Usage(u) => {
+                if let Some(c) = u.get("cost").and_then(Value::as_f64) {
+                    self.spent = (self.spent.0 + c, self.spent.1 + 1);
+                }
+                self.usage = Some(u);
+                self.warn_if_full();
+            }
             AgentMsg::Served(s) => {
                 self.look_up_window(&s.model);
                 self.served = Some(s);
@@ -444,152 +483,6 @@ impl App {
     }
 
     /// Runs the input as a command if its first word names one.
-    fn command(&mut self) -> bool {
-        let text = self.input.text().trim().to_string();
-        let (name, arg) = text.split_once(' ').unwrap_or((&text, ""));
-        let arg = arg.trim();
-        if !COMMANDS.iter().any(|(n, _)| *n == name) {
-            return false;
-        }
-        self.input.take();
-        self.scroll = 0;
-        if name == "/help" {
-            self.transcript.push(Block::Info(help()));
-            return true;
-        }
-        let Some(session) = self.session.as_mut() else {
-            self.transcript
-                .push(Block::Error("Still working; Esc stops it first.".into()));
-            return true;
-        };
-        match name {
-            "/clear" => {
-                session.clear();
-                self.transcript.clear();
-                self.usage = None;
-                self.served = None;
-                self.timing = None;
-                self.last_request.clear();
-                self.transcript
-                    .push(Block::Info("A new conversation.".into()));
-            }
-            "/model" if arg.is_empty() => {
-                self.transcript
-                    .push(Block::Info(format!("The model is {}.", session.model)));
-            }
-            "/model" => {
-                session.model = arg.to_string();
-                self.model = arg.to_string();
-                self.served = None;
-                self.look_up_window(arg);
-                self.transcript
-                    .push(Block::Info(format!("The model is now {arg}.")));
-            }
-            "/edit" => self.edit_context(),
-            "/set" if arg.is_empty() => {
-                let sources = session.fields.sources(&session.model);
-                let text = if sources.is_empty() {
-                    "No request fields are set. /set NAME VALUE sets one for this session; \
-                     the settings file sets them for good."
-                        .to_string()
-                } else {
-                    let fields: Vec<String> = sources
-                        .iter()
-                        .map(|(k, v, from)| match v {
-                            Value::Null => format!("  {k}: left out, by {from}"),
-                            v => format!("  {k}: {v}, by {from}"),
-                        })
-                        .collect();
-                    format!("Set in every request:\n{}", fields.join("\n"))
-                };
-                self.transcript.push(Block::Info(text));
-            }
-            "/set" => {
-                let (key, value) = arg.split_once(' ').unwrap_or((arg, ""));
-                let value = value.trim();
-                let text = if value.is_empty() {
-                    session.fields.session.remove(key);
-                    let now = session.fields.sources(&session.model);
-                    match now.iter().find(|f| f.0 == key) {
-                        Some((_, v, from)) => format!("{key} is {v} again, by {from}."),
-                        None => format!("{key} is back to how {} sends it.", crate::NAME),
-                    }
-                } else {
-                    // JSON when it reads as JSON, otherwise a string.
-                    let value: Value =
-                        serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.into()));
-                    let text = if value.is_null() {
-                        format!("{key} is now left out of every request.")
-                    } else {
-                        format!("Every request now has {key}: {value}.")
-                    };
-                    session.fields.session.insert(key.to_string(), value);
-                    text
-                };
-                self.transcript.push(Block::Info(text));
-            }
-            "/copy" => {
-                let last = session.items.iter().rev().find_map(|i| match i {
-                    Item::Assistant(r) if !r.text.trim().is_empty() => Some(r.text.trim()),
-                    _ => None,
-                });
-                let Some(text) = last else {
-                    self.transcript
-                        .push(Block::Error("There is no reply to copy yet.".into()));
-                    return true;
-                };
-                // OSC 52: the terminal puts the text on the clipboard, also over SSH.
-                let mut out = io::stdout();
-                let _ = write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()));
-                let _ = out.flush();
-                self.transcript.push(Block::Info(format!(
-                    "Copied the last reply ({} characters) to the clipboard, if the terminal \
-                     allows it. In tmux that needs set-clipboard on.",
-                    text.chars().count()
-                )));
-            }
-            "/provider" => {
-                let name = session.log.as_ref().map_or("unnamed", |l| l.1.as_str());
-                let base = session.base_url.clone();
-                let proxy = session.proxy.clone();
-                let mut text = format!("The provider is {name}, at {base}.");
-                match self.served.clone() {
-                    Some(s) if crate::policy::known(&base) => {
-                        text.push_str(" Asking OpenRouter about the last reply…");
-                        let tx = self.tx.clone();
-                        std::thread::spawn(move || {
-                            let b = match crate::policy::describe(&base, proxy.as_deref(), &s) {
-                                Ok(t) => Block::Info(t),
-                                Err(e) => Block::Error(format!("policy lookup failed: {e}")),
-                            };
-                            let _ = tx.send(Msg::Block(b));
-                        });
-                    }
-                    _ if crate::policy::known(&base) => text.push_str(
-                        " OpenRouter names the provider that ran a model with each reply; \
-                         ask again after one.",
-                    ),
-                    Some(s) => text.push_str(&format!(
-                        " The last reply came from {}. {} knows no policy API for this provider.",
-                        s.model,
-                        crate::NAME
-                    )),
-                    None => text.push_str(&format!(
-                        " {} knows no policy API for this provider.",
-                        crate::NAME
-                    )),
-                }
-                self.transcript.push(Block::Info(text));
-            }
-            "/undo" => match session.undo() {
-                Ok(done) => self.transcript.push(Block::Info(done)),
-                Err(e) => self.transcript.push(Block::Error(e)),
-            },
-            _ => unreachable!("listed in COMMANDS"),
-        }
-        true
-    }
-
     fn send(&mut self) {
         if self.command() {
             return;
@@ -638,12 +531,12 @@ impl App {
                     name,
                     args,
                     result,
-                    withheld,
+                    note,
                 } => send(AgentMsg::Tool {
                     name: name.into(),
                     args: args.into(),
                     result: result.into(),
-                    withheld: withheld.map(Into::into),
+                    note: note.map(Into::into),
                 }),
             };
             let r = match prompt {
@@ -841,7 +734,8 @@ impl App {
         }
         // On a narrow screen the timing goes first, then the usage.
         let window = self.window.as_ref().and_then(|w| w.1);
-        let usage = usage_text(self.usage.as_ref(), window);
+        let spent = (self.spent.1 > 1).then_some(self.spent.0);
+        let usage = usage_text(self.usage.as_ref(), window, spent);
         let timing = timing_text(self.timing, self.usage.as_ref());
         let right = [
             format!("{usage}{timing}ctrl+t context "),
@@ -940,71 +834,11 @@ fn put_line(screen: &mut Screen, y: u16, w: u16, line: &transcript::Line) {
     }
 }
 
-const COMMANDS: &[(&str, &str)] = &[
-    ("/help", "this list"),
-    ("/clear", "start a new conversation"),
-    ("/model", "show the model; /model <id> switches to another"),
-    ("/undo", "undo the agent's last change to a file"),
-    (
-        "/edit",
-        "edit the whole context in $EDITOR before the next request",
-    ),
-    ("/copy", "copy the last reply to the clipboard"),
-    (
-        "/set",
-        "request fields; /set NAME VALUE sets one (null leaves it out), /set NAME unsets",
-    ),
-    (
-        "/provider",
-        "who ran the last reply, and what they publish about your data",
-    ),
-];
-
-const KEYS: &[(&str, &str)] = &[
-    (
-        "Enter",
-        "send; on an empty line, pick up a reply that did not finish",
-    ),
-    ("Shift+Enter, Alt+Enter, Ctrl+J", "new line"),
-    ("Esc", "stop the reply"),
-    ("Ctrl+C", "stop, clear the input, or quit"),
-    ("Ctrl+D", "quit on an empty line"),
-    ("Ctrl+T", "the exact context sent to the model"),
-    ("Ctrl+O", "show or fold the model's reasoning"),
-    (
-        "Up, Down",
-        "move between lines and through earlier messages",
-    ),
-    ("PageUp, PageDown, wheel", "scroll"),
-    (
-        "Shift+drag",
-        "select text in most terminals; /copy copies a whole reply",
-    ),
-    ("Ctrl+A, Ctrl+E", "start, end of line"),
-    (
-        "Ctrl+U, Ctrl+K, Ctrl+W",
-        "delete to line start, to line end, a word",
-    ),
-];
-
-fn help() -> String {
-    let width = |t: &[(&str, &str)]| t.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
-    let (cw, kw) = (width(COMMANDS), width(KEYS));
-    let mut out = String::from("Commands\n");
-    for (name, what) in COMMANDS {
-        out += &format!("  {name:<cw$}  {what}\n");
-    }
-    out += "\nKeys\n";
-    for (key, what) in KEYS {
-        out += &format!("  {key:<kw$}  {what}\n");
-    }
-    out.trim_end().to_string()
-}
-
 /// Tokens and cost from the provider's usage report.
-/// `in 1200/128k (1000 cached) · out 30 · $0.0001`; the window is the
-/// model's context window, when the provider says.
-fn usage_text(u: Option<&Value>, window: Option<u64>) -> String {
+/// `in 1200/128k (1000 cached) · out 30 · $0.0001 ($0.0040 in all)`; the
+/// window is the model's context window, when the provider says, and the
+/// sum is what the requests of this run cost together.
+fn usage_text(u: Option<&Value>, window: Option<u64>, spent: Option<f64>) -> String {
     let Some(u) = u else { return String::new() };
     let n = |k: &str| u.get(k).and_then(Value::as_u64);
     let mut parts = Vec::new();
@@ -1012,7 +846,9 @@ fn usage_text(u: Option<&Value>, window: Option<u64>) -> String {
         let cached = u
             .pointer("/prompt_tokens_details/cached_tokens")
             .and_then(Value::as_u64);
-        let of = window.map(|w| format!("/{}", short(w))).unwrap_or_default();
+        let of = window
+            .map(|w| format!("/{}", crate::models::short(w)))
+            .unwrap_or_default();
         match cached {
             Some(c) if c > 0 => parts.push(format!("in {p}{of} ({c} cached)")),
             _ => parts.push(format!("in {p}{of}")),
@@ -1022,49 +858,15 @@ fn usage_text(u: Option<&Value>, window: Option<u64>) -> String {
         parts.push(format!("out {c}"));
     }
     if let Some(cost) = u.get("cost").and_then(Value::as_f64) {
-        parts.push(format!("${cost:.4}"));
+        match spent {
+            Some(all) => parts.push(format!("${cost:.4} (${all:.4} in all)")),
+            None => parts.push(format!("${cost:.4}")),
+        }
     }
     if parts.is_empty() {
         return String::new();
     }
     parts.join(" · ") + " · "
-}
-
-/// Standard base64 with padding.
-fn base64(bytes: &[u8]) -> String {
-    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(ABC[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
-/// A token count in a few characters: 950, 8.2k, 131k, 1M, 1.5M.
-fn short(n: u64) -> String {
-    let f = |v: f64, unit: &str| {
-        let s = if v < 10.0 {
-            format!("{v:.1}")
-        } else {
-            format!("{v:.0}")
-        };
-        format!("{}{unit}", s.trim_end_matches(".0"))
-    };
-    match n {
-        0..1000 => n.to_string(),
-        1000..1_000_000 => f(n as f64 / 1000.0, "k"),
-        _ => f(n as f64 / 1_000_000.0, "M"),
-    }
 }
 
 /// `first 0.4s · 2.1s · 52 tok/s`: time to the first token, in all, and
@@ -1160,24 +962,19 @@ mod tests {
         let u = json!({"prompt_tokens": 1200, "completion_tokens": 30, "cost": 0.00012,
                        "prompt_tokens_details": {"cached_tokens": 1000}});
         assert_eq!(
-            usage_text(Some(&u), Some(131_072)),
+            usage_text(Some(&u), Some(131_072), None),
             "in 1200/131k (1000 cached) · out 30 · $0.0001 · "
         );
-        assert_eq!(usage_text(None, None), "");
+        assert_eq!(
+            usage_text(Some(&u), None, Some(0.004)),
+            "in 1200 (1000 cached) · out 30 · $0.0001 ($0.0040 in all) · "
+        );
+        assert_eq!(usage_text(None, None, None), "");
         let shorts: Vec<String> = [950, 8192, 131_072, 1_000_000, 1_500_000]
             .into_iter()
-            .map(short)
+            .map(crate::models::short)
             .collect();
         assert_eq!(shorts, ["950", "8.2k", "131k", "1M", "1.5M"]);
-    }
-
-    #[test]
-    fn base64_matches_the_standard() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64("héllo wörld".as_bytes()), "aMOpbGxvIHfDtnJsZA==");
     }
 
     #[test]
