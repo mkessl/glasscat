@@ -108,7 +108,7 @@ pub fn run(session: Session) -> Result<()> {
         quit: false,
     };
     app.transcript.push(Block::Info(format!(
-        "{} · {} · Enter sends, Shift+Enter adds a line, Ctrl+T shows the exact context, Ctrl+C quits",
+        "{} · {} · /help lists commands and keys",
         crate::NAME,
         app.model
     )));
@@ -233,7 +233,57 @@ impl App {
         }
     }
 
+    /// Runs the input as a command if its first word names one.
+    fn command(&mut self) -> bool {
+        let text = self.input.text().trim().to_string();
+        let (name, arg) = text.split_once(' ').unwrap_or((&text, ""));
+        let arg = arg.trim();
+        if !COMMANDS.iter().any(|(n, _)| *n == name) {
+            return false;
+        }
+        self.input.take();
+        self.scroll = 0;
+        if name == "/help" {
+            self.transcript.push(Block::Info(help()));
+            return true;
+        }
+        let Some(session) = self.session.as_mut() else {
+            self.transcript
+                .push(Block::Error("Still working; Esc stops it first.".into()));
+            return true;
+        };
+        match name {
+            "/clear" => {
+                session.clear();
+                self.transcript.clear();
+                self.usage = None;
+                self.last_request.clear();
+                self.transcript
+                    .push(Block::Info("A new conversation.".into()));
+            }
+            "/model" if arg.is_empty() => {
+                self.transcript
+                    .push(Block::Info(format!("The model is {}.", session.model)));
+            }
+            "/model" => {
+                session.model = arg.to_string();
+                self.model = arg.to_string();
+                self.transcript
+                    .push(Block::Info(format!("The model is now {arg}.")));
+            }
+            "/undo" => match session.undo() {
+                Ok(done) => self.transcript.push(Block::Info(done)),
+                Err(e) => self.transcript.push(Block::Error(e)),
+            },
+            _ => unreachable!("listed in COMMANDS"),
+        }
+        true
+    }
+
     fn send(&mut self) {
+        if self.command() {
+            return;
+        }
         let empty = self.input.text().trim().is_empty();
         let resume = empty && self.session.as_ref().is_some_and(|s| s.unanswered());
         if empty && !resume {
@@ -488,6 +538,48 @@ impl App {
 }
 
 /// Tokens and cost from the provider's usage report.
+const COMMANDS: &[(&str, &str)] = &[
+    ("/help", "this list"),
+    ("/clear", "start a new conversation"),
+    ("/model", "show the model; /model <id> switches to another"),
+    ("/undo", "undo the agent's last change to a file"),
+];
+
+const KEYS: &[(&str, &str)] = &[
+    (
+        "Enter",
+        "send; on an empty line, pick up a reply that did not finish",
+    ),
+    ("Shift+Enter, Alt+Enter, Ctrl+J", "new line"),
+    ("Esc", "stop the reply"),
+    ("Ctrl+C", "stop, clear the input, or quit"),
+    ("Ctrl+D", "quit on an empty line"),
+    ("Ctrl+T", "the exact context sent to the model"),
+    ("Ctrl+O", "show or fold the model's reasoning"),
+    (
+        "Up, Down",
+        "move between lines and through earlier messages",
+    ),
+    ("PageUp, PageDown, wheel", "scroll"),
+    ("Ctrl+A, Ctrl+E", "start, end of line"),
+    (
+        "Ctrl+U, Ctrl+K, Ctrl+W",
+        "delete to line start, to line end, a word",
+    ),
+];
+
+fn help() -> String {
+    let mut out = String::from("Commands\n");
+    for (name, what) in COMMANDS {
+        out += &format!("  {name:<8} {what}\n");
+    }
+    out += "\nKeys\n";
+    for (key, what) in KEYS {
+        out += &format!("  {key:<32} {what}\n");
+    }
+    out.trim_end().to_string()
+}
+
 fn usage_text(u: Option<&Value>) -> String {
     let Some(u) = u else { return String::new() };
     let n = |k: &str| u.get(k).and_then(Value::as_u64);

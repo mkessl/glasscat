@@ -4,6 +4,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde_json::{Value, json};
 
@@ -23,6 +24,32 @@ const SEARCH_FILE_MAX: u64 = 10 * 1024 * 1024;
 pub struct Tools {
     access: Access,
     journal: Journal,
+    /// This run's changes, last at the end, for /undo.
+    changes: Mutex<Vec<Change>>,
+}
+
+/// One change to a file and what it takes to undo it.
+struct Change {
+    path: PathBuf,
+    /// What the change was, in a few words: "the edit at line 3".
+    what: String,
+    /// Hash of the file right after the change, to see later changes.
+    after: u64,
+    undo: Undo,
+}
+
+enum Undo {
+    /// The file was created: remove it and the directories made for it,
+    /// deepest first.
+    Remove { dirs: Vec<PathBuf> },
+    /// The file was overwritten: put these bytes back.
+    Restore(Vec<u8>),
+    /// An edit: put `old` back at these byte offsets, where `new` stands.
+    Replace {
+        at: Vec<usize>,
+        old: String,
+        new: String,
+    },
 }
 
 pub fn specs() -> Vec<ToolSpec> {
@@ -114,7 +141,59 @@ pub fn read_only(name: &str) -> bool {
 
 impl Tools {
     pub fn new(access: Access, journal: Journal) -> Self {
-        Self { access, journal }
+        Self {
+            access,
+            journal,
+            changes: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn remember(&self, change: Change) {
+        self.changes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(change);
+    }
+
+    /// Undoes the last change still undone, leaving a file alone if it
+    /// was changed after; says what happened in a sentence.
+    pub fn undo(&self) -> Result<String, String> {
+        let change = self
+            .changes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+            .ok_or("No changes to undo.")?;
+        let shown = self.access.show(&change.path);
+        let now = fs::read(&change.path).ok();
+        if now.as_deref().map(fnv) != Some(change.after) {
+            return Err(format!(
+                "{shown} was changed after {}, so it was left as it is. /undo again goes one change further back.",
+                change.what
+            ));
+        }
+        let io = |e: io::Error| format!("could not undo {} in {shown}: {e}", change.what);
+        match &change.undo {
+            Undo::Remove { dirs } => {
+                fs::remove_file(&change.path).map_err(io)?;
+                for d in dirs {
+                    // Only while empty: the user may have put files there.
+                    let _ = fs::remove_dir(d);
+                }
+            }
+            Undo::Restore(bytes) => write_atomic(&change.path, bytes).map_err(io)?,
+            Undo::Replace { at, old, new } => {
+                let mut bytes = now.expect("hash matched");
+                for &i in at.iter().rev() {
+                    bytes.splice(i..i + new.len(), old.bytes());
+                }
+                write_atomic(&change.path, &bytes).map_err(io)?;
+            }
+        }
+        let _ = self
+            .journal
+            .record(json!({ "tool": "undo", "path": change.path, "what": change.what }));
+        Ok(format!("Undid {} in {shown}.", change.what))
     }
 
     pub fn cwd(&self) -> &Path {
@@ -298,10 +377,30 @@ impl Tools {
             return Err(format!("{path} is a directory"));
         }
         let old = fs::read(&real).ok();
+        let mut dirs = Vec::new();
         if let Some(dir) = real.parent() {
+            dirs = dir
+                .ancestors()
+                .take_while(|d| !d.exists())
+                .map(Path::to_path_buf)
+                .collect();
             fs::create_dir_all(dir).map_err(|e| io_err(path, e))?;
         }
         write_atomic(&real, content.as_bytes()).map_err(|e| io_err(path, e))?;
+        self.remember(Change {
+            path: real.clone(),
+            what: if old.is_some() {
+                "the overwrite"
+            } else {
+                "the creation"
+            }
+            .into(),
+            after: fnv(content.as_bytes()),
+            undo: match &old {
+                Some(bytes) => Undo::Restore(bytes.clone()),
+                None => Undo::Remove { dirs },
+            },
+        });
         let old_text = old.as_deref().map(String::from_utf8_lossy);
         self.journal
             .record(json!({ "tool": "write", "path": real, "old": old_text, "new": content }))
@@ -359,6 +458,22 @@ impl Tools {
         let first_line = line_of(at[0]);
         let changed = format!("{bom}{}", text.replace(&old, &new));
         write_atomic(&real, changed.as_bytes()).map_err(|e| io_err(path, e))?;
+        // Where each replacement now stands in the changed file.
+        let now_at = at
+            .iter()
+            .enumerate()
+            .map(|(n, &i)| bom.len() + i - n * old.len() + n * new.len())
+            .collect();
+        self.remember(Change {
+            path: real.clone(),
+            what: format!("the edit at line {}", line_of(at[0])),
+            after: fnv(changed.as_bytes()),
+            undo: Undo::Replace {
+                at: now_at,
+                old: old.clone(),
+                new: new.clone(),
+            },
+        });
         self.journal
             .record(json!({
                 "tool": "edit", "path": real, "line": first_line,
@@ -440,6 +555,13 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
     fs::rename(&tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
+    })
+}
+
+/// FNV-1a: a hash that stays the same across builds.
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     })
 }
 
@@ -581,6 +703,77 @@ mod tests {
             "src/lib.rs:1: pub fn a() {}\nsrc/lib.rs:2: pub fn b() {}\n"
         );
         assert!(run(&f, "search", json!({"pattern": "("})).contains("bad pattern"));
+    }
+
+    #[test]
+    fn undo_goes_back_one_change_at_a_time() {
+        let f = fixture("undo");
+        let p = f.base.join("proj");
+        let lib = fs::read(p.join("src/lib.rs")).unwrap();
+        // An edit with several matches whose length changes, an
+        // overwrite, and a new file in a new directory.
+        let edit =
+            json!({"path": "src/lib.rs", "old": "pub fn", "new": "pub(crate) fn", "all": true});
+        assert!(run(&f, "edit", edit).starts_with("edited"));
+        let main = fs::read(p.join("src/main.rs")).unwrap();
+        run(&f, "write", json!({"path": "src/main.rs", "content": "x"}));
+        run(
+            &f,
+            "write",
+            json!({"path": "new/deep/a.txt", "content": "a"}),
+        );
+
+        assert_eq!(
+            f.tools.undo().unwrap(),
+            "Undid the creation in new/deep/a.txt."
+        );
+        assert!(!p.join("new").exists(), "directories made for it go too");
+        assert_eq!(
+            f.tools.undo().unwrap(),
+            "Undid the overwrite in src/main.rs."
+        );
+        assert_eq!(fs::read(p.join("src/main.rs")).unwrap(), main);
+        assert_eq!(
+            f.tools.undo().unwrap(),
+            "Undid the edit at line 1 in src/lib.rs."
+        );
+        assert_eq!(fs::read(p.join("src/lib.rs")).unwrap(), lib);
+        assert_eq!(f.tools.undo().unwrap_err(), "No changes to undo.");
+    }
+
+    #[test]
+    fn undo_restores_bom_and_crlf_files_exactly() {
+        let f = fixture("undo-bom");
+        let path = f.base.join("proj/w.txt");
+        let orig = "\u{feff}one\r\ntwo\r\none\r\n";
+        fs::write(&path, orig).unwrap();
+        let edit = json!({"path": "w.txt", "old": "one\n", "new": "1\n", "all": true});
+        assert!(run(&f, "edit", edit).starts_with("edited"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "\u{feff}1\r\ntwo\r\n1\r\n"
+        );
+        f.tools.undo().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), orig);
+    }
+
+    #[test]
+    fn undo_leaves_a_file_changed_since() {
+        let f = fixture("undo-changed");
+        let path = f.base.join("proj/src/lib.rs");
+        run(
+            &f,
+            "edit",
+            json!({"path": "src/lib.rs", "old": "a()", "new": "c()"}),
+        );
+        fs::write(&path, "the user's own text").unwrap();
+        assert!(
+            f.tools
+                .undo()
+                .unwrap_err()
+                .contains("was changed after the edit at line 1")
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "the user's own text");
     }
 
     #[test]

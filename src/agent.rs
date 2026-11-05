@@ -17,6 +17,9 @@ pub struct Session {
     pub items: Vec<Item>,
     pub tools: Tools,
     specs: Vec<ToolSpec>,
+    /// What the model should learn with the next message, such as a
+    /// change the user undid.
+    notes: Vec<String>,
 }
 
 /// What a turn shows as it goes.
@@ -53,7 +56,23 @@ impl Session {
             items,
             tools,
             specs: tools::specs(),
+            notes: Vec::new(),
         }
+    }
+
+    /// Forgets the conversation; the system prompt stays.
+    pub fn clear(&mut self) {
+        self.items.truncate(1);
+        self.notes.clear();
+    }
+
+    /// Undoes the last file change the tools made; the model is told
+    /// with the next message.
+    pub fn undo(&mut self) -> std::result::Result<String, String> {
+        let done = self.tools.undo()?;
+        self.notes
+            .push(format!("[The user undid one of your changes. {done}]"));
+        Ok(done)
     }
 
     /// Runs one user message to the model's final answer.
@@ -63,6 +82,11 @@ impl Session {
         cancel: &AtomicBool,
         on: impl FnMut(Shown),
     ) -> Result<()> {
+        let prompt = if self.notes.is_empty() {
+            prompt
+        } else {
+            format!("{}\n\n{prompt}", std::mem::take(&mut self.notes).join("\n"))
+        };
         self.items.push(Item::User(prompt));
         self.run(cancel, on)
     }

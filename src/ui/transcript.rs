@@ -52,6 +52,11 @@ impl Transcript {
         self.cache.push(None);
     }
 
+    pub fn clear(&mut self) {
+        self.blocks.clear();
+        self.cache.clear();
+    }
+
     pub fn toggle_reasoning(&mut self) {
         self.reasoning_open ^= true;
         self.cache.iter_mut().for_each(|c| *c = None);
