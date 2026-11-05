@@ -3,6 +3,8 @@
 
 use std::io::{BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -171,7 +173,7 @@ struct FunctionDelta {
 }
 
 /// How often a waiting stream checks whether it was cancelled.
-const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(30);
+const CANCEL_POLL: Duration = Duration::from_millis(30);
 
 /// Reads a streamed response to its end, calling `on` for each piece.
 /// Reading happens on its own thread, so a cancel takes effect at once even
@@ -183,7 +185,7 @@ pub fn read_stream(
     cancel: &AtomicBool,
     mut on: impl FnMut(Event),
 ) -> Outcome {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<String, String>>(64);
+    let (tx, rx) = mpsc::sync_channel::<Result<String, String>>(64);
     std::thread::spawn(move || {
         let mut events = Events::new(BufReader::new(body));
         loop {
@@ -212,8 +214,8 @@ pub fn read_stream(
                 out.error = Some(e);
                 break;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if data == "[DONE]" {
             out.done = true;
@@ -281,9 +283,51 @@ pub fn read_stream(
 
 /// Sends a request body to `{base_url}/chat/completions` and returns the
 /// response stream. A non-success status becomes an error with the body.
-pub fn send(base_url: &str, api_key: Option<&str>, body: &[u8]) -> Result<impl Read + use<>> {
+/// Sends a request and waits for the response to start, on a thread so a
+/// cancel takes effect at once; `None` when cancelled. The thread left
+/// behind ends with the connection or its timeout.
+pub fn send(
+    base_url: &str,
+    api_key: Option<&str>,
+    body: &[u8],
+    cancel: &AtomicBool,
+) -> Result<Option<impl Read + Send + use<>>> {
+    let (tx, rx) = mpsc::sync_channel(1);
+    let (url, key, body) = (
+        base_url.to_string(),
+        api_key.map(str::to_string),
+        body.to_vec(),
+    );
+    std::thread::spawn(move || {
+        let _ = tx.send(post(&url, key.as_deref(), &body));
+    });
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        match rx.recv_timeout(CANCEL_POLL) {
+            Ok(r) => return r.map(Some),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("the request thread crashed".into());
+            }
+        }
+    }
+}
+
+/// Giving up on a silent connection. Generous: a local model may read a
+/// long prompt for minutes before its first byte, and a stop works at
+/// any time anyway.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const READ_TIMEOUT: Duration = Duration::from_secs(600);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn post(base_url: &str, api_key: Option<&str>, body: &[u8]) -> Result<ureq::BodyReader<'static>> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_per_read(Some(READ_TIMEOUT))
+        .timeout_per_write(Some(WRITE_TIMEOUT))
         .build()
         .into();
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
@@ -325,7 +369,9 @@ mod tests {
             sse.len()
         ));
         let body = request_body("m", &[Item::User("hi".into())], &[], Prefill::None);
-        let stream = send(&url, Some("k"), &body).unwrap();
+        let stream = send(&url, Some("k"), &body, &AtomicBool::new(false))
+            .unwrap()
+            .unwrap();
         let out = read_stream(stream, &AtomicBool::new(false), |_| {});
         assert_eq!(out.reply.text, "ok");
         let req = server.join().unwrap();
@@ -338,13 +384,34 @@ mod tests {
     }
 
     #[test]
+    fn cancel_works_while_the_server_is_silent() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let held = std::thread::spawn(move || listener.accept().map(|(conn, _)| conn));
+        let cancel = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            assert!(send(&url, None, b"{}", &cancel).unwrap().is_none());
+        });
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(held.join());
+    }
+
+    #[test]
     fn error_status_carries_the_body() {
         let msg = r#"{"error":{"message":"No auth credentials found"}}"#;
         let (url, server) = crate::test_server::serve_once(format!(
             "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\n\r\n{msg}",
             msg.len()
         ));
-        let err = send(&url, None, b"{}").err().unwrap().to_string();
+        let err = send(&url, None, b"{}", &AtomicBool::new(false))
+            .err()
+            .unwrap()
+            .to_string();
         server.join().unwrap();
         assert!(
             err.contains("401") && err.contains("No auth credentials"),

@@ -182,21 +182,21 @@ impl App {
                     self.transcript.push(Block::Error(e));
                 }
                 let session = self.session.as_ref().expect("just put back");
-                if session.cut_reply().is_some() {
+                if session.unanswered() {
                     let why = if cancelled {
                         "Stopped."
-                    } else {
+                    } else if session.cut_reply().is_some() {
                         "The reply was cut off."
+                    } else {
+                        "No reply."
                     };
                     let how = if session.continues_from_token() {
-                        "continues it from where it stopped"
+                        "continues the reply from where it stopped"
                     } else {
-                        "asks for it again"
+                        "asks again"
                     };
                     self.transcript
                         .push(Block::Info(format!("{why} Enter on an empty line {how}.")));
-                } else if cancelled {
-                    self.transcript.push(Block::Info("Stopped.".into()));
                 }
             }
         }
@@ -235,11 +235,7 @@ impl App {
 
     fn send(&mut self) {
         let empty = self.input.text().trim().is_empty();
-        let resume = empty
-            && self
-                .session
-                .as_ref()
-                .is_some_and(|s| s.cut_reply().is_some());
+        let resume = empty && self.session.as_ref().is_some_and(|s| s.unanswered());
         if empty && !resume {
             return;
         }

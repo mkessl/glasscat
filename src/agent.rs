@@ -75,14 +75,24 @@ impl Session {
         }
     }
 
+    /// Whether the model owes a reply: the last turn was stopped, failed
+    /// or was cut off before the model finished.
+    pub fn unanswered(&self) -> bool {
+        match self.items.last() {
+            Some(Item::User(_) | Item::ToolResult { .. }) => true,
+            Some(Item::Assistant(r)) => r.cut,
+            _ => false,
+        }
+    }
+
     /// Whether a cut-off reply will continue from its last token rather
     /// than be asked for again.
     pub fn continues_from_token(&self) -> bool {
         self.prefill != Prefill::None && self.cut_reply().is_some_and(|r| !r.text.is_empty())
     }
 
-    /// Picks up a cut-off reply: from its last token where the provider
-    /// allows it, otherwise by asking for the reply again.
+    /// Picks up an unanswered turn: a cut-off reply from its last token
+    /// where the provider allows it, otherwise by asking again.
     pub fn resume(&mut self, cancel: &AtomicBool, on: impl FnMut(Shown)) -> Result<()> {
         if self.cut_reply().is_some() && !self.continues_from_token() {
             self.items.pop();
@@ -94,7 +104,11 @@ impl Session {
         loop {
             let body = openai::request_body(&self.model, &self.items, &self.specs, self.prefill);
             on(Shown::Request(&body));
-            let stream = openai::send(&self.base_url, self.api_key.as_deref(), &body)?;
+            let Some(stream) =
+                openai::send(&self.base_url, self.api_key.as_deref(), &body, cancel)?
+            else {
+                return Ok(());
+            };
             let mut continuation = self
                 .continues_from_token()
                 .then(|| self.cut_reply().cloned().map(Continuation::new))
