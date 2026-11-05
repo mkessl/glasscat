@@ -51,6 +51,7 @@ enum AgentMsg {
         result: String,
     },
     Usage(Value),
+    StartedOver,
 }
 
 enum View {
@@ -176,11 +177,26 @@ impl App {
             Msg::Done(session, err) => {
                 self.session = Some(session);
                 self.busy = None;
-                if self.cancel.swap(false, Ordering::Relaxed) {
-                    self.transcript.push(Block::Info("cancelled".into()));
-                }
+                let cancelled = self.cancel.swap(false, Ordering::Relaxed);
                 if let Some(e) = err {
                     self.transcript.push(Block::Error(e));
+                }
+                let session = self.session.as_ref().expect("just put back");
+                if session.cut_reply().is_some() {
+                    let why = if cancelled {
+                        "Stopped."
+                    } else {
+                        "The reply was cut off."
+                    };
+                    let how = if session.continues_from_token() {
+                        "continues it from where it stopped"
+                    } else {
+                        "asks for it again"
+                    };
+                    self.transcript
+                        .push(Block::Info(format!("{why} Enter on an empty line {how}.")));
+                } else if cancelled {
+                    self.transcript.push(Block::Info("Stopped.".into()));
                 }
             }
         }
@@ -206,6 +222,9 @@ impl App {
                 self.transcript.push(Block::Tool { name, args, result });
             }
             AgentMsg::Usage(u) => self.usage = Some(u),
+            AgentMsg::StartedOver => self.transcript.push(Block::Info(
+                "The model wrote the reply anew instead of continuing it; only the new one is kept.".into(),
+            )),
         }
         // Keep the lines being read in place while scrolled up.
         if let Some(before) = before {
@@ -215,15 +234,27 @@ impl App {
     }
 
     fn send(&mut self) {
-        if self.input.text().trim().is_empty() {
+        let empty = self.input.text().trim().is_empty();
+        let resume = empty
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.cut_reply().is_some());
+        if empty && !resume {
             return;
         }
         let Some(mut session) = self.session.take() else {
             self.busy = Some("still working; Esc stops it".into());
             return;
         };
-        let prompt = self.input.take();
-        self.transcript.push(Block::User(prompt.clone()));
+        let prompt = if resume {
+            self.input.clear();
+            None
+        } else {
+            let p = self.input.take();
+            self.transcript.push(Block::User(p.clone()));
+            Some(p)
+        };
         self.scroll = 0;
         self.busy = Some("sending".into());
         let tx = self.tx.clone();
@@ -232,19 +263,24 @@ impl App {
             let send = |m| {
                 let _ = tx.send(Msg::Agent(m));
             };
-            let r = session.turn(prompt, &cancel, |shown| match shown {
+            let on = |shown: Shown| match shown {
                 Shown::Request(b) => send(AgentMsg::Request(b.to_vec())),
                 Shown::Stream(Stream::Text(t)) => send(AgentMsg::Text(t.into())),
                 Shown::Stream(Stream::Reasoning(t)) => send(AgentMsg::Reasoning(t.into())),
                 Shown::Stream(Stream::Call(n)) => send(AgentMsg::Calling(n.into())),
                 Shown::Stream(Stream::CallArgs(_)) => {}
                 Shown::Usage(u) => send(AgentMsg::Usage(u.clone())),
+                Shown::StartedOver => send(AgentMsg::StartedOver),
                 Shown::ToolDone { name, args, result } => send(AgentMsg::Tool {
                     name: name.into(),
                     args: args.into(),
                     result: result.into(),
                 }),
-            });
+            };
+            let r = match prompt {
+                Some(p) => session.turn(p, &cancel, on),
+                None => session.resume(&cancel, on),
+            };
             let _ = tx.send(Msg::Done(session, r.err().map(|e| e.to_string())));
         });
     }

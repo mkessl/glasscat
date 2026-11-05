@@ -17,6 +17,9 @@ pub struct Reply {
     pub text: String,
     pub reasoning: String,
     pub calls: Vec<ToolCall>,
+    /// Stopped before the model finished: cancelled, broken off, or out of
+    /// output tokens.
+    pub cut: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

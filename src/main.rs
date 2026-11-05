@@ -94,7 +94,8 @@ fn run() -> Result<()> {
     allowed.extend(args.allow);
     let access = access::Access::new(&cwd, &allowed, &args.hide)?;
     let tools = tools::Tools::new(access, journal::Journal::for_session());
-    let mut session = agent::Session::new(preset.base_url.into(), model, key, tools);
+    let mut session =
+        agent::Session::new(preset.base_url.into(), model, key, preset.prefill, tools);
     let Some(prompt) = args.prompt else {
         use std::io::IsTerminal;
         if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
@@ -107,7 +108,7 @@ fn run() -> Result<()> {
     let mut out = std::io::stdout().lock();
     let mut write_err = None;
     let mut at_line_start = true;
-    session.turn(prompt, &AtomicBool::new(false), |shown| {
+    let turn = session.turn(prompt, &AtomicBool::new(false), |shown| {
         let r = match shown {
             agent::Shown::Request(body) if show_request => {
                 let mut err = std::io::stderr().lock();
@@ -136,12 +137,16 @@ fn run() -> Result<()> {
         if let Err(e) = r {
             write_err.get_or_insert(e);
         }
-    })?;
+    });
+    if !at_line_start {
+        writeln!(out)?;
+    }
+    turn?;
     if let Some(e) = write_err {
         return Err(e.into());
     }
-    if !at_line_start {
-        writeln!(out)?;
+    if session.cut_reply().is_some() {
+        return Err("the reply was cut off: the model ran out of output tokens".into());
     }
     Ok(())
 }

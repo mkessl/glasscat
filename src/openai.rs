@@ -11,9 +11,33 @@ use crate::Result;
 use crate::context::{Item, Reply, ToolCall, ToolSpec};
 use crate::sse::Events;
 
+/// How a provider continues a cut-off assistant message from its last
+/// token. The message is sent last, as the start of the reply.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Prefill {
+    /// Not supported; the reply is asked for again instead.
+    None,
+    /// A trailing assistant message is continued as it is (OpenRouter,
+    /// Groq, llama.cpp).
+    Plain,
+    /// `"prefix": true` on the message (DeepSeek beta, Mistral).
+    PrefixFlag,
+    /// `"partial": true` on the message (Kimi).
+    PartialFlag,
+}
+
 /// The exact request body. The bytes built here are the bytes sent.
-pub fn request_body(model: &str, items: &[Item], tools: &[ToolSpec]) -> Vec<u8> {
-    let messages: Vec<Value> = items.iter().map(message).collect();
+pub fn request_body(model: &str, items: &[Item], tools: &[ToolSpec], prefill: Prefill) -> Vec<u8> {
+    let mut messages: Vec<Value> = items.iter().map(message).collect();
+    let continuing = prefill != Prefill::None
+        && matches!(items.last(), Some(Item::Assistant(r)) if r.cut && !r.text.is_empty());
+    if continuing && let Some(last) = messages.last_mut() {
+        match prefill {
+            Prefill::PrefixFlag => last["prefix"] = true.into(),
+            Prefill::PartialFlag => last["partial"] = true.into(),
+            _ => {}
+        }
+    }
     let mut body = json!({
         "model": model,
         "messages": messages,
@@ -68,7 +92,7 @@ fn message(item: &Item) -> Value {
 }
 
 /// Something the stream produced, passed on as soon as it arrives.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Event<'a> {
     Text(&'a str),
     Reasoning(&'a str),
@@ -86,8 +110,25 @@ pub struct Outcome {
     /// or was cancelled.
     pub finish: Option<String>,
     pub cancelled: bool,
+    /// Why the stream broke off, if it did: a network error, an error the
+    /// provider sent inside the stream, or a chunk that could not be read.
+    pub error: Option<String>,
+    /// Whether the stream said it was finished (`[DONE]` or a finish
+    /// reason) rather than just ending.
+    pub done: bool,
     /// The usage object exactly as the provider sent it.
     pub usage: Option<Value>,
+}
+
+impl Outcome {
+    /// Whether the reply stopped before the model finished it, so it can be
+    /// continued from where it stopped.
+    pub fn cut(&self) -> bool {
+        self.cancelled
+            || self.error.is_some()
+            || !self.done
+            || self.finish.as_deref() == Some("length")
+    }
 }
 
 #[derive(Deserialize)]
@@ -129,29 +170,65 @@ struct FunctionDelta {
     arguments: Option<String>,
 }
 
+/// How often a waiting stream checks whether it was cancelled.
+const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(30);
+
 /// Reads a streamed response to its end, calling `on` for each piece.
-/// When `cancel` is set the partial reply is returned as it stands.
+/// Reading happens on its own thread, so a cancel takes effect at once even
+/// while the provider sends nothing; the partial reply is kept. A broken
+/// stream is not an `Err` either: the outcome keeps what arrived and says
+/// why it stopped.
 pub fn read_stream(
-    body: impl Read,
+    body: impl Read + Send + 'static,
     cancel: &AtomicBool,
     mut on: impl FnMut(Event),
-) -> Result<Outcome> {
-    let mut events = Events::new(BufReader::new(body));
+) -> Outcome {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<String, String>>(64);
+    std::thread::spawn(move || {
+        let mut events = Events::new(BufReader::new(body));
+        loop {
+            let next = match events.next_data() {
+                Ok(Some(data)) => Ok(data),
+                Ok(None) => break,
+                Err(e) => Err(format!("connection broke: {e}")),
+            };
+            let stop = next.is_err();
+            if tx.send(next).is_err() || stop {
+                break;
+            }
+        }
+    });
     let mut out = Outcome::default();
     // Provider call index -> position in `out.reply.calls`.
     let mut slots: Vec<(usize, usize)> = Vec::new();
-    while let Some(data) = events.next_data()? {
+    loop {
         if cancel.load(Ordering::Relaxed) {
             out.cancelled = true;
             break;
         }
+        let data = match rx.recv_timeout(CANCEL_POLL) {
+            Ok(Ok(data)) => data,
+            Ok(Err(e)) => {
+                out.error = Some(e);
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         if data == "[DONE]" {
+            out.done = true;
             break;
         }
-        let chunk: Chunk =
-            serde_json::from_str(&data).map_err(|e| format!("bad stream chunk ({e}): {data}"))?;
+        let chunk: Chunk = match serde_json::from_str(&data) {
+            Ok(c) => c,
+            Err(e) => {
+                out.error = Some(format!("unreadable stream chunk ({e}): {data}"));
+                break;
+            }
+        };
         if let Some(err) = chunk.error {
-            return Err(format!("provider error in stream: {err}").into());
+            out.error = Some(format!("provider error: {err}"));
+            break;
         }
         if chunk.usage.is_some() {
             out.usage = chunk.usage;
@@ -194,11 +271,12 @@ pub fn read_stream(
                 }
             }
             if choice.finish_reason.is_some() {
+                out.done = true;
                 out.finish = choice.finish_reason;
             }
         }
     }
-    Ok(out)
+    out
 }
 
 /// Sends a request body to `{base_url}/chat/completions` and returns the
@@ -246,9 +324,9 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{sse}",
             sse.len()
         ));
-        let body = request_body("m", &[Item::User("hi".into())], &[]);
+        let body = request_body("m", &[Item::User("hi".into())], &[], Prefill::None);
         let stream = send(&url, Some("k"), &body).unwrap();
-        let out = read_stream(stream, &AtomicBool::new(false), |_| {}).unwrap();
+        let out = read_stream(stream, &AtomicBool::new(false), |_| {});
         assert_eq!(out.reply.text, "ok");
         let req = server.join().unwrap();
         assert!(req.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
@@ -278,8 +356,7 @@ mod tests {
         let mut seen = Vec::new();
         let out = read_stream(stream_of(chunks), &AtomicBool::new(false), |e| {
             seen.push(format!("{e:?}"))
-        })
-        .unwrap();
+        });
         (out, seen)
     }
 
@@ -296,6 +373,7 @@ mod tests {
                     name: "read".into(),
                     args: "{}".into(),
                 }],
+                cut: false,
             }),
             Item::ToolResult {
                 call_id: "c1".into(),
@@ -307,7 +385,8 @@ mod tests {
             description: "Read a file".into(),
             parameters: json!({ "type": "object" }),
         }];
-        let body: Value = serde_json::from_slice(&request_body("m", &items, &tools)).unwrap();
+        let body: Value =
+            serde_json::from_slice(&request_body("m", &items, &tools, Prefill::None)).unwrap();
         assert_eq!(body["model"], "m");
         assert_eq!(body["stream"], true);
         let msgs = body["messages"].as_array().unwrap();
@@ -321,8 +400,34 @@ mod tests {
     }
 
     #[test]
+    fn flags_only_a_cut_reply_being_continued() {
+        let cut = |cut| {
+            Item::Assistant(Reply {
+                text: "Hel".into(),
+                cut,
+                ..Reply::default()
+            })
+        };
+        let last = |items: &[Item], prefill| {
+            let body: Value =
+                serde_json::from_slice(&request_body("m", items, &[], prefill)).unwrap();
+            body["messages"].as_array().unwrap().last().unwrap().clone()
+        };
+        let items = [Item::User("hi".into()), cut(true)];
+        assert_eq!(last(&items, Prefill::PrefixFlag)["prefix"], true);
+        assert_eq!(last(&items, Prefill::PartialFlag)["partial"], true);
+        assert_eq!(
+            last(&items, Prefill::Plain),
+            json!({ "role": "assistant", "content": "Hel" })
+        );
+        let done = [Item::User("hi".into()), cut(false)];
+        assert!(last(&done, Prefill::PrefixFlag).get("prefix").is_none());
+    }
+
+    #[test]
     fn no_tools_key_without_tools() {
-        let body: Value = serde_json::from_slice(&request_body("m", &[], &[])).unwrap();
+        let body: Value =
+            serde_json::from_slice(&request_body("m", &[], &[], Prefill::None)).unwrap();
         assert!(body.get("tools").is_none());
     }
 
@@ -365,13 +470,13 @@ mod tests {
     }
 
     #[test]
-    fn error_inside_stream_is_an_error() {
-        let r = read_stream(
-            stream_of(&[r#"{"error":{"message":"overloaded","code":502}}"#]),
-            &AtomicBool::new(false),
-            |_| {},
-        );
-        assert!(r.unwrap_err().to_string().contains("overloaded"));
+    fn error_inside_stream_keeps_the_partial_reply() {
+        let (out, _) = run(&[
+            r#"{"choices":[{"delta":{"content":"so far"}}]}"#,
+            r#"{"error":{"message":"overloaded","code":502}}"#,
+        ]);
+        assert!(out.error.unwrap().contains("overloaded"));
+        assert_eq!(out.reply.text, "so far");
     }
 
     #[test]
@@ -384,8 +489,7 @@ mod tests {
             ]),
             &cancel,
             |_| cancel.store(true, Ordering::Relaxed),
-        )
-        .unwrap();
+        );
         assert!(out.cancelled);
         assert_eq!(out.reply.text, "part");
     }
