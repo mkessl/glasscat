@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="838.4" height="528" viewBox="0 0 838.4 528">
+<rect width="100%" height="100%" rx="10" fill="#0d1117"/>
+<path d="M0 36 V10 Q0 0 10 0 H828.4 Q838.4 0 838.4 10 V36 Z" fill="#161b22"/>
+<circle cx="20" cy="18" r="6" fill="#ff5f57"/>
+<circle cx="40" cy="18" r="6" fill="#febc2e"/>
+<circle cx="60" cy="18" r="6" fill="#28c840"/>
+<g font-family="ui-monospace, SFMono-Regular, &#x27;SF Mono&#x27;, Menlo, Consolas, &#x27;DejaVu Sans Mono&#x27;, &#x27;Liberation Mono&#x27;, monospace" font-size="14">
+<text x="16" y="67" textLength="487.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">glasscat · openrouter/free · /help lists commands and keys</text>
+<text x="16" y="107" textLength="798" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#b3f0ff">› Which tools does this agent give the model? Search src/tools.rs for the specs, then list each</text>
+<text x="16" y="127" textLength="453.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#b3f0ff">  tool with one short line, tool names as inline code.</text>
+<text x="16" y="167" textLength="268.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">thought · 7 lines · ctrl+o shows</text>
+<text x="16" y="207" textLength="159.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#f2cc60">▸ read src/tools.rs</text>
+<text x="16" y="227" textLength="747.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">  //! The model&#x27;s tools. Each takes JSON arguments and returns text for the  (+881 lines)</text>
+<text x="16" y="267" textLength="277.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">thought · 13 lines · ctrl+o shows</text>
+<text x="16" y="307" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">Based on </text>
+<text x="91.6" y="307" textLength="100.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">src/tools.rs</text>
+<text x="192.4" y="307" textLength="235.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">, the model has these tools:</text>
+<text x="16" y="347" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">• </text>
+<text x="32.8" y="347" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">read</text>
+<text x="66.4" y="347" textLength="487.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> — Read a text file (up to 2000 lines, with offset/limit).</text>
+<text x="16" y="367" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">• </text>
+<text x="32.8" y="367" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">list</text>
+<text x="66.4" y="367" textLength="352.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> — List a directory; directories end with </text>
+<text x="419.2" y="367" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">/</text>
+<text x="427.6" y="367" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">.</text>
+<text x="16" y="387" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">• </text>
+<text x="32.8" y="387" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">find</text>
+<text x="66.4" y="387" textLength="336" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> — Find files by glob pattern, skipping </text>
+<text x="402.4" y="387" textLength="84" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">.gitignore</text>
+<text x="486.4" y="387" textLength="92.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">-d entries.</text>
+<text x="16" y="407" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">• </text>
+<text x="32.8" y="407" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">search</text>
+<text x="83.2" y="407" textLength="386.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> — Search file contents with a regex; returns </text>
+<text x="469.6" y="407" textLength="126" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">path:line: text</text>
+<text x="595.6" y="407" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">.</text>
+<text x="16" y="427" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">• </text>
+<text x="32.8" y="427" textLength="42" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">write</text>
+<text x="74.8" y="427" textLength="512.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> — Write a whole file, creating parent directories as needed.</text>
+<text x="16" y="447" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">• </text>
+<text x="32.8" y="447" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">edit</text>
+<text x="66.4" y="447" textLength="495.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> — Replace exact text in a file (once, or all occurrences).</text>
+<text x="16" y="467" textLength="806.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">────────────────────────────────────────────────────────────────────────────────────────────────</text>
+<text x="16" y="487" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#b3f0ff" font-weight="700">› </text>
+<text x="32.8" y="487" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">Message…</text>
+<text x="16" y="507" textLength="126" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">openrouter/free</text>
+<text x="444.4" y="507" textLength="369.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">in 8543 · out 316 · $0.0000 · ctrl+t context</text>
+</g></svg>
