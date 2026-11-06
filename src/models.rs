@@ -52,9 +52,18 @@ pub fn zdr(base_url: &str, proxy: Option<&str>) -> Result<Option<HashSet<String>
     Ok(Some(ids))
 }
 
+/// The answers fetched so far in this run, by address.
+static LISTS: Mutex<Option<HashMap<String, Arc<Value>>>> = Mutex::new(None);
+
+/// The provider's `/models` list if it was fetched already; never waits
+/// for one.
+pub fn fetched(base_url: &str) -> Option<Arc<Value>> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    LISTS.lock().unwrap().as_ref()?.get(&url).cloned()
+}
+
 /// A JSON answer from `url`, fetched once per run.
 fn once(url: String, api_key: Option<&str>, proxy: Option<&str>) -> Result<Arc<Value>> {
-    static LISTS: Mutex<Option<HashMap<String, Arc<Value>>>> = Mutex::new(None);
     let cached = LISTS
         .lock()
         .unwrap()
@@ -132,6 +141,10 @@ pub fn matching(list: &Value, filter: &str, max: usize, zdr: Option<&HashSet<Str
             if is_zdr(m) {
                 line += " · ZDR";
             }
+            let params = m["supported_parameters"].as_array();
+            if params.is_some_and(|p| !p.iter().any(|p| p == "tools")) {
+                line += " · no tools";
+            }
             line
         })
         .collect();
@@ -152,6 +165,14 @@ pub fn takes_images(list: &Value, model: &str) -> Option<bool> {
     Some(inputs.iter().any(|m| m == "image"))
 }
 
+/// Whether `model` takes tools, by the parameters OpenRouter's list says
+/// it supports; None when the list does not say.
+pub fn takes_tools(list: &Value, model: &str) -> Option<bool> {
+    let entry = list["data"].as_array()?.iter().find(|m| m["id"] == model)?;
+    let params = entry["supported_parameters"].as_array()?;
+    Some(params.iter().any(|p| p == "tools"))
+}
+
 fn window_in(list: &Value, model: &str) -> Option<u64> {
     let entry = list["data"].as_array()?.iter().find(|m| m["id"] == model)?;
     WINDOW_KEYS.iter().find_map(|k| entry[k].as_u64())
@@ -170,6 +191,7 @@ mod tests {
             {"id": "a/big", "context_length": 200000,
              "pricing": {"prompt": "0.000003", "completion": "0.000015"}},
             {"id": "a/small"},
+            {"id": "b/chat", "supported_parameters": ["temperature"]},
         ]});
         assert_eq!(
             matching(&list, "a/", 5, None),
@@ -181,7 +203,7 @@ mod tests {
         );
         assert_eq!(
             matching(&list, "", 1, None),
-            "a/big · 200k · $3.00 in, $15.00 out per M\nand 2 more; add words to narrow it down."
+            "a/big · 200k · $3.00 in, $15.00 out per M\nand 3 more; add words to narrow it down."
         );
         assert!(matching(&list, "nope", 5, None).starts_with("No model"));
         let zdr: HashSet<String> = ["a/small".to_string()].into();
@@ -191,6 +213,7 @@ mod tests {
             "a/big · 200k · $3.00 in, $15.00 out per M\na/small · ZDR"
         );
         assert!(matching(&list, "zdr", 5, None).starts_with("No model"));
+        assert_eq!(matching(&list, "chat", 5, None), "b/chat · no tools");
     }
 
     #[test]
@@ -204,6 +227,14 @@ mod tests {
         assert_eq!(takes_images(&list, "t"), Some(false));
         assert_eq!(takes_images(&list, "u"), None);
         assert_eq!(takes_images(&list, "x"), None);
+        let list = json!({"data": [
+            {"id": "a", "supported_parameters": ["tools", "temperature"]},
+            {"id": "b", "supported_parameters": ["temperature"]},
+            {"id": "c"},
+        ]});
+        assert_eq!(takes_tools(&list, "a"), Some(true));
+        assert_eq!(takes_tools(&list, "b"), Some(false));
+        assert_eq!(takes_tools(&list, "c"), None);
     }
 
     #[test]

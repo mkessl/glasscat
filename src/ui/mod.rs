@@ -82,7 +82,8 @@ enum AgentMsg {
     Timing(Option<Duration>, Duration),
     Retrying(String, Duration, u32),
     StartedOver,
-    ImagesDropped(String),
+    ImagesDropped(String, bool),
+    ToolsOff(String, bool),
 }
 
 enum View {
@@ -94,6 +95,17 @@ enum View {
 /// Said when the provider refused the images in the context.
 pub const IMAGES_DROPPED: &str =
     "The images were taken out of the context, and the request goes again without them.";
+
+/// Said when the model takes no tools.
+pub const NO_TOOLS: &str = "so it is sent none: it can answer but cannot read or change \
+                            anything; /model switches to one that takes them.";
+
+/// Said when the provider refused the tools.
+pub const TOOLS_OFF: &str = "The model is sent no tools from now on, so it can answer but cannot \
+                             read or change anything; the request goes again without them.";
+
+/// The most lines of paths shown above the input after Tab.
+const PATH_LINES: usize = 6;
 
 /// Raw or not and sent or not, the width, the body, and its lines.
 type ContextLines = ((bool, bool), u16, Vec<u8>, Vec<transcript::Line>);
@@ -133,6 +145,10 @@ struct App {
     served: Option<Served>,
     /// The last request's time to first token and in all.
     timing: Option<(Option<Duration>, Duration)>,
+    /// The input when Tab found several paths, and the paths.
+    paths: Option<(String, Vec<String>)>,
+    /// Every request of this run that was answered, for /usage.
+    requests: Vec<Request>,
     api: Api,
     /// The model whose context window was looked up, and the window.
     window: Option<(String, Option<u64>)>,
@@ -206,6 +222,8 @@ pub fn run(session: Session) -> Result<()> {
         busy: None,
         call: None,
         usage: None,
+        requests: Vec::new(),
+        paths: None,
         spent: (0.0, 0),
         cancel: Arc::new(AtomicBool::new(false)),
         tx,
@@ -503,6 +521,7 @@ impl App {
             ));
             return;
         }
+        let mut same = false;
         let result = text.and_then(|t| {
             let items = crate::context::from_text(&t).map_err(|e| {
                 self.kept_edit = Some(path.clone());
@@ -511,9 +530,16 @@ impl App {
                     path.display()
                 )
             })?;
+            same = items == session.items;
             session.set_items(items).map_err(|e| e.to_string())
         });
         match result {
+            Ok(()) if same => {
+                let _ = std::fs::remove_file(&path);
+                self.transcript.push(Block::Info(
+                    "Nothing was changed, so the context is as it was.".into(),
+                ));
+            }
             Ok(()) => {
                 let _ = std::fs::remove_file(&path);
                 let items = session.items.clone();
@@ -619,6 +645,9 @@ impl App {
                 }
             }
             AgentMsg::Usage(u) => {
+                if let Some(r) = self.requests.last_mut() {
+                    r.usage = Some(u.clone());
+                }
                 if let Some(c) = u.get("cost").and_then(Value::as_f64) {
                     self.spent = (self.spent.0 + c, self.spent.1 + 1);
                 }
@@ -664,10 +693,22 @@ impl App {
                 self.warn_if_full();
             }
             AgentMsg::Served(s) => {
+                if let Some(r) = self.requests.last_mut() {
+                    r.served = Some(s.clone());
+                }
                 self.look_up_window(&s.model);
                 self.served = Some(s);
             }
-            AgentMsg::Timing(first, total) => self.timing = Some((first, total)),
+            AgentMsg::Timing(first, total) => {
+                self.timing = Some((first, total));
+                self.requests.push(Request {
+                    model: self.model.clone(),
+                    served: None,
+                    usage: None,
+                    first,
+                    total,
+                });
+            }
             AgentMsg::Retrying(error, wait, attempt) => {
                 let error = text::clip(error.lines().next().unwrap_or(""), 300);
                 self.transcript.push(Block::Info(format!(
@@ -681,9 +722,23 @@ impl App {
             AgentMsg::StartedOver => self.transcript.push(Block::Info(
                 "The model wrote the reply anew instead of continuing it; only the new one is kept.".into(),
             )),
-            AgentMsg::ImagesDropped(e) => {
-                self.transcript.push(Block::Error(e));
-                self.transcript.push(Block::Info(IMAGES_DROPPED.into()));
+            AgentMsg::ToolsOff(why, refused) => {
+                if refused {
+                    self.transcript.push(Block::Error(why));
+                    self.transcript.push(Block::Info(TOOLS_OFF.into()));
+                } else {
+                    self.transcript.push(Block::Info(format!("{why}, {NO_TOOLS}")));
+                }
+            }
+            AgentMsg::ImagesDropped(why, refused) => {
+                if refused {
+                    self.transcript.push(Block::Error(why));
+                    self.transcript.push(Block::Info(IMAGES_DROPPED.into()));
+                } else {
+                    self.transcript.push(Block::Info(format!(
+                        "{why} The images were taken out of the context."
+                    )));
+                }
             }
         }
         // Keep the lines being read in place while scrolled up.
@@ -748,7 +803,10 @@ impl App {
                     attempt,
                 } => send(AgentMsg::Retrying(error.into(), wait, attempt)),
                 Shown::StartedOver => send(AgentMsg::StartedOver),
-                Shown::ImagesDropped(e) => send(AgentMsg::ImagesDropped(e.into())),
+                Shown::ToolsOff { why, refused } => send(AgentMsg::ToolsOff(why.into(), refused)),
+                Shown::ImagesDropped { why, refused } => {
+                    send(AgentMsg::ImagesDropped(why.into(), refused))
+                }
                 Shown::ToolDone {
                     name,
                     args,
@@ -791,7 +849,18 @@ impl App {
             KeyCode::Char('j') if ctrl => self.input.insert("\n"),
             KeyCode::Enter => self.send(),
             KeyCode::Tab if self.input.at_end() => {
-                let rest = commands::complete(self.input.text());
+                let typed = self.input.text();
+                let rest = if commands::completions(typed).is_empty() {
+                    let cwd = match &self.session {
+                        Some(s) => s.tools.cwd().to_path_buf(),
+                        None => std::env::current_dir().unwrap_or_default(),
+                    };
+                    let (rest, names) = commands::complete_path(typed, &cwd);
+                    self.paths = Some((format!("{typed}{rest}"), names));
+                    rest
+                } else {
+                    commands::complete(typed)
+                };
                 self.input.insert(&rest);
             }
             KeyCode::Esc => self.stop(),
@@ -816,7 +885,18 @@ impl App {
             KeyCode::Char('o') if ctrl => self.transcript.toggle_reasoning(),
             KeyCode::Char('a') if ctrl => self.input.line_start(),
             KeyCode::Char('e') if ctrl => self.input.line_end(),
+            // Ctrl+_ and Ctrl+/ come as Ctrl+7 from most terminals.
+            KeyCode::Char('z' | '_' | '7' | '/') if ctrl => {
+                self.input.undo();
+            }
             KeyCode::Char('u') if ctrl => self.input.kill_before(),
+            KeyCode::Char('y') if ctrl => self.input.yank(),
+            KeyCode::Char('b') if alt => self.input.word_left(),
+            KeyCode::Char('f') if alt => self.input.word_right(),
+            KeyCode::Char('d') if alt => self.input.kill_word_after(),
+            KeyCode::Delete if ctrl || alt => self.input.kill_word_after(),
+            KeyCode::Char('b') if ctrl => self.input.left(),
+            KeyCode::Char('f') if ctrl => self.input.right(),
             KeyCode::Char('k') if ctrl => self.input.kill_after(),
             KeyCode::Char('w') if ctrl => self.input.kill_word(),
             KeyCode::Backspace if ctrl || alt => self.input.kill_word(),
@@ -1005,6 +1085,42 @@ impl App {
             self.screen.put(x, y, w, what, Style::dim());
         }
 
+        // After Tab, the paths the last word may become.
+        let paths = match &self.paths {
+            Some((at, names)) if found.is_empty() && at == self.input.text() => names.clone(),
+            _ => Vec::new(),
+        };
+        if !paths.is_empty() {
+            // Each line with how many names it holds.
+            let mut lines: Vec<(String, usize)> = vec![(String::new(), 0)];
+            for name in &paths {
+                let (last, n) = lines.last_mut().expect("one at least");
+                if *n > 0 && text::width(last) + 2 + text::width(name) + 2 > w as usize {
+                    lines.push((String::new(), 0));
+                }
+                let (last, n) = lines.last_mut().expect("one at least");
+                if *n > 0 {
+                    last.push_str("  ");
+                }
+                last.push_str(name);
+                *n += 1;
+            }
+            // The lines that fit, ending with how many more there are.
+            let room = (sep_y as usize).min(PATH_LINES);
+            if lines.len() > room {
+                lines.truncate(room.saturating_sub(1));
+                let shown: usize = lines.iter().map(|l| l.1).sum();
+                lines.push((format!("and {} more", paths.len() - shown), 0));
+            }
+            let lines: Vec<String> = lines.into_iter().map(|l| l.0).collect();
+            for (i, line) in lines.iter().enumerate() {
+                let y = sep_y - lines.len() as u16 + i as u16;
+                self.screen
+                    .put(0, y, w, &" ".repeat(w as usize), Style::default());
+                self.screen.put(2, y, w, line, Style::fg(Color::Cyan));
+            }
+        }
+
         let sep = if self.scroll > 0 {
             format!("── {} lines below · PageDown or wheel ", self.scroll)
         } else {
@@ -1118,11 +1234,15 @@ impl App {
         for (i, line) in lines.iter().skip(scroll).take(height).enumerate() {
             put_line(&mut self.screen, i as u16, w, line);
         }
-        let status = format!(
-            "context · lines {}-{} of {} · r raw/parts · ↑↓ PgUp PgDn · Esc back",
+        let at = format!(
+            "context · lines {}-{} of {}",
             scroll + 1,
             (scroll + height).min(lines.len()),
             lines.len()
+        );
+        let status = text::fit_parts(
+            &[&at, "r raw/parts", "↑↓ PgUp PgDn", "Esc back"],
+            w as usize,
         );
         self.screen.put(0, h - 1, w, &status, Style::dim());
     }
@@ -1139,8 +1259,15 @@ impl App {
             put_line(&mut self.screen, i as u16, w, line);
         }
         let status = f.note.clone().unwrap_or_else(|| {
-            "↑↓ move · → opens · ← closes · Space hides or shows · s keeps the rules · Esc back"
-                .into()
+            let keys = [
+                "↑↓ move",
+                "→ opens",
+                "← closes",
+                "Space hides or shows",
+                "s keeps the rules",
+                "Esc back",
+            ];
+            text::fit_parts(&keys, w as usize)
         });
         self.screen.put(0, h - 1, w, &status, Style::dim());
     }
@@ -1263,6 +1390,108 @@ fn usage_text(u: Option<&Value>, window: Option<u64>, spent: Option<f64>) -> Str
     parts.join(" · ") + " · "
 }
 
+/// One answered request, as /usage lists it.
+pub struct Request {
+    /// The model asked for.
+    model: String,
+    served: Option<Served>,
+    usage: Option<Value>,
+    first: Option<Duration>,
+    total: Duration,
+}
+
+/// Output tokens a second after the first token, when it can be told.
+fn speed(first: Option<Duration>, total: Duration, out: Option<u64>) -> Option<f64> {
+    let (f, n) = (first?, out?);
+    let secs = (total - f).as_secs_f64();
+    (secs >= 0.1 && n > 1).then(|| (n - 1) as f64 / secs)
+}
+
+/// The requests of this run in a table: tokens, cost and time of each,
+/// and who ran it, with the sums above.
+fn requests_text(rows: &[Request]) -> String {
+    if rows.is_empty() {
+        return "No request was answered yet in this run.".into();
+    }
+    let n = |r: &Request, k: &str| r.usage.as_ref()?.pointer(k)?.as_u64();
+    let sum = |k: &str| rows.iter().filter_map(|r| n(r, k)).sum::<u64>();
+    let costs: Vec<f64> = rows
+        .iter()
+        .filter_map(|r| r.usage.as_ref()?.get("cost")?.as_f64())
+        .collect();
+    let s = if rows.len() == 1 { "" } else { "s" };
+    let mut head = format!(
+        "{} request{s} in this run: {} tokens in, {} of them from the cache, {} out",
+        rows.len(),
+        sum("/prompt_tokens"),
+        sum("/prompt_tokens_details/cached_tokens"),
+        sum("/completion_tokens"),
+    );
+    if !costs.is_empty() {
+        head += &format!(", {}", text::money(costs.iter().sum()));
+    }
+    let time: Duration = rows.iter().map(|r| r.total).sum();
+    head += &format!(", {:.1}s waited.", time.as_secs_f64());
+    let mut table = vec![
+        [
+            "#", "in", "cached", "out", "cost", "first", "all", "tok/s", "model",
+        ]
+        .map(String::from),
+    ];
+    let opt = |v: Option<String>| v.unwrap_or_else(|| "-".into());
+    for (i, r) in rows.iter().enumerate() {
+        let num = |k: &str| opt(n(r, k).map(|v| v.to_string()));
+        let mut who = match &r.served {
+            Some(s) if s.model != r.model => format!("{} → {}", r.model, s.model),
+            _ => r.model.clone(),
+        };
+        if let Some(p) = r.served.as_ref().and_then(|s| s.provider.as_ref()) {
+            who += &format!(" on {p}");
+        }
+        table.push([
+            (i + 1).to_string(),
+            num("/prompt_tokens"),
+            num("/prompt_tokens_details/cached_tokens"),
+            num("/completion_tokens"),
+            opt(r
+                .usage
+                .as_ref()
+                .and_then(|u| u.get("cost")?.as_f64())
+                .map(text::money)),
+            opt(r.first.map(|f| format!("{:.1}s", f.as_secs_f64()))),
+            format!("{:.1}s", r.total.as_secs_f64()),
+            opt(speed(r.first, r.total, n(r, "/completion_tokens")).map(|v| format!("{v:.0}"))),
+            who,
+        ]);
+    }
+    let widths: Vec<usize> = (0..9)
+        .map(|c| {
+            table
+                .iter()
+                .map(|row| text::width(&row[c]))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let lines: Vec<String> = table
+        .iter()
+        .map(|row| {
+            let mut line = String::new();
+            for (c, cell) in row.iter().enumerate() {
+                if c == 8 {
+                    line += cell;
+                } else {
+                    // Numbers line up on the right.
+                    let pad = widths[c] - text::width(cell);
+                    line += &format!("{}{cell}  ", " ".repeat(pad));
+                }
+            }
+            line
+        })
+        .collect();
+    format!("{head}\n\n{}", lines.join("\n"))
+}
+
 /// `first 0.4s · 2.1s · 52 tok/s`: time to the first token, in all, and
 /// the output speed after the first token.
 fn timing_text(t: Option<(Option<Duration>, Duration)>, usage: Option<&Value>) -> String {
@@ -1277,11 +1506,8 @@ fn timing_text(t: Option<(Option<Duration>, Duration)>, usage: Option<&Value>) -
     let out = usage
         .and_then(|u| u.get("completion_tokens"))
         .and_then(Value::as_u64);
-    if let (Some(f), Some(n)) = (first, out) {
-        let secs = (total - f).as_secs_f64();
-        if secs >= 0.1 && n > 1 {
-            parts.push(format!("{:.0} tok/s", (n - 1) as f64 / secs));
-        }
+    if let Some(v) = speed(first, total, out) {
+        parts.push(format!("{v:.0} tok/s"));
     }
     parts.join(" · ") + " · "
 }
@@ -1400,6 +1626,44 @@ mod tests {
             .map(crate::models::short)
             .collect();
         assert_eq!(shorts, ["950", "8.2k", "131k", "1M", "1.5M"]);
+    }
+
+    #[test]
+    fn usage_lists_each_request() {
+        assert!(requests_text(&[]).starts_with("No request"));
+        let rows = [
+            Request {
+                model: "a/m".into(),
+                served: Some(Served {
+                    model: "a/m".into(),
+                    provider: Some("P".into()),
+                }),
+                usage: Some(serde_json::json!({
+                    "prompt_tokens": 1200, "completion_tokens": 31, "cost": 0.0002,
+                    "prompt_tokens_details": {"cached_tokens": 1000}
+                })),
+                first: Some(Duration::from_millis(500)),
+                total: Duration::from_millis(1500),
+            },
+            Request {
+                model: "free".into(),
+                served: Some(Served {
+                    model: "x/y".into(),
+                    provider: None,
+                }),
+                usage: None,
+                first: None,
+                total: Duration::from_millis(200),
+            },
+        ];
+        assert_eq!(
+            requests_text(&rows),
+            "2 requests in this run: 1200 tokens in, 1000 of them from the cache, 31 out, \
+             $0.0002, 1.7s waited.\n\n\
+             #    in  cached  out     cost  first   all  tok/s  model\n\
+             1  1200    1000   31  $0.0002   0.5s  1.5s     30  a/m on P\n\
+             2     -       -    -        -      -  0.2s      -  free → x/y"
+        );
     }
 
     #[test]

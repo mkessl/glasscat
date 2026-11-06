@@ -12,7 +12,27 @@ pub struct Input {
     history: Vec<String>,
     hist: Option<usize>,
     draft: String,
+    /// Text and cursor before each group of edits, for undo.
+    undo: Vec<(String, usize)>,
+    /// The kind of the last edit: a run of typing or of deleting is one
+    /// step to undo.
+    last: Edit,
+    /// The text cut out last with a kill.
+    killed: String,
 }
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Edit {
+    #[default]
+    None,
+    Typing,
+    Deleting,
+    /// A kill, a paste or a clear: always a step of its own.
+    Other,
+}
+
+/// Steps kept to undo.
+const UNDO_MAX: usize = 200;
 
 /// One screen row of the text: a byte range without the newline.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,6 +66,8 @@ impl Input {
 
     /// Takes the text out for sending and remembers it in history.
     pub fn take(&mut self) -> String {
+        self.undo.clear();
+        self.last = Edit::None;
         let text = std::mem::take(&mut self.text);
         if !text.trim().is_empty() && self.history.last() != Some(&text) {
             self.history.push(text.clone());
@@ -57,6 +79,7 @@ impl Input {
     }
 
     pub fn clear(&mut self) {
+        self.save(Edit::Other);
         self.text.clear();
         self.cur = 0;
         self.goal = None;
@@ -65,12 +88,22 @@ impl Input {
 
     pub fn insert(&mut self, s: &str) {
         let s = s.replace("\r\n", "\n").replace('\r', "\n");
+        // A word typed is a step; a paste is one too.
+        match s.chars().count() {
+            1 if s == " " || s == "\n" => self.save(Edit::Other),
+            1 => self.save(Edit::Typing),
+            _ => self.save(Edit::Other),
+        }
+        if s == " " || s == "\n" {
+            self.last = Edit::Typing;
+        }
         self.text.insert_str(self.cur, &s);
         self.cur += s.len();
         self.goal = None;
     }
 
     pub fn backspace(&mut self) {
+        self.save(Edit::Deleting);
         if let Some(p) = self.prev(self.cur) {
             self.text.replace_range(p..self.cur, "");
             self.cur = p;
@@ -79,6 +112,7 @@ impl Input {
     }
 
     pub fn delete(&mut self) {
+        self.save(Edit::Deleting);
         if let Some(n) = self.next(self.cur) {
             self.text.replace_range(self.cur..n, "");
         }
@@ -87,46 +121,50 @@ impl Input {
 
     pub fn left(&mut self) {
         self.cur = self.prev(self.cur).unwrap_or(0);
-        self.goal = None;
+        self.moved();
     }
 
     pub fn right(&mut self) {
         self.cur = self.next(self.cur).unwrap_or(self.cur);
-        self.goal = None;
+        self.moved();
     }
 
     pub fn word_left(&mut self) {
         self.cur = self.word_start(self.cur);
-        self.goal = None;
+        self.moved();
     }
 
     pub fn word_right(&mut self) {
+        self.cur = self.word_end();
+        self.moved();
+    }
+
+    /// Where the word at or after the cursor ends.
+    fn word_end(&self) -> usize {
         let rest = &self.text[self.cur..];
         let skip_space = rest.len() - rest.trim_start().len();
         let word = rest[skip_space..]
             .find(char::is_whitespace)
             .unwrap_or(rest.len() - skip_space);
-        self.cur += skip_space + word;
-        self.goal = None;
+        self.cur + skip_space + word
     }
 
     pub fn line_start(&mut self) {
         self.cur = self.text[..self.cur].rfind('\n').map_or(0, |i| i + 1);
-        self.goal = None;
+        self.moved();
     }
 
     pub fn line_end(&mut self) {
         self.cur += self.text[self.cur..]
             .find('\n')
             .unwrap_or(self.text.len() - self.cur);
-        self.goal = None;
+        self.moved();
     }
 
     /// Deletes from the start of the line to the cursor.
     pub fn kill_before(&mut self) {
         let start = self.text[..self.cur].rfind('\n').map_or(0, |i| i + 1);
-        self.text.replace_range(start..self.cur, "");
-        self.cur = start;
+        self.kill(start..self.cur);
     }
 
     /// Deletes from the cursor to the end of the line.
@@ -135,13 +173,36 @@ impl Input {
             + self.text[self.cur..]
                 .find('\n')
                 .unwrap_or(self.text.len() - self.cur);
-        self.text.replace_range(self.cur..end, "");
+        self.kill(self.cur..end);
     }
 
     pub fn kill_word(&mut self) {
         let start = self.word_start(self.cur);
-        self.text.replace_range(start..self.cur, "");
-        self.cur = start;
+        self.kill(start..self.cur);
+    }
+
+    /// Cuts out the word after the cursor.
+    pub fn kill_word_after(&mut self) {
+        self.kill(self.cur..self.word_end());
+    }
+
+    /// Cuts out `range`, keeping it for `yank`; the cursor goes to its
+    /// start.
+    fn kill(&mut self, range: std::ops::Range<usize>) {
+        if range.is_empty() {
+            return;
+        }
+        self.save(Edit::Other);
+        self.killed = self.text[range.clone()].to_string();
+        self.cur = range.start;
+        self.text.replace_range(range, "");
+    }
+
+    /// Puts back the text cut out last, at the cursor.
+    pub fn yank(&mut self) {
+        let killed = std::mem::take(&mut self.killed);
+        self.insert(&killed);
+        self.killed = killed;
     }
 
     /// Moves one screen row up or down; false when there is none.
@@ -154,6 +215,7 @@ impl Input {
         };
         let goal = *self.goal.get_or_insert(col);
         self.cur = self.offset_at(r, goal);
+        self.last = Edit::None;
         true
     }
 
@@ -170,6 +232,8 @@ impl Input {
         self.hist = Some(i);
         self.text = self.history[i].clone();
         self.cur = self.text.len();
+        self.undo.clear();
+        self.last = Edit::None;
     }
 
     pub fn history_next(&mut self) {
@@ -182,6 +246,41 @@ impl Input {
             self.text = std::mem::take(&mut self.draft);
         }
         self.cur = self.text.len();
+        self.undo.clear();
+        self.last = Edit::None;
+    }
+
+    /// Puts back the text as it was before the last group of edits;
+    /// false when there is nothing to undo.
+    pub fn undo(&mut self) -> bool {
+        while let Some((text, cur)) = self.undo.pop() {
+            if text != self.text {
+                self.text = text;
+                self.cur = cur;
+                self.goal = None;
+                self.last = Edit::None;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remembers the text before an edit of this kind, unless it goes on
+    /// a run of the same kind.
+    fn save(&mut self, kind: Edit) {
+        let new_step = kind == Edit::Other || kind != self.last;
+        if new_step && self.undo.last().is_none_or(|(t, _)| *t != self.text) {
+            if self.undo.len() == UNDO_MAX {
+                self.undo.remove(0);
+            }
+            self.undo.push((self.text.clone(), self.cur));
+        }
+        self.last = kind;
+    }
+
+    fn moved(&mut self) {
+        self.goal = None;
+        self.last = Edit::None;
     }
 
     /// Places the cursor at a screen position of the laid-out text.
@@ -190,7 +289,7 @@ impl Input {
         if let Some(&r) = rows.get(row).or(rows.last()) {
             self.cur = self.offset_at(r, col);
         }
-        self.goal = None;
+        self.moved();
     }
 
     /// The text cut into rows of at most `width` columns, after a space
@@ -367,6 +466,49 @@ mod tests {
         assert_eq!(i.text(), "first");
         i.history_next();
         assert_eq!(i.text(), "draft");
+    }
+
+    #[test]
+    fn undo_goes_back_a_word_or_a_kill_at_a_time() {
+        let mut i = Input::default();
+        for c in "one two".chars() {
+            i.insert(&c.to_string());
+        }
+        i.kill_before();
+        assert_eq!(i.text(), "");
+        assert!(i.undo());
+        assert_eq!((i.text(), i.cur), ("one two", 7));
+        i.backspace();
+        i.backspace();
+        assert!(i.undo());
+        assert_eq!(i.text(), "one two");
+        assert!(i.undo());
+        assert_eq!(i.text(), "one");
+        assert!(i.undo());
+        assert_eq!(i.text(), "");
+        assert!(!i.undo());
+        i.insert("pasted text");
+        i.clear();
+        assert!(i.undo());
+        assert_eq!(i.text(), "pasted text");
+        i.take();
+        assert!(!i.undo(), "a sent message starts anew");
+
+        let mut i = with("cut this");
+        i.word_left();
+        i.kill_before();
+        i.line_end();
+        i.insert(" ");
+        i.yank();
+        assert_eq!(i.text(), "this cut ");
+        let mut i = with("one two three");
+        i.line_start();
+        i.word_right();
+        i.kill_word_after();
+        assert_eq!(i.text(), "one three");
+        i.line_end();
+        i.yank();
+        assert_eq!(i.text(), "one three two");
     }
 
     #[test]

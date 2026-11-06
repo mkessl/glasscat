@@ -24,6 +24,8 @@ pub struct Session {
     pub items: Vec<Item>,
     pub tools: Tools,
     specs: Vec<ToolSpec>,
+    /// The model sent no tools, since it takes none.
+    no_tools: Option<String>,
     /// What the model should learn with the next message, such as a
     /// change the user undid.
     notes: Vec<String>,
@@ -59,9 +61,20 @@ pub enum Shown<'a> {
     /// Asked to continue a cut-off reply, the model wrote a new one; it
     /// replaces the cut-off one.
     StartedOver,
-    /// The provider refused the images in the context with this error;
-    /// they were taken out and the request goes again.
-    ImagesDropped(&'a str),
+    /// The images in the context were taken out, since the provider
+    /// refused them with the error `why`, or its model list says the
+    /// model takes none; the request goes (again) without them.
+    ImagesDropped {
+        why: &'a str,
+        refused: bool,
+    },
+    /// The model is sent no tools from now on, since the provider refused
+    /// them with the error `why`, or its model list says the model takes
+    /// none.
+    ToolsOff {
+        why: &'a str,
+        refused: bool,
+    },
     ToolDone {
         name: &'a str,
         args: &'a str,
@@ -95,6 +108,7 @@ impl Session {
             items,
             tools,
             specs,
+            no_tools: None,
             notes: Vec::new(),
             log: None,
             launch: Default::default(),
@@ -245,7 +259,11 @@ impl Session {
         openai::request_body(
             &self.model,
             &self.items,
-            &self.specs,
+            if self.no_tools.as_ref() == Some(&self.model) {
+                &[]
+            } else {
+                &self.specs
+            },
             self.prefill,
             &self.fields.for_model(&self.model),
         )
@@ -253,6 +271,37 @@ impl Session {
 
     fn run(&mut self, cancel: &AtomicBool, mut on: impl FnMut(Shown)) -> Result<()> {
         'request: loop {
+            let images = self.items.iter().any(|i| matches!(i, Item::Image { .. }));
+            if images
+                && self.takes_images() == Some(false)
+                && self.drop_images("this model takes no images")
+            {
+                let why = format!(
+                    "{} takes no images, by its provider's model list.",
+                    self.model
+                );
+                on(Shown::ImagesDropped {
+                    why: &why,
+                    refused: false,
+                });
+            }
+            let sends_tools = self.no_tools.as_ref() != Some(&self.model);
+            // Only a list at hand is asked, so the request never waits for one;
+            // a refusal from the provider tells the rest.
+            let listed = crate::models::fetched(&self.base_url);
+            if sends_tools
+                && listed.and_then(|l| crate::models::takes_tools(&l, &self.model)) == Some(false)
+            {
+                self.no_tools = Some(self.model.clone());
+                let why = format!(
+                    "{} takes no tools, by its provider's model list",
+                    self.model
+                );
+                on(Shown::ToolsOff {
+                    why: &why,
+                    refused: false,
+                });
+            }
             let body = self.body();
             on(Shown::Request(&body));
             let mut attempt = 0;
@@ -275,8 +324,19 @@ impl Session {
                     .and_then(|h| h.retry_wait(attempt));
                 let Some(wait) = wait.filter(|_| attempt < RETRIES) else {
                     // Every later request would fail the same way.
-                    if refuses_images(&*e) && self.drop_images() {
-                        on(Shown::ImagesDropped(&e.to_string()));
+                    if refuses_images(&*e) && self.drop_images("the provider refused it") {
+                        on(Shown::ImagesDropped {
+                            why: &e.to_string(),
+                            refused: true,
+                        });
+                        continue 'request;
+                    }
+                    if sends_tools && refuses_tools(&*e) {
+                        self.no_tools = Some(self.model.clone());
+                        on(Shown::ToolsOff {
+                            why: &e.to_string(),
+                            refused: true,
+                        });
                         continue 'request;
                     }
                     return Err(e);
@@ -372,15 +432,15 @@ impl Session {
     }
 
     /// Takes every image out of the context, and tells the model in the
-    /// tool result it came with; false if there was none.
-    fn drop_images(&mut self) -> bool {
+    /// tool result it came with `why`; false if there was none.
+    fn drop_images(&mut self, why: &str) -> bool {
         let before = self.items.len();
         self.items.retain(|i| !matches!(i, Item::Image { .. }));
         for item in &mut self.items {
             if let Item::ToolResult { content, .. } = item
                 && let Some(head) = content.strip_suffix(IMAGE_FOLLOWS)
             {
-                *content = format!("{head}; not shown: the provider refused it");
+                *content = format!("{head}; not shown: {why}");
             }
         }
         self.items.len() < before
@@ -446,6 +506,25 @@ fn refuses_images(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
         && ["image", "vision", "multimodal"]
             .iter()
             .any(|w| text.contains(w))
+}
+
+/// Whether a provider's error refuses tools for the model, as OpenRouter's
+/// "No endpoints found that support tool use" or Ollama's "does not
+/// support tools".
+fn refuses_tools(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    let Some(h) = e.downcast_ref::<openai::HttpError>() else {
+        return false;
+    };
+    let text = h.message.to_lowercase();
+    matches!(h.status, 400 | 404 | 422)
+        && [
+            "support tool",
+            "support function",
+            "tool choice",
+            "tool_choice",
+        ]
+        .iter()
+        .any(|w| text.contains(w))
 }
 
 /// Tries of a request after the first, on errors that may pass.
@@ -699,6 +778,54 @@ mod tests {
     }
 
     #[test]
+    fn tools_the_provider_refuses_are_left_out() {
+        let dir = std::env::temp_dir().join(format!("agent-no-tools-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let body = r#"{"error":{"message":"No endpoints found that support tool use."}}"#;
+        let (url, server) = serve(vec![
+            format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+            sse(&[
+                r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+                "[DONE]",
+            ]),
+            sse(&[
+                r#"{"choices":[{"delta":{"content":"again"},"finish_reason":"stop"}]}"#,
+                "[DONE]",
+            ]),
+        ]);
+        let access = Access::new(&dir, std::slice::from_ref(&dir), &[]).unwrap();
+        let tools = Tools::new(access, Journal::new(dir.join("j.jsonl")));
+        let mut session = Session::new(url, "m".into(), None, Prefill::None, tools);
+        let mut off = 0;
+        for say in ["hello", "more"] {
+            session
+                .turn(say.into(), &AtomicBool::new(false), |s| {
+                    if let Shown::ToolsOff { refused: true, .. } = s {
+                        off += 1;
+                    }
+                })
+                .unwrap();
+        }
+        assert_eq!(off, 1);
+        let requests = server.join().unwrap();
+        assert!(requests[0].contains(r#""tools":"#));
+        assert!(!requests[1].contains(r#""tools":"#));
+        assert!(!requests[2].contains(r#""tools":"#));
+        // Another model is sent the tools again.
+        session.model = "n".into();
+        assert!(
+            String::from_utf8(session.body())
+                .unwrap()
+                .contains(r#""tools":"#)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn an_image_the_provider_refuses_is_taken_out() {
         let dir = std::env::temp_dir().join(format!("agent-image-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -731,8 +858,8 @@ mod tests {
         let mut dropped = Vec::new();
         session
             .turn("look".into(), &AtomicBool::new(false), |s| {
-                if let Shown::ImagesDropped(e) = s {
-                    dropped.push(e.to_string());
+                if let Shown::ImagesDropped { why, .. } = s {
+                    dropped.push(why.to_string());
                 }
             })
             .unwrap();

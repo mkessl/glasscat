@@ -35,6 +35,9 @@ impl App {
         if name == "/help" {
             return self.show(help());
         }
+        if name == "/usage" {
+            return self.show(super::requests_text(&self.requests));
+        }
         let Some(session) = self.session.as_mut() else {
             self.transcript
                 .push(Block::Error("Still working; Esc stops it first.".into()));
@@ -147,7 +150,11 @@ impl App {
                 };
                 // OSC 52: the terminal puts the text on the clipboard, also over SSH.
                 let mut out = io::stdout();
-                let _ = write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()));
+                let _ = write!(
+                    out,
+                    "\x1b]52;c;{}\x07",
+                    crate::image::base64(text.as_bytes())
+                );
                 let _ = out.flush();
                 self.transcript.push(Block::Info(format!(
                     "Copied the last reply ({} characters) to the clipboard, if the terminal \
@@ -434,6 +441,63 @@ pub(super) fn complete(typed: &str) -> String {
     first[typed.len()..shared].to_string()
 }
 
+/// What Tab adds to the path that ends `typed`, looked up from `cwd`: the
+/// rest of the name its matches share, and a `/` or a space when only one
+/// is left; and the matches when there are more, a folder with a `/`.
+/// A name starting with a dot is offered only after a dot.
+pub(super) fn complete_path(typed: &str, cwd: &std::path::Path) -> (String, Vec<String>) {
+    let word = typed.rsplit(char::is_whitespace).next().unwrap_or("");
+    if word.is_empty() {
+        return Default::default();
+    }
+    let (dir, prefix) = match word.rfind('/') {
+        Some(i) => (&word[..=i], &word[i + 1..]),
+        None => ("", word),
+    };
+    let base = match dir.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => std::path::PathBuf::from(home).join(rest),
+            None => return Default::default(),
+        },
+        None => cwd.join(dir),
+    };
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return Default::default();
+    };
+    let mut found: Vec<(String, bool)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let dot = name.starts_with('.') && !prefix.starts_with('.');
+            (name.starts_with(prefix) && !dot).then(|| (name, e.path().is_dir()))
+        })
+        .collect();
+    found.sort();
+    let Some(((first, is_dir), rest)) = found.split_first() else {
+        return Default::default();
+    };
+    if rest.is_empty() {
+        let end = if *is_dir { "/" } else { " " };
+        return (format!("{}{end}", &first[prefix.len()..]), Vec::new());
+    }
+    let shared = rest.iter().fold(first.len(), |n, (other, _)| {
+        first
+            .char_indices()
+            .zip(other.chars())
+            .take_while(|((i, a), b)| *i < n && a == b)
+            .last()
+            .map_or(0, |((i, a), _)| i + a.len_utf8())
+    });
+    let names = found
+        .iter()
+        .map(|(n, d)| if *d { format!("{n}/") } else { n.clone() })
+        .collect();
+    (
+        first[prefix.len()..shared.max(prefix.len())].to_string(),
+        names,
+    )
+}
+
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "this list"),
     ("/clear", "start a new conversation"),
@@ -471,6 +535,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "/provider",
         "who ran the last reply, and what they publish about your data",
     ),
+    (
+        "/usage",
+        "each request of this run: tokens, cache, cost, time, and who ran it",
+    ),
     ("/tools", "the tools the model has, and what each one runs"),
     (
         "/access",
@@ -492,7 +560,10 @@ const KEYS: &[(&str, &str)] = &[
         "send; on an empty line, pick up a reply that did not finish",
     ),
     ("Shift+Enter, Alt+Enter, Ctrl+J", "new line"),
-    ("Tab", "complete a command name; / lists the commands"),
+    (
+        "Tab",
+        "complete a command name or a file path; / lists the commands",
+    ),
     ("Esc", "stop the reply"),
     ("Ctrl+C", "stop, clear the input, or quit"),
     ("Ctrl+D", "quit on an empty line"),
@@ -512,9 +583,15 @@ const KEYS: &[(&str, &str)] = &[
     ),
     ("Ctrl+A, Ctrl+E", "start, end of line"),
     (
-        "Ctrl+U, Ctrl+K, Ctrl+W",
-        "delete to line start, to line end, a word",
+        "Alt+B, Alt+F",
+        "a word back, forward; so do Ctrl+Left, Ctrl+Right",
     ),
+    (
+        "Ctrl+U, Ctrl+K, Ctrl+W, Alt+D",
+        "delete to line start, to line end, the word before, the word after",
+    ),
+    ("Ctrl+Y", "put back the text deleted last"),
+    ("Ctrl+Z or Ctrl+_", "undo in the input"),
 ];
 
 fn help() -> String {
@@ -529,26 +606,6 @@ fn help() -> String {
         out += &format!("  {key:<kw$}  {what}\n");
     }
     out.trim_end().to_string()
-}
-
-/// Standard base64 with padding.
-fn base64(bytes: &[u8]) -> String {
-    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(ABC[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -567,11 +624,33 @@ mod tests {
     }
 
     #[test]
-    fn base64_matches_the_standard() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64("héllo wörld".as_bytes()), "aMOpbGxvIHfDtnJsZA==");
+    fn completes_paths() {
+        let dir = std::env::temp_dir().join(format!("complete-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/ui")).unwrap();
+        for f in [
+            "src/main.rs",
+            "src/mod.rs",
+            "src/model.rs",
+            ".env",
+            "README.md",
+        ] {
+            std::fs::write(dir.join(f), "").unwrap();
+        }
+        let add = |typed: &str| complete_path(typed, &dir).0;
+        assert_eq!(add("look at REA"), "DME.md ");
+        assert_eq!(add("sr"), "c/");
+        assert_eq!(add("read src/mo"), "d");
+        assert_eq!(add("read src/u"), "i/");
+        assert_eq!(add("src/m"), "");
+        assert_eq!(add(""), "");
+        assert_eq!(add("x "), "");
+        assert_eq!(add("e"), "");
+        assert_eq!(add(".e"), "nv ");
+        assert_eq!(
+            complete_path("src/", &dir).1,
+            ["main.rs", "mod.rs", "model.rs", "ui/"]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -49,6 +49,8 @@ const ADDED: Style = Style::fg(Color::Green);
 
 /// Lines of an edit's change shown under the call.
 const DIFF_LINES: usize = 12;
+/// The most kept lines shown between two changes; more are counted.
+const CONTEXT_RUN: usize = 3;
 
 #[derive(Default)]
 pub struct Transcript {
@@ -333,17 +335,82 @@ pub fn change(name: &str, args: &str, result: &str, before: Option<&str>) -> Vec
         .count();
     old.truncate(old.len() - same);
     new.truncate(new.len() - same);
-    let mut lines: Vec<(String, Style)> = old
-        .iter()
-        .map(|l| (format!("  - {l}"), ERROR))
-        .chain(new.iter().map(|l| (format!("  + {l}"), ADDED)))
-        .collect();
+    let mut lines: Vec<(String, Style)> = Vec::new();
+    match diff(&old, &new) {
+        Some(steps) => {
+            // Lines kept between two changes stay as context, a long run of
+            // them in short.
+            let mut i = 0;
+            while i < steps.len() {
+                let (op, l) = steps[i];
+                if op != ' ' {
+                    let st = if op == '-' { ERROR } else { ADDED };
+                    lines.push((format!("  {op} {l}"), st));
+                    i += 1;
+                    continue;
+                }
+                let run = steps[i..].iter().take_while(|s| s.0 == ' ').count();
+                if run <= CONTEXT_RUN {
+                    lines.extend(
+                        steps[i..i + run]
+                            .iter()
+                            .map(|s| (format!("    {}", s.1), Style::dim())),
+                    );
+                } else {
+                    lines.push((format!("    ⋯ {run} lines as they were"), Style::dim()));
+                }
+                i += run;
+            }
+        }
+        None => {
+            lines.extend(old.iter().map(|l| (format!("  - {l}"), ERROR)));
+            lines.extend(new.iter().map(|l| (format!("  + {l}"), ADDED)));
+        }
+    }
     if lines.len() > DIFF_LINES {
         let more = lines.len() - (DIFF_LINES - 1);
         lines.truncate(DIFF_LINES - 1);
         lines.push((format!("  … {more} more lines"), Style::dim()));
     }
     lines
+}
+
+/// The steps from `a` to `b`, by the longest run of lines they share:
+/// `' '` kept, `'-'` taken out, `'+'` put in. None when the two are too long
+/// to compare in a moment.
+fn diff<'a>(a: &[&'a str], b: &[&'a str]) -> Option<Vec<(char, &'a str)>> {
+    let (n, m) = (a.len(), b.len());
+    if n.saturating_mul(m) > 1 << 22 {
+        return None;
+    }
+    // shared[i][j]: how many lines a[i..] and b[j..] share, at most.
+    // Below the limit one side is under 2^11 lines, so u16 holds it.
+    let w = m + 1;
+    let mut shared = vec![0u16; (n + 1) * w];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            shared[i * w + j] = if a[i] == b[j] {
+                shared[(i + 1) * w + j + 1] + 1
+            } else {
+                shared[(i + 1) * w + j].max(shared[i * w + j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut steps = Vec::with_capacity(n + m);
+    while i < n || j < m {
+        if i < n && j < m && a[i] == b[j] {
+            steps.push((' ', a[i]));
+            (i, j) = (i + 1, j + 1);
+        } else if j == m || (i < n && shared[(i + 1) * w + j] >= shared[i * w + j + 1]) {
+            steps.push(('-', a[i]));
+            i += 1;
+        } else {
+            steps.push(('+', b[j]));
+            j += 1;
+        }
+    }
+    Some(steps)
 }
 
 /// A tool call's arguments in a few words: the path or pattern when there
@@ -543,6 +610,43 @@ mod tests {
                 "  + ok"
             ]
         );
+    }
+
+    #[test]
+    fn a_change_shows_only_what_changed() {
+        let text = |old: &str, new: &str| -> Vec<String> {
+            let args = serde_json::json!({"path": "a", "old": old, "new": new}).to_string();
+            change("edit", &args, "edited a", None)
+                .into_iter()
+                .map(|(t, _)| t)
+                .collect()
+        };
+        assert_eq!(
+            text(
+                "from x import a\n\n\ndef f():\n    a()\n",
+                "from x import b\n\n\ndef f():\n    b()\n"
+            ),
+            [
+                "  - from x import a",
+                "  + from x import b",
+                "    ",
+                "    ",
+                "    def f():",
+                "  -     a()",
+                "  +     b()",
+            ]
+        );
+        assert_eq!(
+            text("a\n1\n2\n3\n4\nb", "A\n1\n2\n3\n4\nB"),
+            [
+                "  - a",
+                "  + A",
+                "    ⋯ 4 lines as they were",
+                "  - b",
+                "  + B"
+            ]
+        );
+        assert_eq!(text("a\nb", "a\nx\nb"), ["  + x"]);
     }
 
     #[test]

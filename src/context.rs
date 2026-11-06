@@ -123,7 +123,12 @@ pub fn from_text(text: &str) -> Result<Vec<Item>, String> {
     for (n, header, body) in parts {
         let body = body.join("\n");
         let words: Vec<&str> = header.split_whitespace().collect();
-        let err = |what: &str| Err(format!("line {n}: {what}: {header}"));
+        let err = |what: &str| {
+            Err(format!(
+                "line {n}: {what}: {header} (a line of text that starts with === or --- \
+                 takes a \\ in front)"
+            ))
+        };
         match words.as_slice() {
             ["===", "system"] => items.push(Item::System(body)),
             ["===", "user"] => items.push(Item::User(body)),
@@ -218,7 +223,8 @@ mod tests {
     fn errors_name_the_line() {
         assert_eq!(
             from_text("=== user\nhi\n=== bogus\n").unwrap_err(),
-            "line 3: unknown header: === bogus"
+            "line 3: unknown header: === bogus (a line of text that starts with === or --- \
+             takes a \\ in front)"
         );
         assert!(
             from_text("--- reasoning\nx")

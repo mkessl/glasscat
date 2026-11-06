@@ -17,6 +17,7 @@ pub struct Style {
     pub italic: bool,
     pub underline: bool,
     pub reverse: bool,
+    pub strike: bool,
 }
 
 impl Style {
@@ -29,6 +30,7 @@ impl Style {
             italic: false,
             underline: false,
             reverse: false,
+            strike: false,
         }
     }
     pub const fn dim() -> Self {
@@ -40,6 +42,7 @@ impl Style {
             italic: false,
             underline: false,
             reverse: false,
+            strike: false,
         }
     }
     pub const fn bold(mut self) -> Self {
@@ -52,6 +55,10 @@ impl Style {
     }
     pub const fn underline(mut self) -> Self {
         self.underline = true;
+        self
+    }
+    pub const fn strike(mut self) -> Self {
+        self.strike = true;
         self
     }
 }
@@ -114,6 +121,7 @@ const BLANK: Cell = Cell {
         italic: false,
         underline: false,
         reverse: false,
+        strike: false,
     },
 };
 
@@ -262,6 +270,9 @@ fn set_style(out: &mut impl Write, s: Style) -> io::Result<()> {
     }
     if s.reverse {
         queue!(out, SetAttribute(Attribute::Reverse))?;
+    }
+    if s.strike {
+        queue!(out, SetAttribute(Attribute::CrossedOut))?;
     }
     if let Some(c) = s.fg {
         queue!(out, SetForegroundColor(c))?;

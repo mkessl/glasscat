@@ -84,6 +84,7 @@ pub fn describe(b: &[u8], mime: &str) -> String {
     format!("{name} image{px}, {amount}")
 }
 
+/// Standard base64 with padding.
 pub fn base64(b: &[u8]) -> String {
     const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
@@ -114,6 +115,7 @@ mod tests {
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
         assert_eq!(base64(&[0xff, 0xfe]), "//4=");
+        assert_eq!(base64("héllo wörld".as_bytes()), "aMOpbGxvIHfDtnJsZA==");
     }
 
     #[test]

@@ -227,8 +227,18 @@ fn run() -> Result<()> {
                 }
                 Ok(())
             }
-            agent::Shown::ImagesDropped(error) => {
-                writeln!(std::io::stderr(), "{error}\n{}", ui::IMAGES_DROPPED)
+            agent::Shown::ImagesDropped { why, refused: true } => {
+                writeln!(std::io::stderr(), "{why}\n{}", ui::IMAGES_DROPPED)
+            }
+            agent::Shown::ImagesDropped { why, .. } => writeln!(
+                std::io::stderr(),
+                "{why} The images were taken out of the context."
+            ),
+            agent::Shown::ToolsOff { why, refused: true } => {
+                writeln!(std::io::stderr(), "{why}\n{}", ui::TOOLS_OFF)
+            }
+            agent::Shown::ToolsOff { why, .. } => {
+                writeln!(std::io::stderr(), "{why}, {}", ui::NO_TOOLS)
             }
             agent::Shown::Retrying { error, wait, .. } => writeln!(
                 std::io::stderr(),

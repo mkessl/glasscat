@@ -175,6 +175,22 @@ pub fn money(dollars: f64) -> String {
     }
 }
 
+/// Parts of a status line joined by " · " in `width` columns: the parts
+/// that do not fit go from before the last one, which stays.
+pub fn fit_parts(parts: &[&str], width: usize) -> String {
+    let Some((last, rest)) = parts.split_last() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for p in rest {
+        if out.width() + p.width() + 3 + last.width() > width {
+            break;
+        }
+        out = out + p + " · ";
+    }
+    clip(&(out + last), width)
+}
+
 /// Cuts text to at most `width` columns, ending with … when cut.
 pub fn clip(s: &str, width: usize) -> String {
     if s.width() <= width {
@@ -222,6 +238,15 @@ pub fn clip_start(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_parts_keep_the_last() {
+        let parts = ["a move", "b open", "Esc back"];
+        assert_eq!(fit_parts(&parts, 80), "a move · b open · Esc back");
+        assert_eq!(fit_parts(&parts, 20), "a move · Esc back");
+        assert_eq!(fit_parts(&parts, 8), "Esc back");
+        assert_eq!(fit_parts(&parts, 5), "Esc …");
+    }
 
     #[test]
     fn wraps_at_spaces() {

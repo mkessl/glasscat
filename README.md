@@ -66,13 +66,15 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
   `/access allow PATH`.
 - **Reasoning** from thinking models streams in, then folds away; <kbd>Ctrl</kbd>+<kbd>O</kbd>
   opens it.
-- **Markdown** in replies is rendered: headings, lists, quotes, tables, links, bold and italic,
-  and code in colour for the common languages and diffs, in your terminal's own palette.
+- **Markdown** in replies is rendered: headings, lists and task lists, quotes, tables, links,
+  bold, italic and struck text, and code in colour for the common languages and diffs, in your
+  terminal's own palette.
   A table too wide for the screen wraps its widest cells.
 - **Usage, cost and speed** of each request in the status bar: the context used out of the
   model's window, cache hits, time to the first token, tokens per second, and what all the
-  requests so far cost together. When the provider's cache gives back much less than the last
-  request sent, you are told what changed: the request, the provider it ran on, or nothing.
+  requests so far cost together; `/usage` lists each request. When the provider's cache gives
+  back much less than the last request sent, you are told what changed: the request, the
+  provider it ran on, or nothing.
 - **Reports, not telemetry.** When the model meets a fault of glasscat itself, it can write it
   up with only what the fault needs. The report is saved on your machine and nothing is sent;
   `/report` opens it as a new GitHub issue that you read and send yourself.
@@ -120,15 +122,16 @@ Inside a session:
 | <kbd>Enter</kbd> | send; on an empty line, continue a reply that did not finish |
 | <kbd>Shift</kbd>+<kbd>Enter</kbd>, <kbd>Alt</kbd>+<kbd>Enter</kbd> or <kbd>Ctrl</kbd>+<kbd>J</kbd> | new line |
 | <kbd>↑</kbd> <kbd>↓</kbd> | earlier messages, also from past conversations held here |
-| <kbd>Tab</kbd> | complete a command; typing `/` lists them |
+| <kbd>Tab</kbd> | complete a command or a file path; typing `/` lists the commands |
 | <kbd>Esc</kbd> | stop the reply |
 | <kbd>Ctrl</kbd>+<kbd>T</kbd> | the exact context sent to the model |
 | <kbd>Ctrl</kbd>+<kbd>O</kbd> | show or fold reasoning and long pasted messages |
+| <kbd>Ctrl</kbd>+<kbd>Z</kbd> | undo in the input, say after <kbd>Ctrl</kbd>+<kbd>U</kbd> cleared a line by mistake; <kbd>Ctrl</kbd>+<kbd>Y</kbd> puts back what was deleted |
 | <kbd>Shift</kbd>+drag | select text (in most terminals) |
 | `/model <id>` | switch the model |
 | `/resume` | earlier conversations held in this directory; `/resume N` picks one up |
 | `/retry` | drop the last answer and ask again, say after switching the model |
-| `/models <words>` | find models by id, with context window and price; on OpenRouter, `ZDR` marks those a provider keeping no data runs, and the word `zdr` keeps to them |
+| `/models <words>` | find models by id, with context window and price; on OpenRouter, `ZDR` marks those a provider keeping no data runs, and the word `zdr` keeps to them; `no tools` marks those that can only talk, which are sent no tools |
 | `/undo` | undo the agent's last file change; `/undo 3`, the last three |
 | `/changes` | the agent's file changes in this session, which `/undo` takes back in turn |
 | `/access` | a tree of what the model may see, to hide or show paths; or `hide`, `show`, `allow` PATH |
@@ -139,6 +142,7 @@ Inside a session:
 | `/settings` | edit the settings file; most of it applies at once |
 | `/set <name> <value>` | set a request field for this session, such as `temperature 0.3`; `/set` lists them |
 | `/provider` | who ran the last reply, and what they publish about your data |
+| `/usage` | each request of this run: tokens in, from the cache and out, cost, time to the first token and in all, speed, and who ran it |
 | `/clear` | start a new conversation |
 | `/help` | all commands and keys |
 

@@ -302,10 +302,17 @@ fn is_rule(s: &str) -> bool {
     s.len() >= 3 && ['-', '*', '_'].iter().any(|&m| s.chars().all(|c| c == m))
 }
 
-/// `- x`, `* x`, `+ x` become `• x`; `1. x` and `1) x` keep their number.
+/// `- x`, `* x`, `+ x` become `• x`, `- [ ] x` and `- [x] x` a box;
+/// `1. x` and `1) x` keep their number.
 fn list_item(s: &str) -> Option<(String, &str)> {
     for m in ["- ", "* ", "+ "] {
         if let Some(rest) = s.strip_prefix(m) {
+            // A task list's box takes the bullet's place.
+            for (b, mark) in [("[ ] ", "☐"), ("[x] ", "☑"), ("[X] ", "☑")] {
+                if let Some(rest) = rest.strip_prefix(b) {
+                    return Some((mark.into(), rest));
+                }
+            }
             return Some(("•".into(), rest));
         }
     }
@@ -321,9 +328,23 @@ fn list_item(s: &str) -> Option<(String, &str)> {
     None
 }
 
-/// `code`, **bold**, __bold__, *italic* and [links](url) in one line of
-/// text; a link shows its text, then its address dimmed.
+/// `code`, **bold**, __bold__, *italic*, _italic_, ~~struck~~ and
+/// [links](url) in one line of text; a link shows its text, then its address dimmed.
 fn inline(s: &str, base: Style) -> Vec<Span> {
+    // A marker left open at the end of the line was no marker: it is
+    // taken as text, and the line laid out again.
+    let mut literal = Vec::new();
+    loop {
+        match spans(s, base, &literal) {
+            (out, None) => return out,
+            (_, Some(at)) => literal.push(at),
+        }
+    }
+}
+
+/// The spans of one line, with the markers at the byte offsets in
+/// `literal` taken as text; and the offset of a marker left open, if any.
+fn spans(s: &str, base: Style, literal: &[usize]) -> (Vec<Span>, Option<usize>) {
     let mut out: Vec<Span> = Vec::new();
     let mut push = |text: &str, style: Style| match out.last_mut() {
         Some((t, st)) if *st == style => t.push_str(text),
@@ -332,18 +353,28 @@ fn inline(s: &str, base: Style) -> Vec<Span> {
     let mut rest = s;
     // The marker that opened bold, `**` or `__`.
     let mut bold: Option<&str> = None;
-    let mut italic = false;
-    let style = |bold: Option<&str>, italic: bool| {
+    // The marker that opened italic, `*` or `_`.
+    let mut italic: Option<char> = None;
+    let mut strike = false;
+    // Where each open marker opened.
+    let (mut bold_at, mut italic_at, mut strike_at) = (0, 0, 0);
+    let style = |bold: Option<&str>, italic: Option<char>, strike: bool| {
         let mut st = base;
         if bold.is_some() {
             st = st.bold();
         }
-        if italic {
+        if italic.is_some() {
             st = st.italic();
+        }
+        if strike {
+            st = st.strike();
         }
         st
     };
+    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
     while let Some(c) = rest.chars().next() {
+        let at = s.len() - rest.len();
+        let free = !literal.contains(&at);
         if c == '`' {
             let ticks = rest.chars().take_while(|&c| c == '`').count();
             let marker = &rest[..ticks];
@@ -357,14 +388,14 @@ fn inline(s: &str, base: Style) -> Vec<Span> {
                 rest = &rest[ticks + end + ticks..];
                 continue;
             }
-            push(marker, style(bold, italic));
+            push(marker, style(bold, italic, strike));
             rest = &rest[ticks..];
             continue;
         }
         if c == '['
             && let Some((text, url, len)) = link(rest)
         {
-            push(text, style(bold, italic).underline());
+            push(text, style(bold, italic, strike).underline());
             if url != text {
                 push(&format!(" ({url})"), Style::dim());
             }
@@ -383,7 +414,6 @@ fn inline(s: &str, base: Style) -> Vec<Span> {
         if rest.starts_with("**") || rest.starts_with("__") {
             let m = &rest[..2];
             // `__` inside a word, as in `__init__`, is part of the word.
-            let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
             let inside = m == "__"
                 && if bold.is_some() {
                     word(rest[2..].chars().next())
@@ -392,25 +422,68 @@ fn inline(s: &str, base: Style) -> Vec<Span> {
                 };
             let fits = match bold {
                 Some(open) => open == m,
-                None => toggles(m, false, rest),
+                None => free && toggles(m, false, rest),
             };
             if fits && !inside {
                 bold = if bold.is_some() { None } else { Some(m) };
+                bold_at = at;
                 rest = &rest[2..];
                 continue;
             }
-            push(m, style(bold, italic));
+            push(m, style(bold, italic, strike));
             rest = &rest[2..];
             continue;
-        } else if c == '*' && toggles("*", italic, rest) {
-            italic = !italic;
+        } else if rest.starts_with("~~") && (strike || free) && toggles("~~", strike, rest) {
+            strike = !strike;
+            strike_at = at;
+            rest = &rest[2..];
+            continue;
+        } else if c == '*'
+            && italic != Some('_')
+            && (italic.is_some() || free)
+            && toggles("*", italic.is_some(), rest)
+        {
+            italic = if italic.is_some() { None } else { Some('*') };
+            italic_at = at;
             rest = &rest[1..];
             continue;
+        } else if c == '_' && italic != Some('*') {
+            // `_` works only at the edge of a word: snake_case stays as it is.
+            let before = s[..s.len() - rest.len()].chars().next_back();
+            let after = rest[1..].chars().next();
+            let fits = if italic.is_some() {
+                !word(after) && !before.is_some_and(char::is_whitespace)
+            } else {
+                free && !word(before)
+                    && after.is_some_and(|c| !c.is_whitespace())
+                    && closes(&rest[1..])
+            };
+            if fits {
+                italic = if italic.is_some() { None } else { Some('_') };
+                italic_at = at;
+                rest = &rest[1..];
+                continue;
+            }
         }
-        push(&rest[..c.len_utf8()], style(bold, italic));
+        push(&rest[..c.len_utf8()], style(bold, italic, strike));
         rest = &rest[c.len_utf8()..];
     }
-    out
+    let open = [
+        (bold.is_some(), bold_at),
+        (italic.is_some(), italic_at),
+        (strike, strike_at),
+    ];
+    (out, open.iter().find(|o| o.0).map(|o| o.1))
+}
+
+/// Whether `s` holds a `_` that ends italic: after text, before no word.
+fn closes(s: &str) -> bool {
+    s.char_indices().any(|(i, c)| {
+        c == '_'
+            && i > 0
+            && !s[..i].ends_with(char::is_whitespace)
+            && !s[i + 1..].starts_with(char::is_alphanumeric)
+    })
 }
 
 /// `[text](url)` at the start of `s`: the text, the address, and the
@@ -452,6 +525,31 @@ mod tests {
             ]
         );
         assert_eq!(inline("snake_case_name", Style::default()).len(), 1);
+        // A marker that never closes is text.
+        for open in ["_a__ and more", "_a `b_` c", "**a `b**` c", "~~a `~~`"] {
+            assert!(
+                inline(open, Style::default())
+                    .iter()
+                    .all(|(_, st)| *st == Style::default() || *st == CODE),
+                "{open}"
+            );
+        }
+        let i = Style::default().italic();
+        assert_eq!(
+            inline(
+                "**bold _it_** _x_y_ a_b _ c_ ~~gone~~ ~x~",
+                Style::default()
+            ),
+            [
+                ("bold ".to_string(), b),
+                ("it".to_string(), b.italic()),
+                (" ".to_string(), Style::default()),
+                ("x_y".to_string(), i),
+                (" a_b _ c_ ".to_string(), Style::default()),
+                ("gone".to_string(), Style::default().strike()),
+                (" ~x~".to_string(), Style::default()),
+            ]
+        );
         let b = Style::default().bold();
         assert_eq!(
             inline("**src/__init__.py** __x__", Style::default()),
@@ -508,6 +606,10 @@ mod tests {
                 "────────────",
                 "let *x* = 1;",
             ]
+        );
+        assert_eq!(
+            texts("- [ ] to do\n- [x] done\n- [y] not a box", 20),
+            ["☐ to do", "☑ done", "• [y] not a box"]
         );
     }
 }
