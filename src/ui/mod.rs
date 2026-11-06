@@ -68,6 +68,8 @@ enum AgentMsg {
     Text(String),
     Reasoning(String),
     Calling(String),
+    /// More bytes of the arguments of the call being written.
+    CallArgs(usize),
     Tool {
         name: String,
         args: String,
@@ -80,6 +82,7 @@ enum AgentMsg {
     Timing(Option<Duration>, Duration),
     Retrying(String, Duration, u32),
     StartedOver,
+    ImagesDropped(String),
 }
 
 enum View {
@@ -87,6 +90,13 @@ enum View {
     Context { raw: bool, scroll: usize },
     Files(files::Files),
 }
+
+/// Said when the provider refused the images in the context.
+pub const IMAGES_DROPPED: &str =
+    "The images were taken out of the context, and the request goes again without them.";
+
+/// Raw or not and sent or not, the width, the body, and its lines.
+type ContextLines = ((bool, bool), u16, Vec<u8>, Vec<transcript::Line>);
 
 struct App {
     session: Option<Box<Session>>,
@@ -98,6 +108,10 @@ struct App {
     /// Lines scrolled up from the bottom of the transcript.
     scroll: usize,
     last_request: Vec<u8>,
+    /// The context view as laid out last: raw or not and sent or not,
+    /// the width, and the body it shows; a big request takes long to lay
+    /// out.
+    context_lines: Option<ContextLines>,
     /// What a command shows over the chat, and how far it is scrolled.
     panel: Option<(String, usize)>,
     /// When the last request went out.
@@ -105,9 +119,13 @@ struct App {
     /// The last request that reported usage, and when it ended, to see
     /// why the cache missed.
     cache_last: Option<(crate::cache::Sent, Instant)>,
-    /// Providers already said to have kept nothing of an unchanged request.
-    cache_told: Vec<Option<String>>,
+    /// Cache misses said already, of those said once in a run.
+    cache_told: Vec<String>,
+    /// Providers that gave back cached tokens in this run.
+    cache_hits: Vec<Option<String>>,
     busy: Option<String>,
+    /// The tool call the model is writing, and its arguments' size so far.
+    call: Option<(String, usize)>,
     usage: Option<Value>,
     /// Cost of every request in this run, and how many reported one.
     spent: (f64, u32),
@@ -179,11 +197,14 @@ pub fn run(session: Session) -> Result<()> {
         view: View::Chat,
         scroll: 0,
         last_request: Vec::new(),
+        context_lines: None,
         panel: None,
         sent_at: Instant::now(),
         cache_last: None,
         cache_told: Vec::new(),
+        cache_hits: Vec::new(),
         busy: None,
+        call: None,
         usage: None,
         spent: (0.0, 0),
         cancel: Arc::new(AtomicBool::new(false)),
@@ -561,7 +582,21 @@ impl App {
                 self.busy = Some("thinking".into());
                 self.transcript.stream(&t, true);
             }
-            AgentMsg::Calling(name) => self.busy = Some(format!("calling {name}")),
+            AgentMsg::Calling(name) => {
+                self.busy = Some(format!("calling {name}"));
+                self.call = Some((name, 0));
+            }
+            AgentMsg::CallArgs(n) => {
+                if let Some((name, size)) = &mut self.call {
+                    *size += n;
+                    let shown = if *size < 1024 {
+                        format!("{size} B")
+                    } else {
+                        format!("{:.1} KB", *size as f64 / 1024.0)
+                    };
+                    self.busy = Some(format!("calling {name} · {shown}"));
+                }
+            }
             AgentMsg::Tool {
                 name,
                 args,
@@ -587,6 +622,15 @@ impl App {
                 if let Some(c) = u.get("cost").and_then(Value::as_f64) {
                     self.spent = (self.spent.0 + c, self.spent.1 + 1);
                 }
+                let on = self.served.as_ref().and_then(|s| s.provider.clone());
+                let hit_before = self.cache_hits.contains(&on);
+                let hit = u
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|c| c > 0);
+                if hit && !hit_before {
+                    self.cache_hits.push(on.clone());
+                }
                 if let Some((last, ended)) = &self.cache_last {
                     let gap = self.sent_at.saturating_duration_since(*ended);
                     let why = crate::cache::explain_miss(
@@ -595,14 +639,13 @@ impl App {
                         &u,
                         self.served.as_ref(),
                         gap,
+                        hit_before,
                         crate::policy::known(&self.api.base_url),
                     );
                     if let Some(why) = why {
-                        // That a provider kept nothing is said once for it.
-                        let on = self.served.as_ref().and_then(|s| s.provider.clone());
-                        let told = why.unchanged && self.cache_told.contains(&on);
-                        if why.unchanged && !told {
-                            self.cache_told.push(on);
+                        let told = why.once.as_ref().is_some_and(|k| self.cache_told.contains(k));
+                        if let Some(k) = why.once.filter(|_| !told) {
+                            self.cache_told.push(k);
                         }
                         if !told {
                             self.transcript.push(Block::Info(why.text));
@@ -638,6 +681,10 @@ impl App {
             AgentMsg::StartedOver => self.transcript.push(Block::Info(
                 "The model wrote the reply anew instead of continuing it; only the new one is kept.".into(),
             )),
+            AgentMsg::ImagesDropped(e) => {
+                self.transcript.push(Block::Error(e));
+                self.transcript.push(Block::Info(IMAGES_DROPPED.into()));
+            }
         }
         // Keep the lines being read in place while scrolled up.
         if let Some(before) = before {
@@ -691,7 +738,7 @@ impl App {
                 Shown::Stream(Stream::Text(t)) => send(AgentMsg::Text(t.into())),
                 Shown::Stream(Stream::Reasoning(t)) => send(AgentMsg::Reasoning(t.into())),
                 Shown::Stream(Stream::Call(n)) => send(AgentMsg::Calling(n.into())),
-                Shown::Stream(Stream::CallArgs(_)) => {}
+                Shown::Stream(Stream::CallArgs(a)) => send(AgentMsg::CallArgs(a.len())),
                 Shown::Usage(u) => send(AgentMsg::Usage(u.clone())),
                 Shown::Served(s) => send(AgentMsg::Served(s.clone())),
                 Shown::Timing { first, total } => send(AgentMsg::Timing(first, total)),
@@ -701,6 +748,7 @@ impl App {
                     attempt,
                 } => send(AgentMsg::Retrying(error.into(), wait, attempt)),
                 Shown::StartedOver => send(AgentMsg::StartedOver),
+                Shown::ImagesDropped(e) => send(AgentMsg::ImagesDropped(e.into())),
                 Shown::ToolDone {
                     name,
                     args,
@@ -1049,11 +1097,19 @@ impl App {
             Some(s) if self.last_request.is_empty() => s.body(),
             _ => Vec::new(),
         };
-        let lines = if preview.is_empty() {
-            context::lines(&self.last_request, raw, w as usize, true)
+        let body = if preview.is_empty() {
+            &self.last_request
         } else {
-            context::lines(&preview, raw, w as usize, false)
+            &preview
         };
+        let key = (raw, preview.is_empty());
+        let fresh = matches!(&self.context_lines,
+            Some((k, cw, b, _)) if *k == key && *cw == w && b == body);
+        if !fresh {
+            let lines = context::lines(body, raw, w as usize, key.1);
+            self.context_lines = Some((key, w, body.clone(), lines));
+        }
+        let lines = &self.context_lines.as_ref().expect("set above").3;
         let height = h as usize - 1;
         let scroll = scroll.min(lines.len().saturating_sub(height));
         if let View::Context { scroll: s, .. } = &mut self.view {
@@ -1141,7 +1197,7 @@ fn replay(items: &[Item], t: &mut Transcript) {
                     });
                 }
             }
-            Item::System(_) | Item::ToolResult { .. } => {}
+            Item::System(_) | Item::ToolResult { .. } | Item::Image { .. } => {}
         }
     }
 }

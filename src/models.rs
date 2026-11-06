@@ -144,6 +144,14 @@ pub fn matching(list: &Value, filter: &str, max: usize, zdr: Option<&HashSet<Str
     out.join("\n")
 }
 
+/// Whether `model` takes images, by the input modalities OpenRouter's
+/// list gives; None when the list does not say.
+pub fn takes_images(list: &Value, model: &str) -> Option<bool> {
+    let entry = list["data"].as_array()?.iter().find(|m| m["id"] == model)?;
+    let inputs = entry["architecture"]["input_modalities"].as_array()?;
+    Some(inputs.iter().any(|m| m == "image"))
+}
+
 fn window_in(list: &Value, model: &str) -> Option<u64> {
     let entry = list["data"].as_array()?.iter().find(|m| m["id"] == model)?;
     WINDOW_KEYS.iter().find_map(|k| entry[k].as_u64())
@@ -183,6 +191,19 @@ mod tests {
             "a/big · 200k · $3.00 in, $15.00 out per M\na/small · ZDR"
         );
         assert!(matching(&list, "zdr", 5, None).starts_with("No model"));
+    }
+
+    #[test]
+    fn knows_which_models_take_images() {
+        let list = json!({"data": [
+            {"id": "v", "architecture": {"input_modalities": ["text", "image"]}},
+            {"id": "t", "architecture": {"input_modalities": ["text"]}},
+            {"id": "u"},
+        ]});
+        assert_eq!(takes_images(&list, "v"), Some(true));
+        assert_eq!(takes_images(&list, "t"), Some(false));
+        assert_eq!(takes_images(&list, "u"), None);
+        assert_eq!(takes_images(&list, "x"), None);
     }
 
     #[test]

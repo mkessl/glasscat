@@ -4,6 +4,7 @@ mod cache;
 mod context;
 mod custom;
 mod history;
+mod image;
 mod journal;
 mod models;
 mod openai;
@@ -225,6 +226,9 @@ fn run() -> Result<()> {
                     spent = (spent.0 + c, spent.1 + 1);
                 }
                 Ok(())
+            }
+            agent::Shown::ImagesDropped(error) => {
+                writeln!(std::io::stderr(), "{error}\n{}", ui::IMAGES_DROPPED)
             }
             agent::Shown::Retrying { error, wait, .. } => writeln!(
                 std::io::stderr(),

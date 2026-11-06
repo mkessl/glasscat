@@ -27,21 +27,24 @@ const MIN_CACHED: u64 = 1024;
 #[derive(Debug, PartialEq)]
 pub struct Miss {
     pub text: String,
-    /// Nothing changed: the provider did not give the cache back. Said
-    /// once per provider is enough.
-    pub unchanged: bool,
+    /// Said once in a run is enough for misses with the same key: that a
+    /// provider kept nothing of an unchanged request, or that requests
+    /// moved between providers. None when the request itself changed.
+    pub once: Option<String>,
 }
 
 /// What to tell the user when the cache gave back less than half of what
 /// the last request sent, or None. `gap` is the time from the last
-/// request's end to this one's start; `openrouter` adds how to keep to
-/// one provider there.
+/// request's end to this one's start; `hit_before` whether this provider
+/// gave back cached tokens earlier in the run; `openrouter` adds how to
+/// keep to one provider there.
 pub fn explain_miss(
     last: &Sent,
     body: &[u8],
     usage: &Value,
     served: Option<&Served>,
     gap: Duration,
+    hit_before: bool,
     openrouter: bool,
 ) -> Option<Miss> {
     // Only providers that report cached tokens say anything to compare.
@@ -86,7 +89,7 @@ pub fn explain_miss(
         }
         return Some(Miss {
             text,
-            unchanged: false,
+            once: Some("moved between providers".into()),
         });
     }
     let (Some(old), Some(new)) = (parse(&last.body), new) else {
@@ -95,7 +98,22 @@ pub fn explain_miss(
     if let Some(change) = first_change(&old, &new) {
         return Some(Miss {
             text: format!("{head}: {change} since the last request."),
-            unchanged: false,
+            once: None,
+        });
+    }
+    if !hit_before {
+        let soon = if gap < SOON {
+            ", or not yet: some take a few seconds to store a prompt"
+        } else {
+            ""
+        };
+        return Some(Miss {
+            text: format!(
+                "{head}. {} has given back nothing from its cache in this run, so it may not \
+                 cache prompts{soon}.",
+                now_on.unwrap_or("The provider")
+            ),
+            once: Some(format!("kept nothing on {now_on:?}")),
         });
     }
     let why = if gap < SOON {
@@ -110,7 +128,7 @@ pub fn explain_miss(
              after it. {why}",
             span(gap)
         ),
-        unchanged: true,
+        once: Some(format!("kept nothing on {now_on:?}")),
     })
 }
 
@@ -196,6 +214,7 @@ mod tests {
                 &u,
                 Some(&served(on)),
                 gap,
+                true,
                 on == "R",
             )
             .map(|m| m.text)
@@ -226,12 +245,28 @@ mod tests {
             &usage(5100, 0),
             Some(&served("P")),
             Duration::from_secs(1),
+            true,
             false,
         );
         assert!(
             soon.unwrap()
                 .text
                 .ends_with("a request sent right after another may miss.")
+        );
+        let never = explain_miss(
+            &last,
+            grown.to_string().as_bytes(),
+            &usage(5100, 0),
+            Some(&served("P")),
+            Duration::from_secs(1),
+            false,
+            false,
+        );
+        assert_eq!(
+            never.unwrap().text,
+            "The cache gave back 0 of 5100 tokens. P has given back nothing from its cache in \
+             this run, so it may not cache prompts, or not yet: some take a few seconds to store \
+             a prompt."
         );
         let mut system = grown.clone();
         system["messages"][0]["content"] = json!("t");
@@ -265,6 +300,7 @@ mod tests {
                 &usage(1000, 0),
                 Some(&served("P")),
                 gap,
+                true,
                 true
             ),
             None

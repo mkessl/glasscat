@@ -43,15 +43,16 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
   <kbd>Enter</kbd> on an empty line picks it up again. Where the provider allows it, the reply
   continues from its last token instead of starting over. Errors that may pass, such as rate
   limits and overloaded servers, are retried up to three times, in plain view.
-- **File tools**: read, list, find, search, write, edit and delete. Several reads run at the
+- **File tools**: read, list, find, search, write, edit, move and delete. Several reads run at the
   same time, and search walks the tree on every core. Edits and overwrites keep a file's line
   endings and byte order mark. Each edit or overwrite shows the lines it took out and put
-  in, and a new file shows its first lines.
+  in, and a new file shows its first lines. A PNG, JPEG, GIF or WebP image that the model reads
+  is shown to it, when the model takes images.
 - **Tools of your own.** Give the model any program to run, such as your build or tests,
   with its arguments put into the command line and no shell in between
   ([how](#tools-of-your-own)).
-- **Undo.** Every change the agent makes is written to a journal. `/undo` takes changes back
-  one at a time, and leaves alone a file you changed yourself in the meantime.
+- **Undo.** Every change the agent makes is written to a journal. `/undo` takes changes back,
+  the last one or the last few, and leaves alone a file you changed yourself in the meantime.
 - **Instructions.** `AGENTS.md` in the working directory and your own
   `~/.config/glasscat/AGENTS.md` go into the system prompt of a new conversation, where
   <kbd>Ctrl</kbd>+<kbd>T</kbd> shows them. A hidden `AGENTS.md` stays out.
@@ -128,7 +129,7 @@ Inside a session:
 | `/resume` | earlier conversations held in this directory; `/resume N` picks one up |
 | `/retry` | drop the last answer and ask again, say after switching the model |
 | `/models <words>` | find models by id, with context window and price; on OpenRouter, `ZDR` marks those a provider keeping no data runs, and the word `zdr` keeps to them |
-| `/undo` | undo the agent's last file change |
+| `/undo` | undo the agent's last file change; `/undo 3`, the last three |
 | `/changes` | the agent's file changes in this session, which `/undo` takes back in turn |
 | `/access` | a tree of what the model may see, to hide or show paths; or `hide`, `show`, `allow` PATH |
 | `/tools` | the model's tools: which only read, and what your own ones run |

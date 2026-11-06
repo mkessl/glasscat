@@ -367,6 +367,9 @@ pub fn summary(args: &str, cwd: &str) -> String {
             p => p.into(),
         }
     };
+    if let (Some(from), Some(to)) = (get("from"), get("to")) {
+        return format!("{} → {}", rel(from), rel(to));
+    }
     match (get("pattern"), get("path")) {
         (Some(p), Some(path)) if rel(path) != "." => format!("{p} in {}", rel(path)),
         (Some(p), _) => p.to_string(),
@@ -421,6 +424,10 @@ mod tests {
         assert_eq!(summary(r#"{"path":"/p/src/a.rs"}"#, "/p"), "src/a.rs");
         assert_eq!(summary(r#"{"path":"/p"}"#, ""), "/p");
         assert_eq!(summary(r#"{"pattern":"x","path":"/p/"}"#, "/p"), "x");
+        assert_eq!(
+            summary(r#"{"from":"./a.txt","to":"/p/b/a.txt"}"#, "/p"),
+            "a.txt → b/a.txt"
+        );
         assert_eq!(
             outcome(
                 "read",

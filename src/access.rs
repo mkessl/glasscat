@@ -24,6 +24,11 @@ pub fn take_withheld() -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("; "))
 }
 
+/// Notes for the user that something was kept from the model.
+pub fn withhold(what: String) {
+    WITHHELD.with(|w| w.borrow_mut().0.push(what));
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Seen {
     Shown,

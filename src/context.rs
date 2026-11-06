@@ -9,7 +9,17 @@ pub enum Item {
     System(String),
     User(String),
     Assistant(Reply),
-    ToolResult { call_id: String, content: String },
+    ToolResult {
+        call_id: String,
+        content: String,
+    },
+    /// An image a tool gave, shown to the model after the tool results;
+    /// `data` is base64.
+    Image {
+        name: String,
+        mime: String,
+        data: String,
+    },
 }
 
 /// One model turn: text, reasoning and the tool calls it made.
@@ -43,7 +53,8 @@ pub struct ToolSpec {
 
 /// The context as plain text for editing by hand: each part under a
 /// header line, `=== system`, `=== user`, `=== assistant` (with
-/// `--- reasoning` and `--- call ID NAME` inside), `=== tool CALL_ID`.
+/// `--- reasoning` and `--- call ID NAME` inside), `=== tool CALL_ID`,
+/// `=== image MEDIA_TYPE NAME` over base64 lines.
 /// A line of content that starts with `===`, `---` or `\` gets a `\`
 /// in front, so headers stay unambiguous.
 pub fn to_text(items: &[Item]) -> String {
@@ -80,6 +91,14 @@ pub fn to_text(items: &[Item]) -> String {
                 }
             }
             Item::ToolResult { call_id, content } => part(&format!("=== tool {call_id}"), content),
+            Item::Image { name, mime, data } => {
+                let lines: Vec<&str> = data
+                    .as_bytes()
+                    .chunks(76)
+                    .map(|c| std::str::from_utf8(c).unwrap_or_default())
+                    .collect();
+                part(&format!("=== image {mime} {name}"), &lines.join("\n"));
+            }
         }
     }
     out
@@ -115,6 +134,11 @@ pub fn from_text(text: &str) -> Result<Vec<Item>, String> {
                     ..Reply::default()
                 }));
             }
+            ["===", "image", mime, name @ ..] if !name.is_empty() => items.push(Item::Image {
+                name: name.join(" "),
+                mime: mime.to_string(),
+                data: body.split_whitespace().collect(),
+            }),
             ["===", "tool", id] => items.push(Item::ToolResult {
                 call_id: id.to_string(),
                 content: body,
@@ -164,6 +188,11 @@ mod tests {
             Item::ToolResult {
                 call_id: "c1".into(),
                 content: "x\ny".into(),
+            },
+            Item::Image {
+                name: "a b.png".into(),
+                mime: "image/png".into(),
+                data: "QUJD".repeat(40),
             },
             Item::Assistant(Reply {
                 text: "par".into(),

@@ -59,6 +59,9 @@ pub enum Shown<'a> {
     /// Asked to continue a cut-off reply, the model wrote a new one; it
     /// replaces the cut-off one.
     StartedOver,
+    /// The provider refused the images in the context with this error;
+    /// they were taken out and the request goes again.
+    ImagesDropped(&'a str),
     ToolDone {
         name: &'a str,
         args: &'a str,
@@ -215,7 +218,7 @@ impl Session {
     /// or was cut off before the model finished.
     pub fn unanswered(&self) -> bool {
         match self.items.last() {
-            Some(Item::User(_) | Item::ToolResult { .. }) => true,
+            Some(Item::User(_) | Item::ToolResult { .. } | Item::Image { .. }) => true,
             Some(Item::Assistant(r)) => r.cut,
             _ => false,
         }
@@ -249,7 +252,7 @@ impl Session {
     }
 
     fn run(&mut self, cancel: &AtomicBool, mut on: impl FnMut(Shown)) -> Result<()> {
-        loop {
+        'request: loop {
             let body = self.body();
             on(Shown::Request(&body));
             let mut attempt = 0;
@@ -271,6 +274,11 @@ impl Session {
                     .downcast_ref::<openai::HttpError>()
                     .and_then(|h| h.retry_wait(attempt));
                 let Some(wait) = wait.filter(|_| attempt < RETRIES) else {
+                    // Every later request would fail the same way.
+                    if refuses_images(&*e) && self.drop_images() {
+                        on(Shown::ImagesDropped(&e.to_string()));
+                        continue 'request;
+                    }
                     return Err(e);
                 };
                 attempt += 1;
@@ -330,7 +338,23 @@ impl Session {
                 return Ok(());
             }
             let results = self.run_calls(&calls, cancel);
-            for (call, ran) in calls.into_iter().zip(results) {
+            // Images go after all the results: each tool call must be
+            // answered right after the call.
+            let mut images = Vec::new();
+            for (call, mut ran) in calls.into_iter().zip(results) {
+                if let Some(image) = ran.image.take() {
+                    if self.takes_images() == Some(false) {
+                        ran.result +=
+                            "; not shown: this model takes no images, by its provider's model list";
+                    } else {
+                        ran.result += IMAGE_FOLLOWS;
+                        images.push(Item::Image {
+                            data: crate::image::base64(&image.bytes),
+                            name: image.name,
+                            mime: image.mime,
+                        });
+                    }
+                }
                 on(Shown::ToolDone {
                     name: &call.name,
                     args: &call.args,
@@ -343,7 +367,34 @@ impl Session {
                     content: ran.result,
                 });
             }
+            self.items.append(&mut images);
         }
+    }
+
+    /// Takes every image out of the context, and tells the model in the
+    /// tool result it came with; false if there was none.
+    fn drop_images(&mut self) -> bool {
+        let before = self.items.len();
+        self.items.retain(|i| !matches!(i, Item::Image { .. }));
+        for item in &mut self.items {
+            if let Item::ToolResult { content, .. } = item
+                && let Some(head) = content.strip_suffix(IMAGE_FOLLOWS)
+            {
+                *content = format!("{head}; not shown: the provider refused it");
+            }
+        }
+        self.items.len() < before
+    }
+
+    /// Whether the model takes images, when the provider's model list
+    /// says.
+    fn takes_images(&self) -> Option<bool> {
+        let list = crate::models::list(
+            &self.base_url,
+            self.api_key.as_deref(),
+            self.proxy.as_deref(),
+        );
+        crate::models::takes_images(&*list.ok()?, &self.model)
     }
 
     /// Calls that change nothing run at the same time; otherwise in order.
@@ -366,6 +417,7 @@ impl Session {
                             result: "error: the tool crashed".into(),
                             note: None,
                             before: None,
+                            image: None,
                         })
                     })
                     .collect()
@@ -380,6 +432,21 @@ impl Session {
 }
 
 type Map = serde_json::Map<String, serde_json::Value>;
+
+/// Ends the result of a tool whose image follows the results.
+const IMAGE_FOLLOWS: &str = "; it follows as an image";
+
+/// Whether a provider's error refuses the images in a request.
+fn refuses_images(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    let Some(h) = e.downcast_ref::<openai::HttpError>() else {
+        return false;
+    };
+    let text = h.message.to_lowercase();
+    matches!(h.status, 400 | 404 | 415 | 422)
+        && ["image", "vision", "multimodal"]
+            .iter()
+            .any(|w| text.contains(w))
+}
 
 /// Tries of a request after the first, on errors that may pass.
 pub const RETRIES: u32 = 3;
@@ -628,6 +695,59 @@ mod tests {
         assert_eq!(msgs[3]["tool_call_id"], "r1");
         assert_eq!(msgs[4]["content"], "beta\n");
         assert!(matches!(session.items.last(), Some(Item::Assistant(r)) if r.text == "done"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_image_the_provider_refuses_is_taken_out() {
+        let dir = std::env::temp_dir().join(format!("agent-image-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.gif"), b"GIF89a\x02\x00\x03\x00").unwrap();
+        let reply = |status: &str, body: &str| {
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let (url, server) = serve(vec![
+            sse(&[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"r1","function":{"name":"read","arguments":"{\"path\":\"a.gif\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            ]),
+            // The model list does not say whether the model takes images.
+            reply("200 OK", r#"{"data":[]}"#),
+            reply(
+                "400 Bad Request",
+                r#"{"error":{"message":"image input is not supported"}}"#,
+            ),
+            sse(&[
+                r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
+                "[DONE]",
+            ]),
+        ]);
+        let access = Access::new(&dir, std::slice::from_ref(&dir), &[]).unwrap();
+        let tools = Tools::new(access, Journal::new(dir.join("j.jsonl")));
+        let mut session = Session::new(url, "m".into(), None, Prefill::None, tools);
+        let mut dropped = Vec::new();
+        session
+            .turn("look".into(), &AtomicBool::new(false), |s| {
+                if let Shown::ImagesDropped(e) = s {
+                    dropped.push(e.to_string());
+                }
+            })
+            .unwrap();
+        assert_eq!(dropped.len(), 1);
+        assert!(dropped[0].contains("image input is not supported"));
+        let requests = server.join().unwrap();
+        assert!(requests[2].contains("data:image/gif;base64,"));
+        assert!(!requests[3].contains("image_url"));
+        assert!(requests[3].contains("GIF image, 2×3, 1 KB; not shown: the provider refused it"));
+        assert!(
+            !session
+                .items
+                .iter()
+                .any(|i| matches!(i, Item::Image { .. }))
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

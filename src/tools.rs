@@ -66,6 +66,9 @@ enum Undo {
         old: String,
         new: String,
     },
+    /// The file or directory was moved here from `from`: move it back and
+    /// remove the directories made for it, deepest first.
+    MoveBack { from: PathBuf, dirs: Vec<PathBuf> },
 }
 
 pub fn specs() -> Vec<ToolSpec> {
@@ -77,7 +80,7 @@ pub fn specs() -> Vec<ToolSpec> {
     vec![
         spec(
             "read",
-            "Read a text file. Returns up to 2000 lines; use offset and limit for more.",
+            "Read a text file, up to 2000 lines; offset and limit give more. A PNG, JPEG, GIF or WebP image is shown to you after the tool results, if you take images.",
             json!({
                 "type": "object",
                 "properties": {
@@ -145,6 +148,18 @@ pub fn specs() -> Vec<ToolSpec> {
                     "all": { "type": "boolean", "description": "Replace every match" },
                 },
                 "required": ["path", "old", "new"],
+            }),
+        ),
+        spec(
+            "move",
+            "Move or rename a file or directory. Makes the directories to needs; never replaces what is at to.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string" },
+                    "to": { "type": "string" },
+                },
+                "required": ["from", "to"],
             }),
         ),
         spec(
@@ -296,9 +311,11 @@ impl Tools {
         let shown = self.access.show(&change.path);
         let now = fs::read(&change.path).ok();
         let gone = fs::symlink_metadata(&change.path).is_err();
-        let same = match change.after {
-            Some(hash) => now.as_deref().map(fnv) == Some(hash),
-            None => gone,
+        let same = match (&change.undo, change.after) {
+            // A directory, or a file that could not be read to hash it.
+            (Undo::MoveBack { .. }, None) => fs::symlink_metadata(&change.path).is_ok(),
+            (_, Some(hash)) => now.as_deref().map(fnv) == Some(hash),
+            (_, None) => gone,
         };
         if !same {
             return Err(format!(
@@ -330,6 +347,25 @@ impl Tools {
                     bytes.splice(i..i + new.len(), old.bytes());
                 }
                 write_atomic(&change.path, &bytes).map_err(io)?;
+            }
+            Undo::MoveBack { from, dirs } => {
+                let back = self.access.show(from);
+                if fs::symlink_metadata(from).is_ok() {
+                    return Err(format!(
+                        "{back} exists again, so {shown} was left where it is. /undo again goes one change further back."
+                    ));
+                }
+                if let Some(dir) = from.parent() {
+                    fs::create_dir_all(dir).map_err(io)?;
+                }
+                move_path(&change.path, from).map_err(io)?;
+                for d in dirs {
+                    let _ = fs::remove_dir(d);
+                }
+                let _ = self
+                    .journal
+                    .record(json!({ "tool": "undo", "path": change.path, "what": change.what }));
+                return Ok(format!("Moved {shown} back to {back}."));
             }
         }
         let _ = self
@@ -368,10 +404,12 @@ impl Tools {
                 result,
                 note,
                 before: None,
+                image: None,
             };
         }
         crate::access::take_withheld();
         BEFORE.take();
+        IMAGE.take();
         let result = match self.custom.get(name) {
             Some(t) => self.run_custom(name, t, args, cancel),
             None => self.run(name, args),
@@ -381,6 +419,7 @@ impl Tools {
             result,
             note: kept.map(|w| format!("Kept from the model: {w}.")),
             before: BEFORE.take(),
+            image: IMAGE.take(),
         }
     }
 
@@ -423,6 +462,7 @@ impl Tools {
             "write" => self.write(&args),
             "edit" => self.edit(&args),
             "delete" => self.delete(&args),
+            "move" => self.move_to(&args),
             _ => Err(format!("unknown tool {name}")),
         };
         result.unwrap_or_else(|e| format!("error: {e}"))
@@ -436,11 +476,35 @@ impl Tools {
             return Err(format!("{path} is a directory; use list"));
         }
         let bytes = fs::read(&real).map_err(|e| io_err(path, e))?;
-        if is_binary(&bytes) {
+        if let Some(mime) = crate::image::kind(&bytes) {
+            self.touch(&real, false);
+            let about = crate::image::describe(&bytes, mime);
+            if bytes.len() > crate::image::MAX {
+                return Ok(format!(
+                    "{about}; too large to be shown, over {:.2} MB",
+                    crate::image::MAX as f64 / 1e6
+                ));
+            }
+            IMAGE.set(Some(Image {
+                name: self.access.show(&real).replace(['\n', '\r'], " "),
+                mime: mime.into(),
+                bytes,
+            }));
+            return Ok(about);
+        }
+        // Windows writes UTF-16 text, with a byte order mark.
+        let utf16 = utf16(&bytes);
+        if utf16.is_none() && is_binary(&bytes) {
             return Ok(format!("{path} is a binary file of {} bytes", bytes.len()));
         }
         self.touch(&real, false);
-        let text = String::from_utf8_lossy(&bytes);
+        let (text, encoding) = match utf16 {
+            Some(t) => (t, Some("UTF-16 text")),
+            None => match String::from_utf8_lossy(&bytes) {
+                std::borrow::Cow::Owned(t) => (t, Some("not UTF-8: bytes it cannot show are �")),
+                std::borrow::Cow::Borrowed(t) => (t.to_string(), None),
+            },
+        };
         let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
         if text.is_empty() {
             return Ok(format!("{path} is empty"));
@@ -468,6 +532,11 @@ impl Tools {
             out.push_str(&format!(
                 "[lines {first}-{last} of {total}; continue with offset {}]\n",
                 last + 1
+            ));
+        }
+        if let Some(e) = encoding {
+            out.push_str(&format!(
+                "[{e}; edit cannot change this file, and write would make it UTF-8]\n"
             ));
         }
         Ok(out)
@@ -736,6 +805,86 @@ impl Tools {
         Ok(format!("deleted {shown}"))
     }
 
+    fn move_to(&self, a: &Value) -> Result<String, String> {
+        let (from, to) = (req(a, "from")?, req(a, "to")?);
+        let src = self.access.resolve(from)?;
+        let dst = self.access.resolve(to)?;
+        let given = self.access.cwd().join(from);
+        if fs::symlink_metadata(&given).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!(
+                "{from} is a symbolic link; move cannot move links yet"
+            ));
+        }
+        if src == self.access.cwd() {
+            return Err("that is the working directory; it cannot be moved".into());
+        }
+        let meta = fs::symlink_metadata(&src).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => not_found(from),
+            _ => io_err(from, e),
+        })?;
+        if src == dst {
+            return Err(format!("{from} and {to} are the same path"));
+        }
+        if dst.starts_with(&src) {
+            return Err(format!("{to} is inside {from}"));
+        }
+        if fs::symlink_metadata(&dst).is_ok() {
+            return Err(format!(
+                "{to} exists; delete it first, or move to another name"
+            ));
+        }
+        // What the model may not see inside would come out under a new path.
+        if meta.is_dir() && self.access.hidden().iter().any(|h| h.starts_with(&src)) {
+            crate::access::withhold(format!("{from} (holds a hidden path)"));
+            return Err(format!(
+                "{from} cannot be moved as a whole; move what is in it one by one"
+            ));
+        }
+        let mut dirs = Vec::new();
+        if let Some(dir) = dst.parent() {
+            dirs = dir
+                .ancestors()
+                .take_while(|d| !d.exists())
+                .map(Path::to_path_buf)
+                .collect();
+        }
+        let unmake = |dirs: &[PathBuf]| {
+            for d in dirs {
+                let _ = fs::remove_dir(d);
+            }
+        };
+        if let Some(dir) = dst.parent()
+            && let Err(e) = fs::create_dir_all(dir)
+        {
+            unmake(&dirs);
+            return Err(io_err(to, e));
+        }
+        if let Err(e) = move_path(&src, &dst) {
+            unmake(&dirs);
+            return Err(io_err(from, e));
+        }
+        let (from_shown, to_shown) = (self.access.show(&src), self.access.show(&dst));
+        self.touch(&src, true);
+        // Remembered first, so /undo works even if the journal fails.
+        self.remember(Change {
+            path: dst.clone(),
+            what: format!("the move from {from_shown}"),
+            after: if meta.is_dir() {
+                None
+            } else {
+                fs::read(&dst).ok().map(|b| fnv(&b))
+            },
+            undo: Undo::MoveBack {
+                from: src.clone(),
+                dirs,
+            },
+        });
+        self.journal
+            .record(json!({ "tool": "move", "from": src, "to": dst }))
+            .map_err(|e| format!("moved {from}, but could not record the change: {e}"))?;
+        Ok(format!("moved {from_shown} to {to_shown}"))
+    }
+
     fn edit(&self, a: &Value) -> Result<String, String> {
         let path = req(a, "path")?;
         let old = req(a, "old")?;
@@ -963,6 +1112,15 @@ pub struct Ran {
     pub result: String,
     pub note: Option<String>,
     pub before: Option<String>,
+    /// An image file read, for the model to see.
+    pub image: Option<Image>,
+}
+
+pub struct Image {
+    /// The path as shown to the model.
+    pub name: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
 }
 
 /// The largest file whose old text is kept to show what an overwrite
@@ -971,6 +1129,23 @@ const SHOWN_MAX: usize = 1 << 20;
 
 thread_local! {
     static BEFORE: RefCell<Option<String>> = const { RefCell::new(None) };
+    static IMAGE: RefCell<Option<Image>> = const { RefCell::new(None) };
+}
+
+/// Renames `from` to `to`; a file is copied and removed when they are on
+/// different file systems.
+fn move_path(from: &Path, to: &Path) -> io::Result<()> {
+    match fs::rename(from, to) {
+        Err(e) if e.kind() == io::ErrorKind::CrossesDevices && from.is_file() => {
+            // A failure on the way leaves only the file it started with.
+            let copied = fs::copy(from, to).and_then(|_| fs::remove_file(from));
+            if copied.is_err() {
+                let _ = fs::remove_file(to);
+            }
+            copied
+        }
+        r => r,
+    }
 }
 
 /// Writes through a temporary file and a rename, so a reader never sees
@@ -995,6 +1170,27 @@ fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     })
+}
+
+/// The text of a file that starts with a UTF-16 byte order mark.
+fn utf16(bytes: &[u8]) -> Option<String> {
+    let le = bytes.starts_with(&[0xff, 0xfe]);
+    if !le && !bytes.starts_with(&[0xfe, 0xff]) || !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let units = bytes[2..].chunks(2).map(|c| {
+        let pair = [c[0], c[1]];
+        if le {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        }
+    });
+    // Binary data may start with these two bytes too, but seldom decodes
+    // without a lone surrogate or a control character.
+    let text: String = char::decode_utf16(units).collect::<Result<_, _>>().ok()?;
+    let control = |c: char| c.is_control() && !matches!(c, '\t' | '\n' | '\r' | '\u{c}');
+    (!text.contains(control)).then_some(text)
 }
 
 fn is_binary(bytes: &[u8]) -> bool {
@@ -1100,6 +1296,23 @@ mod tests {
         );
         assert!(run(&f, "read", json!({"path": "bin.dat"})).contains("binary"));
         assert!(run(&f, "read", json!({"path": "src"})).contains("directory"));
+        let p = f.base.join("proj");
+        let wide: Vec<u8> = "\u{feff}héllo\r\nwörld\r\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        fs::write(p.join("w.txt"), wide).unwrap();
+        assert_eq!(
+            run(&f, "read", json!({"path": "w.txt"})),
+            "héllo\nwörld\n[UTF-16 text; edit cannot change this file, and write would make it UTF-8]\n"
+        );
+        fs::write(p.join("b.bin"), [0xff, 0xfe, 0x00, 0xd8, 1, 2, 3, 4, 5, 6]).unwrap();
+        assert!(run(&f, "read", json!({"path": "b.bin"})).contains("binary"));
+        fs::write(p.join("l.txt"), b"caf\xe9\n").unwrap();
+        assert!(
+            run(&f, "read", json!({"path": "l.txt"}))
+                .starts_with("caf\u{fffd}\n[not UTF-8: bytes it cannot show are \u{fffd};")
+        );
         assert!(run(&f, "read", json!({})).contains("missing string argument path"));
         assert!(
             f.tools
@@ -1245,6 +1458,48 @@ mod tests {
         assert!(p.join("empty").is_dir());
         assert_eq!(f.tools.undo().unwrap(), "Undid the deletion in src/lib.rs.");
         assert_eq!(fs::read(p.join("src/lib.rs")).unwrap(), lib);
+    }
+
+    #[test]
+    fn move_and_undo() {
+        let mut f = fixture("move");
+        let p = f.base.join("proj");
+        let lib = fs::read(p.join("src/lib.rs")).unwrap();
+        let mv =
+            |f: &Fixture, from: &str, to: &str| run(f, "move", json!({"from": from, "to": to}));
+        assert_eq!(
+            mv(&f, "src/lib.rs", "a/b/lib.rs"),
+            "moved src/lib.rs to a/b/lib.rs"
+        );
+        assert_eq!(fs::read(p.join("a/b/lib.rs")).unwrap(), lib);
+        assert!(mv(&f, "src/main.rs", "a/b/lib.rs").contains("exists"));
+        assert!(mv(&f, "src", "src/inner").contains("inside"));
+        assert!(mv(&f, "secret/key.rs", "k.rs").contains("no such file"));
+        assert!(mv(&f, "src/main.rs", "secret/m.rs").contains("no such file"));
+        assert!(mv(&f, "nope", "x").contains("no such file"));
+        assert_eq!(mv(&f, "src", "code"), "moved src to code");
+        assert!(p.join("code/main.rs").is_file());
+
+        assert_eq!(f.tools.undo().unwrap(), "Moved code back to src.");
+        assert_eq!(
+            f.tools.undo().unwrap(),
+            "Moved a/b/lib.rs back to src/lib.rs."
+        );
+        assert!(!p.join("a").exists(), "directories made for it go too");
+        assert_eq!(fs::read(p.join("src/lib.rs")).unwrap(), lib);
+
+        // A directory with a hidden path inside stays where it is.
+        f.tools.access.hide(Path::new("src/main.rs"));
+        crate::access::take_withheld();
+        assert!(mv(&f, "src", "code").contains("one by one"));
+        assert!(p.join("src/main.rs").is_file());
+        assert!(crate::access::take_withheld().unwrap().contains("hidden"));
+
+        // Undo leaves the file alone when its old place is taken again.
+        mv(&f, "src/lib.rs", "lib.rs");
+        fs::write(p.join("src/lib.rs"), "new").unwrap();
+        assert!(f.tools.undo().unwrap_err().contains("exists again"));
+        assert!(p.join("lib.rs").is_file());
     }
 
     #[cfg(unix)]

@@ -365,10 +365,36 @@ impl App {
                 let text = session.tools.changes();
                 self.show(text);
             }
-            "/undo" => match session.undo() {
-                Ok(done) => self.transcript.push(Block::Info(done)),
-                Err(e) => self.transcript.push(Block::Error(e)),
-            },
+            "/undo" => {
+                let n = match arg {
+                    "" => 1,
+                    _ => match arg.parse::<usize>() {
+                        Ok(n) if n > 0 => n,
+                        _ => {
+                            return self.transcript.push(Block::Error(
+                                "/undo takes how many changes to undo, such as /undo 3.".into(),
+                            ));
+                        }
+                    },
+                };
+                let mut done = Vec::new();
+                let mut failed = None;
+                for _ in 0..n {
+                    match session.undo() {
+                        Ok(d) => done.push(d),
+                        Err(e) => {
+                            failed = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if !done.is_empty() {
+                    self.transcript.push(Block::Info(done.join("\n")));
+                }
+                if let Some(e) = failed {
+                    self.transcript.push(Block::Error(e));
+                }
+            }
             _ => unreachable!("listed in COMMANDS"),
         }
     }
@@ -419,7 +445,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "/retry",
         "drop the last answer and ask again, also after /model",
     ),
-    ("/undo", "undo the agent's last change to a file"),
+    (
+        "/undo",
+        "undo the agent's last change to a file; /undo N, the last N",
+    ),
     (
         "/changes",
         "the agent's changes to files in this run, which /undo takes back",

@@ -41,7 +41,19 @@ pub fn request_body(
     prefill: Prefill,
     extra: &Map<String, Value>,
 ) -> Vec<u8> {
-    let mut messages: Vec<Value> = items.iter().map(message).collect();
+    let mut messages: Vec<Value> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        // Images next to each other go in one user message.
+        let after_image = i > 0 && matches!(items[i - 1], Item::Image { .. });
+        match (item, messages.last_mut()) {
+            (Item::Image { name, mime, data }, Some(m)) if after_image => {
+                if let Some(c) = m["content"].as_array_mut() {
+                    c.extend(image_parts(name, mime, data));
+                }
+            }
+            _ => messages.push(message(item)),
+        }
+    }
     let continuing = prefill != Prefill::None
         && matches!(items.last(), Some(Item::Assistant(r)) if r.cut && !r.text.is_empty());
     if continuing && let Some(last) = messages.last_mut() {
@@ -110,7 +122,18 @@ fn message(item: &Item) -> Value {
         Item::ToolResult { call_id, content } => {
             json!({ "role": "tool", "tool_call_id": call_id, "content": content })
         }
+        Item::Image { name, mime, data } => {
+            json!({ "role": "user", "content": image_parts(name, mime, data) })
+        }
     }
+}
+
+fn image_parts(name: &str, mime: &str, data: &str) -> [Value; 2] {
+    let url = format!("data:{mime};base64,{data}");
+    [
+        json!({ "type": "text", "text": format!("The image in {name}:") }),
+        json!({ "type": "image_url", "image_url": { "url": url } }),
+    ]
 }
 
 /// Something the stream produced, passed on as soon as it arrives.
