@@ -11,7 +11,7 @@ Every byte sent to the model is yours to read, and every change it makes is your
 
 <br>
 
-<img src="assets/demo.svg" alt="glasscat reads its own source and lists the tools it gives the model" width="840">
+<img src="assets/demo.svg" alt="glasscat fixes two bugs in a small Python project, showing each edit, what it cost and how much the cache gave back" width="840">
 
 </div>
 
@@ -43,8 +43,9 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
   <kbd>Enter</kbd> on an empty line picks it up again. Where the provider allows it, the reply
   continues from its last token instead of starting over. Errors that may pass, such as rate
   limits and overloaded servers, are retried up to three times, in plain view.
-- **File tools**: read, list, find, search, write, edit and delete. Several reads run at the same time.
-  Edits keep a file's line endings and byte order mark.
+- **File tools**: read, list, find, search, write, edit and delete. Several reads run at the
+  same time, and search walks the tree on every core. Edits and overwrites keep a file's line
+  endings and byte order mark, and each edit shows the lines it took out and put in.
 - **Tools of your own.** Give the model any program to run, such as your build or tests,
   with its arguments put into the command line and no shell in between
   ([how](#tools-of-your-own)).
@@ -56,11 +57,15 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
 - **Hidden paths.** Paths given with `--hide` do not exist as far as the model can tell. It
   gets the same answer as for a missing file. Nothing outside the working directory and the
   folders you allow can be reached, through symlinks or `..` either. You are told each time
-  something was kept from the model, and why. `/access` shows the rules and changes them as
-  you work: `/access hide PATH`, `/access show PATH`, `/access allow PATH`.
+  something was kept from the model, and why. `/access` opens your folders as a tree: pick a
+  file or folder, with the keys or the mouse, and <kbd>Space</kbd> hides it from the model or
+  shows it again. Files the model has read or changed are marked. <kbd>s</kbd> keeps the
+  rules in the settings for next time. Or type them: `/access hide PATH`, `/access show PATH`,
+  `/access allow PATH`.
 - **Reasoning** from thinking models streams in, then folds away; <kbd>Ctrl</kbd>+<kbd>O</kbd>
   opens it.
-- **Markdown** in replies is rendered: headings, lists, quotes, code, tables, links, bold and italic.
+- **Markdown** in replies is rendered: headings, lists, quotes, tables, links, bold and italic,
+  and code in colour for the common languages and diffs, in your terminal's own palette.
   A table too wide for the screen wraps its widest cells.
 - **Usage, cost and speed** of each request in the status bar: the context used out of the
   model's window, cache hits, time to the first token, tokens per second, and what all the
@@ -99,11 +104,12 @@ stderr.
 | --- | --- |
 | `-c`, `--continue` | pick up the last conversation held in this directory |
 | `--provider <name>` | where the model runs (default `openrouter`) |
-| `--model <id>` | the model to use; each provider has a default |
+| `-m`, `--model <id>` | the model to use; each provider has a default |
 | `--allow <dir>` | another folder the agent may work in (repeatable) |
 | `--hide <path>` | a path the model must not see (repeatable) |
 | `--proxy <url>` | send requests through a proxy: `socks5://host:port`, `http://user:pass@host:port` |
 | `--show-request` | print each exact request to stderr |
+| `-V`, `--version` | print the version |
 
 Inside a session:
 
@@ -122,7 +128,7 @@ Inside a session:
 | `/retry` | drop the last answer and ask again, say after switching the model |
 | `/models <words>` | find models by id, with context window and price |
 | `/undo` | undo the agent's last file change |
-| `/access` | what the model may see; `hide`, `show` or `allow` a path for this session |
+| `/access` | a tree of what the model may see, to hide or show paths; or `hide`, `show`, `allow` PATH |
 | `/tools` | the model's tools: which only read, and what your own ones run |
 | `/report` | open the model's last report about a glasscat fault as a new issue |
 | `/edit` | change the context in `$EDITOR` before the next request |
@@ -152,7 +158,10 @@ Any server that speaks the OpenAI chat completions API works. These are built in
 | `lmstudio` | none, local | asks again |
 
 OpenRouter's default model, `openrouter/free`, costs nothing, so you can try glasscat with
-a free OpenRouter key.
+a free OpenRouter key. Free models may keep what you send, or train on it; `/provider` shows
+what the provider of each reply publishes about that. To have OpenRouter use only providers
+that keep nothing, put `"request": {"provider": {"zdr": true}}` in the settings, with a
+model that such providers serve.
 
 ## Settings
 
@@ -186,6 +195,9 @@ allowed and hidden paths, and your own tools. Add any OpenAI-compatible server u
 | `tools` | tools of your own: programs the model may run, see below |
 | `instructions` | files in the working directory added to the system prompt (default `["AGENTS.md"]`) |
 | `proxy` | a proxy for every provider; a provider's own `proxy` wins, and `--proxy` wins over both |
+
+Two accounts with one provider are two entries with the same `base_url`, each with its own
+`key_env` and, if you like, its own `proxy`; `--provider` picks one.
 
 `prefill` says how the server continues a cut-off reply: `plain` (a trailing assistant
 message), `prefix` or `partial` (that flag on the message), or `none` to ask again.
@@ -246,7 +258,7 @@ it changes: it does exactly what the program does.
 | Which model and provider ran each reply | status bar, when a router such as OpenRouter says |
 | That provider's quantization, data retention, location and privacy policy | `/provider` (OpenRouter) |
 | The model's reasoning | as it streams; <kbd>Ctrl</kbd>+<kbd>O</kbd> afterwards |
-| Every file change, old and new text | `~/.local/share/glasscat/edits/` |
+| Every file change, old and new text | under the edit, lines taken out and put in; in full in `~/.local/share/glasscat/edits/` |
 | Every conversation | `~/.local/share/glasscat/conversations/` |
 | Reports the model wrote about faults of glasscat | `~/.local/share/glasscat/reports/` |
 

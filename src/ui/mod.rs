@@ -2,11 +2,15 @@
 
 mod commands;
 mod context;
+mod files;
+mod highlight;
 mod input;
 mod markdown;
 mod screen;
 mod text;
 mod transcript;
+
+pub use transcript::outcome;
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -79,6 +83,7 @@ enum AgentMsg {
 enum View {
     Chat,
     Context { raw: bool, scroll: usize },
+    Files(files::Files),
 }
 
 struct App {
@@ -98,6 +103,8 @@ struct App {
     /// The last request that reported usage, and when it ended, to see
     /// why the cache missed.
     cache_last: Option<(crate::cache::Sent, Instant)>,
+    /// Providers already said to have kept nothing of an unchanged request.
+    cache_told: Vec<Option<String>>,
     busy: Option<String>,
     usage: Option<Value>,
     /// Cost of every request in this run, and how many reported one.
@@ -173,6 +180,7 @@ pub fn run(session: Session) -> Result<()> {
         panel: None,
         sent_at: Instant::now(),
         cache_last: None,
+        cache_told: Vec::new(),
         busy: None,
         usage: None,
         spent: (0.0, 0),
@@ -250,6 +258,7 @@ impl App {
             Msg::Term(Event::Key(k)) if k.kind != KeyEventKind::Release => match self.view {
                 View::Chat => self.chat_key(k),
                 View::Context { .. } => self.context_key(k),
+                View::Files(_) => self.files_key(k),
             },
             Msg::Term(Event::Paste(s)) => {
                 if matches!(self.view, View::Chat) {
@@ -258,14 +267,23 @@ impl App {
             }
             Msg::Term(Event::Mouse(m)) => match m.kind {
                 // The wheel scrolls the panel while one is open.
-                MouseEventKind::ScrollUp => match &mut self.panel {
-                    Some((_, s)) => *s = s.saturating_sub(WHEEL_LINES),
-                    None => self.scroll_by(WHEEL_LINES as isize),
+                MouseEventKind::ScrollUp => match (&mut self.panel, &mut self.view) {
+                    (_, View::Files(f)) => f.up(WHEEL_LINES),
+                    (Some((_, s)), _) => *s = s.saturating_sub(WHEEL_LINES),
+                    (None, _) => self.scroll_by(WHEEL_LINES as isize),
                 },
-                MouseEventKind::ScrollDown => match &mut self.panel {
-                    Some((_, s)) => *s += WHEEL_LINES,
-                    None => self.scroll_by(-(WHEEL_LINES as isize)),
+                MouseEventKind::ScrollDown => match (&mut self.panel, &mut self.view) {
+                    (_, View::Files(f)) => f.down(WHEEL_LINES),
+                    (Some((_, s)), _) => *s += WHEEL_LINES,
+                    (None, _) => self.scroll_by(-(WHEEL_LINES as isize)),
                 },
+                MouseEventKind::Down(_) if matches!(self.view, View::Files(_)) => {
+                    if let View::Files(f) = &mut self.view
+                        && let Some(row) = (m.row as usize).checked_sub(files::HEAD)
+                    {
+                        f.click(row);
+                    }
+                }
                 MouseEventKind::Down(_) if matches!(self.view, View::Chat) => {
                     let (y0, top) = self.input_at;
                     let prompt = text::width(PROMPT) as u16;
@@ -524,17 +542,16 @@ impl App {
                         gap,
                         crate::policy::known(&self.api.base_url),
                     );
-                    if let Some(mut why) = why {
+                    if let Some(why) = why {
+                        // That a provider kept nothing is said once for it.
                         let on = self.served.as_ref().and_then(|s| s.provider.clone());
-                        if why.contains("each provider keeps")
-                            && let Some(on) = on.filter(|_| crate::policy::known(&self.api.base_url))
-                        {
-                            why += &format!(
-                                " /set provider {{\"order\": [\"{on}\"]}} asks OpenRouter to \
-                                 keep to one."
-                            );
+                        let told = why.unchanged && self.cache_told.contains(&on);
+                        if why.unchanged && !told {
+                            self.cache_told.push(on);
                         }
-                        self.transcript.push(Block::Info(why));
+                        if !told {
+                            self.transcript.push(Block::Info(why.text));
+                        }
                     }
                 }
                 if let Some(p) = u.get("prompt_tokens").and_then(Value::as_u64) {
@@ -744,6 +761,39 @@ impl App {
         }
     }
 
+    fn files_key(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let page = self.page();
+        let View::Files(f) = &mut self.view else {
+            return;
+        };
+        f.note = None;
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.view = View::Chat,
+            KeyCode::Char('c') if ctrl => self.view = View::Chat,
+            KeyCode::Up | KeyCode::Char('k') => f.up(1),
+            KeyCode::Down | KeyCode::Char('j') => f.down(1),
+            KeyCode::PageUp => f.up(page),
+            KeyCode::PageDown => f.down(page),
+            KeyCode::Home => f.up(usize::MAX),
+            KeyCode::End => f.down(usize::MAX),
+            KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => f.right(),
+            KeyCode::Left | KeyCode::Char('h') => f.left(),
+            KeyCode::Char(' ') => {
+                if let Some(s) = self.session.as_mut() {
+                    f.toggle(&mut s.tools);
+                }
+            }
+            KeyCode::Char('s') => {
+                if let Some(s) = &self.session {
+                    f.note =
+                        Some(crate::settings::keep_hidden(s).unwrap_or_else(|e| e.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn stop(&mut self) {
         if self.session.is_none() {
             self.cancel.store(true, Ordering::Relaxed);
@@ -757,6 +807,7 @@ impl App {
         match &mut self.view {
             View::Chat => self.scroll = self.scroll.saturating_add_signed(n),
             View::Context { scroll, .. } => *scroll = scroll.saturating_add_signed(-n),
+            View::Files(_) => {}
         }
     }
 
@@ -780,6 +831,7 @@ impl App {
             match self.view {
                 View::Chat => self.draw_chat(),
                 View::Context { raw, scroll } => self.draw_context(raw, scroll),
+                View::Files(_) => self.draw_files(),
             }
         }
         self.screen.flush(out)
@@ -902,10 +954,14 @@ impl App {
         );
         let timing = timing_text(self.timing, usage);
         let hint = "ctrl+t context ";
+        // The hint goes before the sum of the run does.
+        let bare = |t: &str| format!("{} ", t.trim_end_matches(" · "));
         let rights = [
             format!("{all}{timing}{hint}"),
             format!("{all}{hint}"),
+            bare(&all),
             format!("{one}{hint}"),
+            bare(&one),
             hint.to_string(),
         ];
         let (left, right) = fit(&lefts, &rights, w as usize);
@@ -941,6 +997,24 @@ impl App {
             (scroll + height).min(lines.len()),
             lines.len()
         );
+        self.screen.put(0, h - 1, w, &status, Style::dim());
+    }
+}
+
+impl App {
+    fn draw_files(&mut self) {
+        let (w, h) = (self.screen.width(), self.screen.height());
+        let (View::Files(f), Some(session)) = (&mut self.view, &self.session) else {
+            return;
+        };
+        let lines = f.lines(&session.tools, w as usize, h as usize - 1);
+        for (i, line) in lines.iter().enumerate() {
+            put_line(&mut self.screen, i as u16, w, line);
+        }
+        let status = f.note.clone().unwrap_or_else(|| {
+            "↑↓ move · → opens · ← closes · Space hides or shows · s keeps the rules · Esc back"
+                .into()
+        });
         self.screen.put(0, h - 1, w, &status, Style::dim());
     }
 }

@@ -145,6 +145,63 @@ pub fn apply(session: &mut crate::agent::Session, s: &Settings) -> Result<()> {
     Ok(())
 }
 
+/// Writes the paths hidden now into the settings file as its `hide`,
+/// leaving the rest of the file as it was; returns what was written.
+pub fn keep_hidden(session: &crate::agent::Session) -> Result<String> {
+    let path = path();
+    let mut file: Map<String, Value> = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| format!("{}: {e}; /settings fixes it", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Map::new(),
+        Err(e) => return Err(format!("{}: {e}", path.display()).into()),
+    };
+    let saved: Vec<PathBuf> = match file.get("hide") {
+        Some(v) => serde_json::from_value(v.clone()).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let list = hide_list(&session.tools.access, &saved, &session.launch.hide);
+    if list.is_empty() {
+        file.remove("hide");
+    } else {
+        file.insert("hide".into(), serde_json::to_value(&list)?);
+    }
+    std::fs::create_dir_all(dir()).map_err(|e| format!("{}: {e}", dir().display()))?;
+    let text = serde_json::to_string_pretty(&file)? + "\n";
+    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let shown: Vec<String> = list.iter().map(|p| p.display().to_string()).collect();
+    Ok(if shown.is_empty() {
+        format!("{} hides nothing now.", path.display())
+    } else {
+        format!("{} hides {} now.", path.display(), shown.join(", "))
+    })
+}
+
+/// The `hide` list for what `access` hides: entries the file already has
+/// stay as written while they still hide something, so a rule like `.env`
+/// keeps applying in every folder; paths hidden since are added in full.
+/// What the command line hid is left to the command line.
+fn hide_list(
+    access: &crate::access::Access,
+    saved: &[PathBuf],
+    launch: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut list: Vec<PathBuf> = Vec::new();
+    for h in access.hidden() {
+        if launch.iter().any(|l| access.rule(l) == *h) {
+            continue;
+        }
+        let entry = saved
+            .iter()
+            .find(|e| access.rule(e) == *h)
+            .unwrap_or(h)
+            .clone();
+        if !list.contains(&entry) {
+            list.push(entry);
+        }
+    }
+    list
+}
+
 fn parse(bytes: &[u8]) -> serde_json::Result<Settings> {
     serde_json::from_slice(bytes)
 }
@@ -152,6 +209,24 @@ fn parse(bytes: &[u8]) -> serde_json::Result<Settings> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeps_hidden_paths_as_written() {
+        let cwd = std::env::temp_dir().canonicalize().unwrap();
+        let mut a = crate::access::Access::new(
+            &cwd,
+            std::slice::from_ref(&cwd),
+            &[".env".into(), "old".into(), "flag".into()],
+        )
+        .unwrap();
+        a.unhide(std::path::Path::new("old"));
+        a.hide(std::path::Path::new("new"));
+        let saved = [PathBuf::from(".env"), PathBuf::from("old")];
+        assert_eq!(
+            hide_list(&a, &saved, &[PathBuf::from("flag")]),
+            [PathBuf::from(".env"), cwd.join("new")]
+        );
+    }
 
     #[test]
     fn reads_providers_and_rejects_typos() {

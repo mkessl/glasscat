@@ -261,7 +261,8 @@ pub fn read_stream(
             }
         };
         if let Some(err) = chunk.error {
-            out.error = Some(format!("provider error: {err}"));
+            let text = error_text(&serde_json::json!({ "error": err }).to_string());
+            out.error = Some(format!("provider error: {text}"));
             break;
         }
         if chunk.usage.is_some() {
@@ -393,7 +394,7 @@ pub fn get_json(url: &str, api_key: Option<&str>, proxy: Option<&str>) -> Result
     let status = resp.status();
     if !status.is_success() {
         let text = resp.body_mut().read_to_string().unwrap_or_default();
-        return Err(format!("{url}: HTTP {status}: {}", text.trim()).into());
+        return Err(format!("{url}: HTTP {status}: {}", error_text(&text)).into());
     }
     let bytes = resp
         .body_mut()
@@ -436,13 +437,39 @@ fn post(
             message: match status.as_u16() {
                 401 => format!(
                     "{url}: HTTP {status}: {}\nThe provider refused the API key, or got none.",
-                    text.trim()
+                    error_text(&text)
                 ),
-                _ => format!("{url}: HTTP {status}: {}", text.trim()),
+                _ => format!("{url}: HTTP {status}: {}", error_text(&text)),
             },
         }));
     }
     Ok(reader)
+}
+
+/// What an error answer says: the message of a JSON error, with what the
+/// provider behind a router said and its name when given; any other
+/// answer as it is.
+fn error_text(body: &str) -> String {
+    let body = body.trim();
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return body.to_string();
+    };
+    let e = &v["error"];
+    if let Some(s) = e.as_str() {
+        return s.trim().to_string();
+    }
+    let Some(message) = e["message"].as_str().or(v["message"].as_str()) else {
+        return body.to_string();
+    };
+    let mut text = message.trim().to_string();
+    let meta = &e["metadata"];
+    if let Some(raw) = meta["raw"].as_str().filter(|r| !r.trim().is_empty()) {
+        text += &format!("\n{}", raw.trim());
+    }
+    if let Some(p) = meta["provider_name"].as_str() {
+        text += &format!(" ({p})");
+    }
+    text
 }
 
 /// A provider's answer with an error status.
@@ -550,9 +577,23 @@ mod tests {
             .to_string();
         server.join().unwrap();
         assert!(
-            err.contains("401") && err.contains("No auth credentials"),
+            err.contains("401") && err.contains("No auth credentials") && !err.contains('{'),
             "{err}"
         );
+    }
+
+    #[test]
+    fn error_text_reads_json_errors() {
+        assert_eq!(
+            error_text(
+                r#"{"error":{"message":"Provider returned error","code":429,
+                "metadata":{"raw":"Rate limited upstream","provider_name":"Chutes"}}}"#
+            ),
+            "Provider returned error\nRate limited upstream (Chutes)"
+        );
+        assert_eq!(error_text(" plain text \n"), "plain text");
+        assert_eq!(error_text(r#"{"error":"busy"}"#), "busy");
+        assert_eq!(error_text(r#"{"detail":"x"}"#), r#"{"detail":"x"}"#);
     }
 
     fn run(chunks: &[&str]) -> (Outcome, Vec<String>) {
@@ -700,7 +741,7 @@ mod tests {
             r#"{"choices":[{"delta":{"content":"so far"}}]}"#,
             r#"{"error":{"message":"overloaded","code":502}}"#,
         ]);
-        assert!(out.error.unwrap().contains("overloaded"));
+        assert_eq!(out.error.unwrap(), "provider error: overloaded");
         assert_eq!(out.reply.text, "so far");
     }
 

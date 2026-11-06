@@ -1,9 +1,10 @@
 //! The markdown models write, laid out for the terminal: headings, lists,
-//! quotes, rules, code blocks, tables, and `code`, **bold** and *italic*
-//! inside lines. Anything else stays as written.
+//! quotes, rules, code blocks in colour, tables, and `code`, **bold** and
+//! *italic* inside lines. Anything else stays as written.
 
 use crossterm::style::Color;
 
+use super::highlight;
 use super::screen::Style;
 use super::text::{Span, wrap_spans};
 use super::transcript::Line;
@@ -13,7 +14,7 @@ const QUOTE: Style = Style::dim();
 
 pub fn lines(text: &str, width: usize) -> Vec<Line> {
     let mut out = Vec::new();
-    let mut fence: Option<String> = None;
+    let mut fence: Option<Fence> = None;
     let all: Vec<&str> = text
         .trim_end()
         .split('\n')
@@ -37,18 +38,34 @@ pub fn lines(text: &str, width: usize) -> Vec<Line> {
             continue;
         }
         let trimmed = line.trim_start();
-        if let Some(open) = &fence {
-            if trimmed.starts_with(open.as_str())
+        if let Some(f) = &mut fence {
+            if trimmed.starts_with(f.marker.as_str())
                 && trimmed.trim_matches(|c| c == '`' || c == '~').is_empty()
             {
                 fence = None;
             } else {
-                block(&mut out, "", "", vec![(line.to_string(), CODE)], width);
+                let mut spans = if f.diff {
+                    highlight::diff_line(line)
+                } else if let Some(lang) = f.lang {
+                    highlight::line(line, lang, &mut f.in_comment)
+                } else {
+                    vec![(line.to_string(), CODE)]
+                };
+                if spans.is_empty() {
+                    spans.push((String::new(), Style::default()));
+                }
+                block(&mut out, "", "", spans, width);
             }
             continue;
         }
         if let Some(marker) = fence_marker(trimmed) {
-            fence = Some(marker);
+            let info = trimmed[marker.len()..].trim();
+            fence = Some(Fence {
+                lang: highlight::lang(info),
+                diff: highlight::is_diff(info),
+                marker,
+                in_comment: false,
+            });
             continue;
         }
         let indent = &line[..line.len() - trimmed.len()];
@@ -87,6 +104,16 @@ pub fn lines(text: &str, width: usize) -> Vec<Line> {
         }
     }
     out
+}
+
+/// An open code block.
+struct Fence {
+    /// What closes it.
+    marker: String,
+    lang: Option<&'static highlight::Lang>,
+    diff: bool,
+    /// Inside a block comment that started on an earlier line.
+    in_comment: bool,
 }
 
 /// Wraps styled text under a first-line prefix, with continuation lines
@@ -303,11 +330,12 @@ fn inline(s: &str, base: Style) -> Vec<Span> {
         _ => out.push((text.to_string(), style)),
     };
     let mut rest = s;
-    let mut bold = false;
+    // The marker that opened bold, `**` or `__`.
+    let mut bold: Option<&str> = None;
     let mut italic = false;
-    let style = |bold: bool, italic: bool| {
+    let style = |bold: Option<&str>, italic: bool| {
         let mut st = base;
-        if bold {
+        if bold.is_some() {
             st = st.bold();
         }
         if italic {
@@ -354,11 +382,26 @@ fn inline(s: &str, base: Style) -> Vec<Span> {
         };
         if rest.starts_with("**") || rest.starts_with("__") {
             let m = &rest[..2];
-            if toggles(m, bold, rest) {
-                bold = !bold;
+            // `__` inside a word, as in `__init__`, is part of the word.
+            let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+            let inside = m == "__"
+                && if bold.is_some() {
+                    word(rest[2..].chars().next())
+                } else {
+                    word(s[..s.len() - rest.len()].chars().next_back())
+                };
+            let fits = match bold {
+                Some(open) => open == m,
+                None => toggles(m, false, rest),
+            };
+            if fits && !inside {
+                bold = if bold.is_some() { None } else { Some(m) };
                 rest = &rest[2..];
                 continue;
             }
+            push(m, style(bold, italic));
+            rest = &rest[2..];
+            continue;
         } else if c == '*' && toggles("*", italic, rest) {
             italic = !italic;
             rest = &rest[1..];
@@ -409,6 +452,15 @@ mod tests {
             ]
         );
         assert_eq!(inline("snake_case_name", Style::default()).len(), 1);
+        let b = Style::default().bold();
+        assert_eq!(
+            inline("**src/__init__.py** __x__", Style::default()),
+            [
+                ("src/__init__.py".to_string(), b),
+                (" ".to_string(), Style::default()),
+                ("x".to_string(), b),
+            ]
+        );
         let l: String = inline(
             "see [the docs](https://d.x) or [a](b c) [u](u)",
             Style::default(),

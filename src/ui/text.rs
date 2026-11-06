@@ -114,6 +114,9 @@ pub fn clip(s: &str, width: usize) -> String {
     if s.width() <= width {
         return s.to_string();
     }
+    if width == 0 {
+        return String::new();
+    }
     let mut out = String::new();
     let mut used = 0;
     for c in s.chars() {

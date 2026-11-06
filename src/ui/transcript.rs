@@ -43,6 +43,10 @@ impl Line {
 const USER: Style = Style::fg(Color::Cyan);
 const TOOL: Style = Style::fg(Color::Yellow);
 const ERROR: Style = Style::fg(Color::Red);
+const ADDED: Style = Style::fg(Color::Green);
+
+/// Lines of an edit's change shown under the call.
+const DIFF_LINES: usize = 12;
 
 #[derive(Default)]
 pub struct Transcript {
@@ -149,7 +153,8 @@ fn layout(b: &Block, width: usize, reasoning_open: bool, last: bool, cwd: &str) 
         Block::Text(t) => return markdown::lines(t, width),
         Block::Reasoning(t) => {
             let lines = wrap(t.trim(), width);
-            let skip = if reasoning_open {
+            // One line takes no more room than the line saying it is folded.
+            let skip = if reasoning_open || lines.len() == 1 {
                 0
             } else {
                 let (verb, keep) = if last {
@@ -175,16 +180,16 @@ fn layout(b: &Block, width: usize, reasoning_open: bool, last: bool, cwd: &str) 
                 TOOL,
             );
             let failed = result.starts_with("error:");
-            let mut lines = result.lines();
-            let first = lines.next().unwrap_or("").trim();
-            let more = lines.count();
-            let tail = if more > 0 {
-                format!("  (+{more} lines)")
-            } else {
-                String::new()
-            };
             let style = if failed { ERROR } else { Style::dim() };
-            add(clip(&format!("  {first}{tail}"), width), style);
+            add(
+                clip(&format!("  {}", outcome(name, result, failed)), width),
+                style,
+            );
+            if name == "edit" && !failed {
+                for (text, style) in change(args) {
+                    add(clip(&text, width), style);
+                }
+            }
         }
         Block::Error(t) => {
             for l in wrap(t, width) {
@@ -198,6 +203,92 @@ fn layout(b: &Block, width: usize, reasoning_open: bool, last: bool, cwd: &str) 
         }
     }
     out
+}
+
+/// A tool's result in one line: how much a read gave, otherwise the first
+/// line and how many follow.
+pub fn outcome(name: &str, result: &str, failed: bool) -> String {
+    let lines: Vec<&str> = result.lines().collect();
+    if name == "read" && !failed && lines.len() > 1 {
+        // "[lines 1-2000 of 5000; continue with offset 2001]"
+        return match lines.last().and_then(|l| l.strip_prefix('[')) {
+            Some(part) if part.starts_with("lines ") => {
+                part.split(';').next().unwrap_or(part).to_string()
+            }
+            _ => format!("{} lines", lines.len()),
+        };
+    }
+    if !failed && lines.len() > 1 {
+        // A note such as "[3 more entries not shown]" ends a long answer.
+        let (items, more) = match lines.split_last() {
+            Some((last, items)) if last.starts_with('[') => (items, true),
+            _ => (&lines[..], false),
+        };
+        let plus = if more { "+" } else { "" };
+        let n = items.len();
+        match name {
+            "list" => return format!("{n}{plus} entries: {}", items.join(", ")),
+            "find" => return format!("{n}{plus} files: {}", items.join(", ")),
+            "search" => {
+                let mut files: Vec<&str> = items.iter().filter_map(|l| match_file(l)).collect();
+                files.dedup();
+                let f = files.len();
+                let fs = if f == 1 { "" } else { "s" };
+                return format!("{n}{plus} matches in {f} file{fs}");
+            }
+            _ => {}
+        }
+    }
+    let first = lines.first().copied().unwrap_or("").trim();
+    match lines.len().saturating_sub(1) {
+        0 => first.to_string(),
+        1 => format!("{first}  (+1 line)"),
+        n => format!("{first}  (+{n} lines)"),
+    }
+}
+
+/// The path of a search result line, "path:line: text", where the path
+/// may hold a colon too.
+fn match_file(l: &str) -> Option<&str> {
+    l.match_indices(':').map(|(i, _)| &l[..i]).find(|p| {
+        let rest = &l[p.len() + 1..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        digits > 0 && rest[digits..].starts_with(": ")
+    })
+}
+
+/// The lines an edit took out and put in, as `- ` and `+ ` lines, cut
+/// short after a screenful.
+fn change(args: &str) -> Vec<(String, Style)> {
+    let Ok(v) = serde_json::from_str::<Value>(args) else {
+        return Vec::new();
+    };
+    let text = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+    let (old, new) = (text("old"), text("new"));
+    let (mut old, mut new): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
+    // Lines the model repeated for context did not change; leave them out.
+    let same = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    old.drain(..same);
+    new.drain(..same);
+    let same = old
+        .iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    old.truncate(old.len() - same);
+    new.truncate(new.len() - same);
+    let mut lines: Vec<(String, Style)> = old
+        .iter()
+        .map(|l| (format!("  - {l}"), ERROR))
+        .chain(new.iter().map(|l| (format!("  + {l}"), ADDED)))
+        .collect();
+    if lines.len() > DIFF_LINES {
+        let more = lines.len() - (DIFF_LINES - 1);
+        lines.truncate(DIFF_LINES - 1);
+        lines.push((format!("  … {more} more lines"), Style::dim()));
+    }
+    lines
 }
 
 /// A tool call's arguments in a few words: the path or pattern when there
@@ -217,8 +308,8 @@ fn summary(args: &str, cwd: &str) -> String {
             .into()
     };
     match (get("pattern"), get("path")) {
-        (Some(p), Some(path)) => format!("{p} in {}", rel(path)),
-        (Some(p), None) => p.to_string(),
+        (Some(p), Some(path)) if rel(path) != "." => format!("{p} in {}", rel(path)),
+        (Some(p), _) => p.to_string(),
         (None, Some(path)) => rel(path),
         (None, None) => Value::Object(m.clone()).to_string(),
     }
@@ -260,7 +351,28 @@ mod tests {
             args: r#"{"path":"src/main.rs"}"#.into(),
             result: "a\nb\nc".into(),
         });
-        assert_eq!(texts(&mut t, 40), ["▸ read src/main.rs", "  a  (+2 lines)"]);
+        assert_eq!(texts(&mut t, 40), ["▸ read src/main.rs", "  3 lines"]);
+        assert_eq!(
+            outcome(
+                "read",
+                "a\nb\n[lines 1-2 of 9; continue with offset 3]",
+                false
+            ),
+            "lines 1-2 of 9"
+        );
+        assert_eq!(outcome("read", "x is empty", false), "x is empty");
+        assert_eq!(
+            outcome("list", "src/\nREADME.md", false),
+            "2 entries: src/, README.md"
+        );
+        assert_eq!(
+            outcome("find", "a.rs\nb.rs\n[3 more files not shown]", false),
+            "2+ files: a.rs, b.rs"
+        );
+        assert_eq!(
+            outcome("search", "C:\\a.rs:1: x\nC:\\a.rs:4: y\nb.rs:2: z\n", false),
+            "3 matches in 2 files"
+        );
         t.cwd = "/p".into();
         t.push(Block::Tool {
             name: "find".into(),
@@ -268,6 +380,50 @@ mod tests {
             result: String::new(),
         });
         assert_eq!(texts(&mut t, 40)[3], "▸ find *.rs in src");
+        t.push(Block::Tool {
+            name: "search".into(),
+            args: r#"{"pattern":"fn","path":"."}"#.into(),
+            result: String::new(),
+        });
+        assert_eq!(texts(&mut t, 40)[6], "▸ search fn");
+    }
+
+    #[test]
+    fn edit_shows_its_change() {
+        let mut t = Transcript::default();
+        t.push(Block::Tool {
+            name: "edit".into(),
+            args: r#"{"path":"a.rs","old":"fn f() {\nlet x = 1;\nfoo();\n}","new":"fn f() {\nlet x = 2;\n}"}"#.into(),
+            result: "edited a.rs at line 3".into(),
+        });
+        assert_eq!(
+            texts(&mut t, 40),
+            [
+                "▸ edit a.rs",
+                "  edited a.rs at line 3",
+                "  - let x = 1;",
+                "  - foo();",
+                "  + let x = 2;"
+            ]
+        );
+        let long = "x\n".repeat(20);
+        t.push(Block::Tool {
+            name: "edit".into(),
+            args: serde_json::json!({"path": "b", "old": long, "new": "y"}).to_string(),
+            result: "edited b at line 1".into(),
+        });
+        let text = texts(&mut t, 40);
+        assert_eq!(text.len(), 5 + 1 + 2 + DIFF_LINES);
+        assert_eq!(text.last().unwrap(), "  … 10 more lines");
+        t.push(Block::Tool {
+            name: "edit".into(),
+            args: r#"{"path":"c","old":"a","new":"b"}"#.into(),
+            result: "error: old text not found".into(),
+        });
+        assert_eq!(
+            texts(&mut t, 40).last().unwrap(),
+            "  error: old text not found"
+        );
     }
 
     #[test]
@@ -285,5 +441,10 @@ mod tests {
         );
         t.toggle_reasoning();
         assert_eq!(texts(&mut t, 40), ["a", "b", "c", "d", "", "answer"]);
+        // A single line is shown as it is.
+        let mut t = Transcript::default();
+        t.stream("short", true);
+        t.stream("answer", false);
+        assert_eq!(texts(&mut t, 40), ["short", "", "answer"]);
     }
 }

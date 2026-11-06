@@ -24,6 +24,15 @@ pub fn take_withheld() -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("; "))
 }
 
+#[derive(Debug, PartialEq)]
+pub enum Seen {
+    Shown,
+    /// Hidden by this rule.
+    Hidden(PathBuf),
+    /// Outside the folders the model may use.
+    Outside,
+}
+
 pub struct Access {
     cwd: PathBuf,
     allowed: Vec<PathBuf>,
@@ -54,6 +63,33 @@ impl Access {
         &self.cwd
     }
 
+    /// The folders the model may use.
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.allowed
+    }
+
+    /// The hidden paths, as given.
+    pub fn hidden(&self) -> &[PathBuf] {
+        &self.hidden
+    }
+
+    /// The real path a rule for `path` stands for.
+    pub fn rule(&self, path: &Path) -> PathBuf {
+        real(&self.cwd.join(path))
+    }
+
+    /// Whether the model sees `path`, and if not, why.
+    pub fn seen(&self, path: &Path) -> Seen {
+        let real = real(&self.cwd.join(path));
+        if !self.allowed.iter().any(|a| real.starts_with(a)) {
+            return Seen::Outside;
+        }
+        match self.hidden.iter().find(|h| real.starts_with(h)) {
+            Some(h) => Seen::Hidden(h.clone()),
+            None => Seen::Shown,
+        }
+    }
+
     /// Hides `path` from now on; false if it already was.
     pub fn hide(&mut self, path: &Path) -> bool {
         let real = real(&self.cwd.join(path));
@@ -82,23 +118,6 @@ impl Access {
         Ok(true)
     }
 
-    /// The rules in words, one per line.
-    pub fn describe(&self) -> String {
-        let mut out = String::from("The model may use:");
-        for a in &self.allowed {
-            out += &format!("\n  {}", a.display());
-        }
-        if self.hidden.is_empty() {
-            out += "\nNothing in them is hidden.";
-        } else {
-            out += "\nExcept, as if they did not exist:";
-            for h in &self.hidden {
-                out += &format!("\n  {}", h.display());
-            }
-        }
-        out
-    }
-
     /// The real path a model-given path stands for, if the model may use it.
     /// The error text is the same for hidden and missing paths.
     pub fn resolve(&self, path: &str) -> Result<PathBuf, String> {
@@ -123,6 +142,13 @@ impl Access {
             WITHHELD.with(|w| w.borrow_mut().1 += 1);
         }
         shown
+    }
+
+    /// Counts `n` entries left out of a listing made on other threads.
+    pub fn left_out(&self, n: usize) {
+        if n > 0 {
+            WITHHELD.with(|w| w.borrow_mut().1 += n);
+        }
     }
 
     /// Whether a real path may be shown to the model.
@@ -250,6 +276,11 @@ mod tests {
     #[test]
     fn rules_change_while_running() {
         let (base, mut a) = tree("change");
+        assert_eq!(a.seen(Path::new("a.txt")), Seen::Shown);
+        assert!(
+            matches!(a.seen(Path::new("secret/key")), Seen::Hidden(h) if h.ends_with("secret"))
+        );
+        assert_eq!(a.seen(Path::new("../outside")), Seen::Outside);
         assert!(a.hide(Path::new("a.txt")));
         assert!(!a.hide(Path::new("./a.txt")));
         assert!(a.resolve("a.txt").is_err());
@@ -263,7 +294,7 @@ mod tests {
         assert!(!a.allow(Path::new("../outside")).unwrap());
         assert!(a.resolve("../outside/x").is_ok());
         assert!(a.allow(Path::new("no-such-dir")).is_err());
-        assert!(a.describe().contains("outside"), "{}", a.describe());
+        assert!(a.roots().iter().any(|r| r.ends_with("outside")));
         fs::remove_dir_all(base).unwrap();
     }
 }

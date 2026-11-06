@@ -34,11 +34,12 @@ streams the answer to stdout; tool calls go to stderr.
 
   -c, --continue    pick up the last conversation held in this directory
   --provider NAME   one of: PROVIDERS (default: openrouter)
-  --model ID        model id (default: the provider's default)
+  -m, --model ID    model id (default: the provider's default)
   --allow PATH      let the model see PATH too (the current directory always)
   --hide PATH       PATH does not exist for the model; repeatable
   --proxy URL       send requests through URL (socks5://, http://)
-  --show-request    print each exact request body to stderr before sending";
+  --show-request    print each exact request body to stderr before sending
+  -V, --version     print the version";
 
 struct Args {
     resume: bool,
@@ -71,16 +72,25 @@ fn parse_args() -> Result<Args> {
                 println!("{}", usage());
                 std::process::exit(0);
             }
+            "-V" | "--version" => {
+                println!("{NAME} {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "-c" | "--continue" => args.resume = true,
             "--provider" => args.provider = Some(value()?),
-            "--model" => args.model = Some(value()?),
+            "-m" | "--model" => args.model = Some(value()?),
             "--allow" => args.allow.push(value()?.into()),
             "--hide" => args.hide.push(value()?.into()),
             "--proxy" => args.proxy = Some(value()?),
             "--show-request" => args.show_request = true,
             "--" => words.extend(it.by_ref()),
-            s if s.starts_with("--") => {
-                return Err(format!("unknown option {s}\n\n{}", usage()).into());
+            // Not taken as the prompt: a mistyped option would be sent.
+            s if s.starts_with('-') && s.len() > 1 => {
+                return Err(format!(
+                    "unknown option {s}; a prompt that starts with - goes after --\n\n{}",
+                    usage()
+                )
+                .into());
             }
             _ => words.push(a),
         }
@@ -197,15 +207,10 @@ fn run() -> Result<()> {
                     at_line_start = true;
                     let _ = writeln!(out);
                 }
-                let first = result.lines().next().unwrap_or("");
-                let more = result.lines().count().saturating_sub(1);
-                let more = if more > 0 {
-                    format!(" (+{more} lines)")
-                } else {
-                    String::new()
-                };
+                let failed = result.starts_with("error:");
+                let outcome = ui::outcome(name, result, failed);
                 let note = note.map(|n| format!("\n  {n}")).unwrap_or_default();
-                writeln!(std::io::stderr(), "› {name} {args}\n  {first}{more}{note}")
+                writeln!(std::io::stderr(), "› {name} {args}\n  {outcome}{note}")
             }
             agent::Shown::Usage(u) => {
                 if let Some(c) = u.get("cost").and_then(serde_json::Value::as_f64) {

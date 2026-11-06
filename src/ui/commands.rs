@@ -216,8 +216,8 @@ impl App {
                 let access = &mut session.tools.access;
                 let block = match verb {
                     "" => {
-                        let text = access.describe();
-                        return self.show(text);
+                        self.view = super::View::Files(super::files::Files::new(access));
+                        return;
                     }
                     _ if path.as_os_str().is_empty() => {
                         Block::Error(format!("/access {verb} needs a path."))
@@ -424,7 +424,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/tools", "the tools the model has, and what each one runs"),
     (
         "/access",
-        "what the model may see; /access hide|show|allow PATH changes it",
+        "a tree of what the model may see, Space hides or shows; or hide|show|allow PATH",
     ),
     (
         "/settings",

@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 
@@ -33,6 +33,9 @@ pub struct Tools {
     custom: std::collections::BTreeMap<String, CustomTool>,
     /// Where reports to the developers are saved.
     pub reports: PathBuf,
+    /// Files the model read or changed in this run, and whether it changed
+    /// them.
+    touched: Mutex<std::collections::HashMap<PathBuf, bool>>,
 }
 
 /// One change to a file and what it takes to undo it.
@@ -106,7 +109,7 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "search",
-            "Search file contents with a regular expression. Returns path:line: text.",
+            "Search file contents with a regular expression, line by line. Skips what .gitignore ignores. Returns path:line: text.",
             json!({
                 "type": "object",
                 "properties": {
@@ -181,6 +184,7 @@ impl Tools {
             changes: Mutex::new(Vec::new()),
             custom: Default::default(),
             reports: crate::journal::data_dir().join("reports"),
+            touched: Mutex::default(),
         }
     }
 
@@ -239,7 +243,21 @@ impl Tools {
         read_only(name) || self.custom.get(name).is_some_and(|t| t.read_only)
     }
 
+    /// Notes that the model read `path`, or changed it.
+    fn touch(&self, path: &Path, changed: bool) {
+        let mut t = self.touched.lock().unwrap_or_else(|e| e.into_inner());
+        let was = t.get(path).copied().unwrap_or(false);
+        t.insert(path.to_path_buf(), was || changed);
+    }
+
+    /// "read" or "changed" for a file the model read or changed in this run.
+    pub fn touched(&self, path: &Path) -> Option<&'static str> {
+        let t = self.touched.lock().unwrap_or_else(|e| e.into_inner());
+        t.get(path).map(|&c| if c { "changed" } else { "read" })
+    }
+
     fn remember(&self, change: Change) {
+        self.touch(&change.path, true);
         self.changes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -396,6 +414,7 @@ impl Tools {
         if is_binary(&bytes) {
             return Ok(format!("{path} is a binary file of {} bytes", bytes.len()));
         }
+        self.touch(&real, false);
         let text = String::from_utf8_lossy(&bytes);
         let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
         if text.is_empty() {
@@ -466,13 +485,14 @@ impl Tools {
         let base = opt_str(a, "path").unwrap_or(".");
         let root = self.access.resolve(base)?;
         let glob = glob_matcher(pattern)?;
-        let mut found = Vec::new();
-        for file in self.walk(&root, base)? {
-            let rel = file.strip_prefix(&root).unwrap_or(&file);
-            if glob.is_match(rel) {
-                found.push(self.access.show(&file));
-            }
-        }
+        let mut found: Vec<String> = self
+            .walk(&root, base, |file| {
+                glob.is_match(file.strip_prefix(&root).unwrap_or(file))
+                    .then_some(())
+            })?
+            .into_iter()
+            .map(|(file, ())| self.access.show(&file))
+            .collect();
         if found.is_empty() {
             return Ok(format!("no files match {pattern}"));
         }
@@ -488,45 +508,70 @@ impl Tools {
 
     fn search(&self, a: &Value) -> Result<String, String> {
         let pattern = req(a, "pattern")?;
-        let re = regex::Regex::new(pattern).map_err(|e| format!("bad pattern: {e}"))?;
+        let bad = |e: regex::Error| format!("bad pattern: {e}");
+        let re = regex::bytes::Regex::new(pattern).map_err(bad)?;
+        // One pass over a whole file tells whether any line can match;
+        // most files have none.
+        let any = regex::bytes::RegexBuilder::new(pattern)
+            .multi_line(true)
+            .crlf(true)
+            .build()
+            .map_err(bad)?;
         let base = opt_str(a, "path").unwrap_or(".");
         let root = self.access.resolve(base)?;
         let glob = opt_str(a, "glob").map(glob_matcher).transpose()?;
-        let mut files = if root.is_file() {
-            vec![root.clone()]
-        } else {
-            self.walk(&root, base)?
+        // Enough found to stop looking; the rest would not be shown.
+        let count = AtomicUsize::new(0);
+        let matches = |file: &Path| -> Option<Vec<(usize, String)>> {
+            let rel = file.strip_prefix(&root).unwrap_or(file);
+            if glob.as_ref().is_some_and(|g| !g.is_match(rel))
+                || count.load(Ordering::Relaxed) > SEARCH_MAX
+                || fs::metadata(file).map_or(true, |m| m.len() > SEARCH_FILE_MAX)
+            {
+                return None;
+            }
+            let bytes = fs::read(file).ok()?;
+            if is_binary(&bytes) || !any.is_match(&bytes) {
+                return None;
+            }
+            let found: Vec<(usize, String)> = bytes
+                .strip_suffix(b"\n")
+                .unwrap_or(&bytes)
+                .split(|&b| b == b'\n')
+                .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+                .enumerate()
+                .filter(|(_, l)| re.is_match(l))
+                .take(SEARCH_MAX + 1)
+                .map(|(n, l)| {
+                    let l = String::from_utf8_lossy(l);
+                    (n + 1, cut(l.trim(), SEARCH_LINE_CHARS))
+                })
+                .collect();
+            count.fetch_add(found.len(), Ordering::Relaxed);
+            (!found.is_empty()).then_some(found)
         };
-        files.sort();
+        let files = if root.is_file() {
+            matches(&root)
+                .map(|m| (root.clone(), m))
+                .into_iter()
+                .collect()
+        } else {
+            self.walk(&root, base, matches)?
+        };
         let mut out = String::new();
-        let mut count = 0;
-        'files: for file in files {
-            let rel = file.strip_prefix(&root).unwrap_or(&file);
-            if glob.as_ref().is_some_and(|g| !g.is_match(rel)) {
-                continue;
-            }
-            if fs::metadata(&file).map_or(true, |m| m.len() > SEARCH_FILE_MAX) {
-                continue;
-            }
-            let Ok(bytes) = fs::read(&file) else { continue };
-            if is_binary(&bytes) {
-                continue;
-            }
-            let text = String::from_utf8_lossy(&bytes);
-            let shown = self.access.show(&file);
-            for (n, line) in text.lines().enumerate() {
-                if re.is_match(line) {
-                    if count == SEARCH_MAX {
-                        out.push_str(&format!("[stopped at {SEARCH_MAX} matches]\n"));
-                        break 'files;
-                    }
-                    count += 1;
-                    let line = cut(line.trim(), SEARCH_LINE_CHARS);
-                    out.push_str(&format!("{shown}:{}: {line}\n", n + 1));
+        let mut shown = 0;
+        'files: for (file, found) in files {
+            let name = self.access.show(&file);
+            for (n, line) in found {
+                if shown == SEARCH_MAX {
+                    out.push_str(&format!("[stopped at {SEARCH_MAX} matches]\n"));
+                    break 'files;
                 }
+                shown += 1;
+                out.push_str(&format!("{name}:{n}: {line}\n"));
             }
         }
-        if count == 0 {
+        if shown == 0 {
             return Ok(format!("no matches for {pattern}"));
         }
         Ok(out)
@@ -540,6 +585,17 @@ impl Tools {
             return Err(format!("{path} is a directory"));
         }
         let old = fs::read(&real).ok();
+        // Over a file with CRLF line endings or a byte order mark, the
+        // model's `\n` text keeps them.
+        let mut content = content.to_string();
+        if let Some(before) = &old {
+            if before.windows(2).any(|w| w == b"\r\n") && !content.contains('\r') {
+                content = content.replace('\n', "\r\n");
+            }
+            if before.starts_with("\u{feff}".as_bytes()) && !content.starts_with('\u{feff}') {
+                content.insert(0, '\u{feff}');
+            }
+        }
         let mut dirs = Vec::new();
         if let Some(dir) = real.parent() {
             dirs = dir
@@ -568,10 +624,13 @@ impl Tools {
         self.journal
             .record(json!({ "tool": "write", "path": real, "old": old_text, "new": content }))
             .map_err(|e| format!("wrote {path}, but could not record the change: {e}"))?;
-        let lines = content.lines().count();
+        let lines = match content.lines().count() {
+            1 => "1 line".to_string(),
+            n => format!("{n} lines"),
+        };
         Ok(match old {
-            Some(_) => format!("wrote {path} ({lines} lines)"),
-            None => format!("created {path} ({lines} lines)"),
+            Some(_) => format!("wrote {} ({lines})", self.access.show(&real)),
+            None => format!("created {} ({lines})", self.access.show(&real)),
         })
     }
 
@@ -614,13 +673,14 @@ impl Tools {
                 .record(json!({ "tool": "delete", "path": real, "dir": true }))
                 .map_err(|e| format!("deleted {path}, but could not record the change: {e}"))?;
         }
+        let shown = self.access.show(&real);
         self.remember(Change {
             path: real,
             what: what.into(),
             after: None,
             undo,
         });
-        Ok(format!("deleted {path}"))
+        Ok(format!("deleted {shown}"))
     }
 
     fn edit(&self, a: &Value) -> Result<String, String> {
@@ -692,28 +752,59 @@ impl Tools {
             }))
             .map_err(|e| format!("edited {path}, but could not record the change: {e}"))?;
         Ok(match at.len() {
-            1 => format!("edited {path} at line {first_line}"),
-            n => format!("edited {path}: {n} places, first at line {first_line}"),
+            1 => format!("edited {} at line {first_line}", self.access.show(&real)),
+            n => format!(
+                "edited {}: {n} places, first at line {first_line}",
+                self.access.show(&real)
+            ),
         })
     }
 
     /// Files under `root` the model may see, skipping `.git`, what
-    /// `.gitignore` ignores inside a repository, and hidden paths.
-    fn walk(&self, root: &Path, shown_as: &str) -> Result<Vec<PathBuf>, String> {
+    /// `.gitignore` ignores inside a repository, and hidden paths, each
+    /// given to `keep` on several threads at once; what it keeps, in path
+    /// order.
+    fn walk<T: Send>(
+        &self,
+        root: &Path,
+        shown_as: &str,
+        keep: impl Fn(&Path) -> Option<T> + Sync,
+    ) -> Result<Vec<(PathBuf, T)>, String> {
+        use ignore::WalkState;
         if !root.is_dir() {
             return Err(format!("{shown_as} is not a directory"));
         }
-        let walker = ignore::WalkBuilder::new(root)
+        let kept = Mutex::new(Vec::new());
+        let left_out = AtomicUsize::new(0);
+        let access = &self.access;
+        ignore::WalkBuilder::new(root)
             .hidden(false)
             .require_git(true)
             .filter_entry(|e| e.file_name() != ".git")
-            .build();
-        Ok(walker
-            .flatten()
-            .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
-            .map(|e| e.into_path())
-            .filter(|p| self.access.listed(p))
-            .collect())
+            .build_parallel()
+            .run(|| {
+                let (kept, left_out, keep) = (&kept, &left_out, &keep);
+                Box::new(move |entry| {
+                    let Ok(e) = entry else {
+                        return WalkState::Continue;
+                    };
+                    // A hidden folder is not even walked.
+                    if e.depth() > 0 && !access.visible(e.path()) {
+                        left_out.fetch_add(1, Ordering::Relaxed);
+                        return WalkState::Skip;
+                    }
+                    if e.file_type().is_some_and(|t| t.is_file())
+                        && let Some(t) = keep(e.path())
+                    {
+                        kept.lock().unwrap().push((e.into_path(), t));
+                    }
+                    WalkState::Continue
+                })
+            });
+        self.access.left_out(left_out.into_inner());
+        let mut kept = kept.into_inner().unwrap();
+        kept.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(kept)
     }
 }
 
@@ -914,6 +1005,22 @@ mod tests {
             "src/lib.rs:1: pub fn a() {}\nsrc/lib.rs:2: pub fn b() {}\n"
         );
         assert!(run(&f, "search", json!({"pattern": "("})).contains("bad pattern"));
+        // Anchors hold per line, in CRLF files too; no line after the last.
+        fs::write(f.base.join("proj/dos.txt"), "x\r\nab\r\n").unwrap();
+        assert_eq!(
+            run(&f, "search", json!({"pattern": "^pub fn b|^ab$"})),
+            "dos.txt:2: ab\nsrc/lib.rs:2: pub fn b() {}\n"
+        );
+        assert_eq!(
+            run(&f, "search", json!({"pattern": "^$"})),
+            "no matches for ^$"
+        );
+        crate::access::take_withheld();
+        run(&f, "search", json!({"pattern": "fn"}));
+        assert_eq!(
+            crate::access::take_withheld().as_deref(),
+            Some("1 entry left out of a listing")
+        );
     }
 
     #[test]
@@ -1102,7 +1209,7 @@ mod tests {
                 "write",
                 json!({"path": "new/dir/a.txt", "content": "x\n"})
             ),
-            "created new/dir/a.txt (1 lines)"
+            "created new/dir/a.txt (1 line)"
         );
         assert_eq!(
             run(
@@ -1124,6 +1231,15 @@ mod tests {
         );
         let journal = fs::read_to_string(f.base.join("journal.jsonl")).unwrap();
         assert_eq!(journal.lines().count(), 2);
+        let abs = f.base.canonicalize().unwrap().join("proj/abs.txt");
+        assert_eq!(
+            run(&f, "write", json!({"path": abs, "content": "x"})),
+            "created abs.txt (1 line)"
+        );
+        let dos = f.base.join("proj/dos.txt");
+        fs::write(&dos, "\u{feff}a\r\nb\r\n").unwrap();
+        run(&f, "write", json!({"path": "dos.txt", "content": "c\nd\n"}));
+        assert_eq!(fs::read_to_string(&dos).unwrap(), "\u{feff}c\r\nd\r\n");
     }
 
     #[test]

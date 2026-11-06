@@ -20,8 +20,17 @@ pub struct Sent {
 /// Below this many tokens providers do not cache at all.
 const MIN_CACHED: u64 = 1024;
 
-/// A sentence for the user when the cache gave back less than half of
-/// what the last request sent, or None. `gap` is the time from the last
+/// Why the cache missed, for the user.
+#[derive(Debug, PartialEq)]
+pub struct Miss {
+    pub text: String,
+    /// Nothing changed: the provider did not give the cache back. Said
+    /// once per provider is enough.
+    pub unchanged: bool,
+}
+
+/// What to tell the user when the cache gave back less than half of what
+/// the last request sent, or None. `gap` is the time from the last
 /// request's end to this one's start; `openrouter` adds how to keep to
 /// one provider there.
 pub fn explain_miss(
@@ -31,7 +40,7 @@ pub fn explain_miss(
     served: Option<&Served>,
     gap: Duration,
     openrouter: bool,
-) -> Option<String> {
+) -> Option<Miss> {
     // Only providers that report cached tokens say anything to compare.
     let cached = usage
         .pointer("/prompt_tokens_details/cached_tokens")?
@@ -49,6 +58,8 @@ pub fn explain_miss(
     let head = format!("The cache gave back {cached} of {prompt} tokens");
     let was_on = was.and_then(|s| s.provider.as_deref());
     let now_on = now.and_then(|s| s.provider.as_deref());
+    let parse = |b: &[u8]| serde_json::from_slice::<Value>(b).ok();
+    let new = parse(body);
     if let (Some(a), Some(b)) = (was_on, now_on)
         && a != b
     {
@@ -57,23 +68,41 @@ pub fn explain_miss(
              own cache."
         );
         if openrouter {
-            text +=
-                &format!(" /set provider {{\"order\": [\"{b}\"]}} asks OpenRouter to keep to one.");
+            // Kept with what the provider field already asks, such as zdr.
+            let mut field = new
+                .as_ref()
+                .and_then(|n| n.get("provider"))
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            field.insert("order".into(), serde_json::json!([b]));
+            text += &format!(
+                " /set provider {} asks OpenRouter to keep to one.",
+                Value::Object(field)
+            );
         }
-        return Some(text);
+        return Some(Miss {
+            text,
+            unchanged: false,
+        });
     }
-    let parse = |b: &[u8]| serde_json::from_slice::<Value>(b).ok();
-    let (Some(old), Some(new)) = (parse(&last.body), parse(body)) else {
+    let (Some(old), Some(new)) = (parse(&last.body), new) else {
         return None;
     };
     if let Some(change) = first_change(&old, &new) {
-        return Some(format!("{head}: {change} since the last request."));
+        return Some(Miss {
+            text: format!("{head}: {change} since the last request."),
+            unchanged: false,
+        });
     }
-    Some(format!(
-        "{head}, though the {before} tokens of the last request went again unchanged, {} after \
-         it. The provider no longer had them, or did not look.",
-        span(gap)
-    ))
+    Some(Miss {
+        text: format!(
+            "{head}, though the {before} tokens of the last request went again unchanged, {} \
+             after it. The provider no longer had them, or did not look.",
+            span(gap)
+        ),
+        unchanged: true,
+    })
 }
 
 /// The first part of the old request that the new one does not repeat.
@@ -147,7 +176,7 @@ mod tests {
 
     #[test]
     fn says_what_changed() {
-        let old = json!({"model": "m", "tools": [1], "messages": [
+        let old = json!({"model": "m", "provider": {"zdr": true}, "tools": [1], "messages": [
             {"role": "system", "content": "s"}, {"role": "user", "content": "a"}]});
         let last = sent(&old, 5000, "P");
         let gap = Duration::from_secs(400);
@@ -160,6 +189,7 @@ mod tests {
                 gap,
                 on == "R",
             )
+            .map(|m| m.text)
         };
         let mut grown = old.clone();
         grown["messages"]
@@ -172,11 +202,9 @@ mod tests {
             "The cache gave back 0 of 5100 tokens: this request ran on Q, the last one on P, \
              and each provider keeps its own cache."
         );
-        assert!(
-            explain(&grown, usage(5100, 0), "R")
-                .unwrap()
-                .ends_with("/set provider {\"order\": [\"R\"]} asks OpenRouter to keep to one.")
-        );
+        assert!(explain(&grown, usage(5100, 0), "R").unwrap().ends_with(
+            "/set provider {\"zdr\":true,\"order\":[\"R\"]} asks OpenRouter to keep to one."
+        ));
         assert_eq!(
             explain(&grown, usage(5100, 0), "P").unwrap(),
             "The cache gave back 0 of 5100 tokens, though the 5000 tokens of the last request \
