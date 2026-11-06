@@ -1,6 +1,7 @@
 //! The model's tools. Each takes JSON arguments and returns text for the
 //! model; failures are text too, written so the model can act on them.
 
+use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -109,7 +110,7 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "search",
-            "Search file contents with a regular expression, line by line. Skips what .gitignore ignores. Returns path:line: text.",
+            "Search file contents with a regular expression, line by line; text that is not one is searched as it stands. Skips what .gitignore ignores. Returns path:line: text.",
             json!({
                 "type": "object",
                 "properties": {
@@ -264,6 +265,25 @@ impl Tools {
             .push(change);
     }
 
+    /// This run's changes still to undo, one per line, the next to undo
+    /// last.
+    pub fn changes(&self) -> String {
+        let changes = self.changes.lock().unwrap_or_else(|e| e.into_inner());
+        if changes.is_empty() {
+            return "No changes to files in this run, or all were undone.".into();
+        }
+        let mut out = String::from(
+            "Changes to files in this run, oldest first; /undo takes back the last.\n\n",
+        );
+        for c in changes.iter() {
+            out += &format!("  {}: {}\n", self.access.show(&c.path), c.what);
+        }
+        out + &format!(
+            "\nEach one, with its old and new text: {}",
+            self.journal.path().display()
+        )
+    }
+
     /// Undoes the last change still undone, leaving a file alone if it
     /// was changed after; says what happened in a sentence.
     pub fn undo(&self) -> Result<String, String> {
@@ -335,28 +355,33 @@ impl Tools {
             .collect()
     }
 
-    /// Runs a tool; returns what the model gets back, and a note for the
-    /// user only: what was kept from the model, or where a report went.
-    pub fn run_noting(
-        &self,
-        name: &str,
-        args: &str,
-        cancel: &AtomicBool,
-    ) -> (String, Option<String>) {
+    /// Runs a tool; returns what the model gets back, and what only the
+    /// user is told.
+    pub fn run_noting(&self, name: &str, args: &str, cancel: &AtomicBool) -> Ran {
         if name == crate::report::TOOL {
             let args = serde_json::from_str(args).unwrap_or(Value::Null);
-            return match crate::report::save(&self.reports, &args) {
+            let (result, note) = match crate::report::save(&self.reports, &args) {
                 Ok((back, note)) => (back, Some(note)),
                 Err(e) => (format!("error: {e}"), None),
             };
+            return Ran {
+                result,
+                note,
+                before: None,
+            };
         }
         crate::access::take_withheld();
+        BEFORE.take();
         let result = match self.custom.get(name) {
             Some(t) => self.run_custom(name, t, args, cancel),
             None => self.run(name, args),
         };
         let kept = crate::access::take_withheld();
-        (result, kept.map(|w| format!("Kept from the model: {w}.")))
+        Ran {
+            result,
+            note: kept.map(|w| format!("Kept from the model: {w}.")),
+            before: BEFORE.take(),
+        }
     }
 
     fn run_custom(&self, name: &str, t: &CustomTool, args: &str, cancel: &AtomicBool) -> String {
@@ -507,16 +532,29 @@ impl Tools {
     }
 
     fn search(&self, a: &Value) -> Result<String, String> {
-        let pattern = req(a, "pattern")?;
+        let given = req(a, "pattern")?;
+        // Models often give code as it is written, such as `f(x`; text
+        // that is no regular expression is looked for as it stands.
+        let (pattern, literal) = match regex::bytes::Regex::new(given) {
+            Ok(_) => (given.to_string(), None),
+            Err(e) => {
+                let why = e.to_string();
+                let why = why.lines().last().unwrap_or_default();
+                let why = why.trim().trim_start_matches("error: ").to_string();
+                (regex::escape(given), Some(why))
+            }
+        };
         let bad = |e: regex::Error| format!("bad pattern: {e}");
-        let re = regex::bytes::Regex::new(pattern).map_err(bad)?;
+        let re = regex::bytes::Regex::new(&pattern).map_err(bad)?;
         // One pass over a whole file tells whether any line can match;
         // most files have none.
-        let any = regex::bytes::RegexBuilder::new(pattern)
+        let any = regex::bytes::RegexBuilder::new(&pattern)
             .multi_line(true)
             .crlf(true)
             .build()
             .map_err(bad)?;
+        // `\A` and `\z` mean the line's ends to a line, the file's to it.
+        let prefilter = !pattern.contains("\\A") && !pattern.contains("\\z");
         let base = opt_str(a, "path").unwrap_or(".");
         let root = self.access.resolve(base)?;
         let glob = opt_str(a, "glob").map(glob_matcher).transpose()?;
@@ -531,7 +569,7 @@ impl Tools {
                 return None;
             }
             let bytes = fs::read(file).ok()?;
-            if is_binary(&bytes) || !any.is_match(&bytes) {
+            if is_binary(&bytes) || prefilter && !any.is_match(&bytes) {
                 return None;
             }
             let found: Vec<(usize, String)> = bytes
@@ -571,8 +609,19 @@ impl Tools {
                 out.push_str(&format!("{name}:{n}: {line}\n"));
             }
         }
+        let note = literal
+            .map(|why| format!("[not a regular expression ({why}), so searched as plain text]"))
+            .unwrap_or_default();
         if shown == 0 {
-            return Ok(format!("no matches for {pattern}"));
+            let note = if note.is_empty() {
+                note
+            } else {
+                format!(" {note}")
+            };
+            return Ok(format!("no matches for {given}{note}"));
+        }
+        if !note.is_empty() {
+            out.insert_str(0, &format!("{note}\n"));
         }
         Ok(out)
     }
@@ -585,6 +634,10 @@ impl Tools {
             return Err(format!("{path} is a directory"));
         }
         let old = fs::read(&real).ok();
+        if let Some(text) = old.as_deref().filter(|b| b.len() <= SHOWN_MAX) {
+            let text = String::from_utf8_lossy(text);
+            BEFORE.set(Some(text.trim_start_matches('\u{feff}').to_string()));
+        }
         // Over a file with CRLF line endings or a byte order mark, the
         // model's `\n` text keeps them.
         let mut content = content.to_string();
@@ -707,12 +760,23 @@ impl Tools {
         };
         // The model writes `\n`; a CRLF file keeps its line endings.
         let crlf = text.contains("\r\n") && !old.contains('\r');
-        let (old, new) = if crlf {
+        let (mut old, new) = if crlf {
             (old.replace('\n', "\r\n"), new.replace('\n', "\r\n"))
         } else {
             (old.to_string(), new.to_string())
         };
-        let at: Vec<usize> = text.match_indices(&old).map(|(i, _)| i).collect();
+        let mut at: Vec<usize> = text.match_indices(&old).map(|(i, _)| i).collect();
+        // Spaces at line ends are invisible to the model; whole lines that
+        // differ only there, in one place, are taken as meant.
+        let mut loose = false;
+        if at.is_empty()
+            && let Some(found) = loose_match(text, &old)
+            && text.matches(found).count() == 1
+        {
+            at = vec![found.as_ptr() as usize - text.as_ptr() as usize];
+            old = found.to_string();
+            loose = true;
+        }
         let line_of = |i: usize| text[..i].matches('\n').count() + 1;
         match at.len() {
             0 => return Err(miss_hint(path, text, &old, &new)),
@@ -751,13 +815,17 @@ impl Tools {
                 "count": at.len(), "old": old, "new": new,
             }))
             .map_err(|e| format!("edited {path}, but could not record the change: {e}"))?;
-        Ok(match at.len() {
+        let mut done = match at.len() {
             1 => format!("edited {} at line {first_line}", self.access.show(&real)),
             n => format!(
                 "edited {}: {n} places, first at line {first_line}",
                 self.access.show(&real)
             ),
-        })
+        };
+        if loose {
+            done += "; old matched once spaces at line ends were ignored";
+        }
+        Ok(done)
     }
 
     /// Files under `root` the model may see, skipping `.git`, what
@@ -809,6 +877,40 @@ impl Tools {
 }
 
 /// Why an edit's old text was not found, as far as can be told.
+/// The one run of whole lines in `text` that reads as `old` when spaces
+/// at line ends are ignored, or None when there is none or more than one.
+fn loose_match<'a>(text: &'a str, old: &str) -> Option<&'a str> {
+    let want: Vec<&str> = old.lines().map(str::trim_end).collect();
+    // Blank lines alone say nothing about where they are meant.
+    if want.iter().all(|l| l.is_empty()) {
+        return None;
+    }
+    // Each line of the text: where it starts, where its text ends before
+    // `\r\n` or `\n`, and where the next line starts.
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for l in text.split_inclusive('\n') {
+        let body = l.trim_end_matches('\n').trim_end_matches('\r');
+        lines.push((start, start + body.len(), start + l.len()));
+        start += l.len();
+    }
+    let line = |(a, b, _): (usize, usize, usize)| text[a..b].trim_end();
+    let mut found = (0..lines.len().saturating_sub(want.len() - 1))
+        .filter(|&i| (0..want.len()).all(|k| line(lines[i + k]) == want[k]));
+    let i = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    let from = lines[i].0;
+    let last = lines[i + want.len() - 1];
+    // A trailing newline in old takes the line's own with it.
+    let to = if old.ends_with('\n') { last.2 } else { last.1 };
+    Some(&text[from..to])
+}
+
+/// Lines of the file a missed edit shows at most.
+const MISS_LINES: usize = 40;
+
 fn miss_hint(path: &str, text: &str, old: &str, new: &str) -> String {
     if !new.is_empty() && text.contains(new) {
         return format!("old is not in {path}, but new already is; the edit may be done");
@@ -821,9 +923,20 @@ fn miss_hint(path: &str, text: &str, old: &str, new: &str) -> String {
     if !first.is_empty()
         && let Some(n) = text.lines().position(|l| l.trim() == first)
     {
+        // The lines there, so the model can copy them without a read.
+        let count = (old.lines().count() + 2).min(MISS_LINES);
+        let there: Vec<String> = text
+            .lines()
+            .skip(n)
+            .take(count)
+            .map(|l| cut(l, SEARCH_LINE_CHARS))
+            .collect();
         return format!(
-            "old is not in {path} exactly; its first line matches line {} but the text differs after it or in whitespace. Read the file again and copy the text exactly",
-            n + 1
+            "old is not in {path} exactly; its first line matches line {} but the text differs after it or in whitespace. Lines {}-{} read:\n{}",
+            n + 1,
+            n + 1,
+            n + there.len(),
+            there.join("\n")
         );
     }
     format!("old is not in {path}; read the file again and copy the text exactly")
@@ -841,6 +954,23 @@ fn glob_matcher(pattern: &str) -> Result<globset::GlobMatcher, String> {
         .build()
         .map(|g| g.compile_matcher())
         .map_err(|e| format!("bad glob: {e}"))
+}
+
+/// A tool's run: what the model gets back, and for the user only what
+/// was kept from the model or where a report went, and the text a file
+/// had before it was overwritten.
+pub struct Ran {
+    pub result: String,
+    pub note: Option<String>,
+    pub before: Option<String>,
+}
+
+/// The largest file whose old text is kept to show what an overwrite
+/// changed.
+const SHOWN_MAX: usize = 1 << 20;
+
+thread_local! {
+    static BEFORE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Writes through a temporary file and a rename, so a reader never sees
@@ -1004,7 +1134,19 @@ mod tests {
             run(&f, "search", json!({"pattern": "pub fn", "glob": "lib.rs"})),
             "src/lib.rs:1: pub fn a() {}\nsrc/lib.rs:2: pub fn b() {}\n"
         );
-        assert!(run(&f, "search", json!({"pattern": "("})).contains("bad pattern"));
+        assert_eq!(
+            run(&f, "search", json!({"pattern": "main("})),
+            "[not a regular expression (unclosed group), so searched as plain text]\n\
+             src/main.rs:1: fn main() {\n"
+        );
+        assert_eq!(
+            run(&f, "search", json!({"pattern": "zz("})),
+            "no matches for zz( [not a regular expression (unclosed group), so searched as plain text]"
+        );
+        assert_eq!(
+            run(&f, "search", json!({"pattern": "^fn main\\(\\) \\{\\z"})),
+            "src/main.rs:1: fn main() {\n"
+        );
         // Anchors hold per line, in CRLF files too; no line after the last.
         fs::write(f.base.join("proj/dos.txt"), "x\r\nab\r\n").unwrap();
         assert_eq!(
@@ -1041,6 +1183,11 @@ mod tests {
             json!({"path": "new/deep/a.txt", "content": "a"}),
         );
 
+        let listed = f.tools.changes();
+        assert!(
+            listed.contains("  src/lib.rs: the edit at line 1\n  src/main.rs: the overwrite\n"),
+            "{listed}"
+        );
         assert_eq!(
             f.tools.undo().unwrap(),
             "Undid the creation in new/deep/a.txt."
@@ -1180,7 +1327,10 @@ mod tests {
                 "edit",
                 json!({"path": "src/main.rs", "old": "fn main() {\n  x", "new": "y"})
             )
-            .contains("first line matches line 1")
+            .ends_with(
+                "first line matches line 1 but the text differs after it or in whitespace. \
+                 Lines 1-3 read:\nfn main() {\n    println!(\"hello\");\n}"
+            )
         );
     }
 
@@ -1198,6 +1348,35 @@ mod tests {
             "edited win.txt at line 1"
         );
         assert_eq!(fs::read_to_string(&p).unwrap(), "\u{feff}1\r\n2\r\n");
+    }
+
+    #[test]
+    fn edit_ignores_spaces_at_line_ends_in_one_place() {
+        let f = fixture("loose");
+        let p = f.base.join("proj/a.rs");
+        fs::write(&p, "fn a() {  \n    x();\t\n}\n").unwrap();
+        let edit =
+            |old: &str, new: &str| run(&f, "edit", json!({"path": "a.rs", "old": old, "new": new}));
+        assert_eq!(
+            edit("fn a() {\n    x();\n", "fn a() {\n    y();\n"),
+            "edited a.rs at line 1; old matched once spaces at line ends were ignored"
+        );
+        assert_eq!(fs::read_to_string(&p).unwrap(), "fn a() {\n    y();\n}\n");
+        f.tools.undo().unwrap();
+        assert_eq!(
+            fs::read_to_string(&p).unwrap(),
+            "fn a() {  \n    x();\t\n}\n"
+        );
+        // Two places read the same: no guess.
+        fs::write(&p, "a \nb\na\t\nb\n").unwrap();
+        assert!(edit("a\nb", "c").starts_with("error"));
+        // Spaces alone are not taken for a blank line.
+        fs::write(&p, "a\n\nb\n").unwrap();
+        assert!(edit("   ", "c").starts_with("error"));
+        // CRLF stays.
+        fs::write(&p, "a  \r\nb\r\n").unwrap();
+        assert!(edit("a\nb", "c\nd").contains("ignored"));
+        assert_eq!(fs::read_to_string(&p).unwrap(), "c\r\nd\r\n");
     }
 
     #[test]
@@ -1223,6 +1402,11 @@ mod tests {
             fs::read_to_string(f.base.join("proj/new/dir/a.txt")).unwrap(),
             "y\nz\n"
         );
+        let args = r#"{"path": "new/dir/a.txt", "content": "w"}"#;
+        let ran = f.tools.run_noting("write", args, &AtomicBool::new(false));
+        assert_eq!(ran.before.as_deref(), Some("y\nz\n"));
+        let ran = f.tools.run_noting("read", args, &AtomicBool::new(false));
+        assert_eq!(ran.before, None);
         assert!(
             run(&f, "write", json!({"path": "secret/x", "content": ""})).contains("no such file")
         );
@@ -1230,7 +1414,7 @@ mod tests {
             run(&f, "write", json!({"path": "../escape", "content": ""})).contains("no such file")
         );
         let journal = fs::read_to_string(f.base.join("journal.jsonl")).unwrap();
-        assert_eq!(journal.lines().count(), 2);
+        assert_eq!(journal.lines().count(), 3);
         let abs = f.base.canonicalize().unwrap().join("proj/abs.txt");
         assert_eq!(
             run(&f, "write", json!({"path": abs, "content": "x"})),

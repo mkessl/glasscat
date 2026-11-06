@@ -66,6 +66,7 @@ impl App {
                 self.look_up_window(arg);
                 self.transcript
                     .push(Block::Info(format!("The model is now {arg}.")));
+                self.check_model(arg);
             }
             "/edit" => self.edit_context(),
             "/settings" => self.edit_settings(),
@@ -77,7 +78,13 @@ impl App {
                         api.api_key.as_deref(),
                         api.proxy.as_deref(),
                     )
-                    .map(|l| crate::models::matching(&l, &filter, 40));
+                    .map(|l| {
+                        // Without the ZDR list, the models are still listed.
+                        let zdr = crate::models::zdr(&api.base_url, api.proxy.as_deref())
+                            .ok()
+                            .flatten();
+                        crate::models::matching(&l, &filter, 40, zdr.as_ref())
+                    });
                     let block = match found {
                         Ok(t) => Block::Info(t),
                         Err(e) => Block::Error(format!("could not list the models: {e}")),
@@ -324,6 +331,12 @@ impl App {
                 let mut text =
                     String::from("Picked up the conversation; it is saved where it was.");
                 if saved.provider == provider {
+                    if saved.model != session.model {
+                        text += &format!(
+                            " It goes on with its model, {}; /model switches.",
+                            saved.model
+                        );
+                    }
                     session.model = saved.model.clone();
                 } else {
                     text += &format!(
@@ -347,6 +360,10 @@ impl App {
                 super::replay(&items, &mut self.transcript);
                 self.transcript.push(Block::Info(text));
                 self.hint_unanswered(false);
+            }
+            "/changes" => {
+                let text = session.tools.changes();
+                self.show(text);
             }
             "/undo" => match session.undo() {
                 Ok(done) => self.transcript.push(Block::Info(done)),
@@ -404,6 +421,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/undo", "undo the agent's last change to a file"),
     (
+        "/changes",
+        "the agent's changes to files in this run, which /undo takes back",
+    ),
+    (
         "/edit",
         "edit the whole context in $EDITOR before the next request",
     ),
@@ -411,7 +432,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/model", "show the model; /model <id> switches to another"),
     (
         "/models",
-        "the provider's models; /models WORDS finds ids with them",
+        "the provider's models; /models WORDS finds ids with them; the word zdr, those run with no data kept",
     ),
     (
         "/set",
@@ -447,7 +468,10 @@ const KEYS: &[(&str, &str)] = &[
     ("Ctrl+C", "stop, clear the input, or quit"),
     ("Ctrl+D", "quit on an empty line"),
     ("Ctrl+T", "the exact context sent to the model"),
-    ("Ctrl+O", "show or fold the model's reasoning"),
+    (
+        "Ctrl+O",
+        "show or fold the model's reasoning and long messages",
+    ),
     (
         "Up, Down",
         "move between lines and through earlier messages",

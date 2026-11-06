@@ -127,6 +127,7 @@ pub fn apply(session: &mut crate::agent::Session, s: &Settings) -> Result<()> {
     let hidden: Vec<PathBuf> = launch.hide.iter().chain(&s.hide).cloned().collect();
     let access = crate::access::Access::new(&cwd, &allowed, &hidden)
         .map_err(|e| format!("a folder to allow: {e}"))?;
+    let builtin = provider.builtin_fields();
     let proxy = launch.proxy.clone().or(provider.proxy);
     if let Some(p) = &proxy {
         crate::openai::parse_proxy(p)?;
@@ -136,6 +137,7 @@ pub fn apply(session: &mut crate::agent::Session, s: &Settings) -> Result<()> {
         .map_err(|e| format!("{}: {e}", path().display()))?;
     session.tools.access = access;
     session.proxy = proxy;
+    session.fields.builtin = builtin;
     session.fields.settings = provider.request;
     session.fields.models = s
         .models

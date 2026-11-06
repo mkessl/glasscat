@@ -17,6 +17,9 @@ pub struct Sent {
     pub served: Option<Served>,
 }
 
+/// A request this soon after the last may find its prompt not yet stored.
+const SOON: Duration = Duration::from_secs(10);
+
 /// Below this many tokens providers do not cache at all.
 const MIN_CACHED: u64 = 1024;
 
@@ -95,10 +98,16 @@ pub fn explain_miss(
             unchanged: false,
         });
     }
+    let why = if gap < SOON {
+        "Some providers take a few seconds to store a prompt, so a request sent right after \
+         another may miss."
+    } else {
+        "The provider no longer had them, or did not look."
+    };
     Some(Miss {
         text: format!(
             "{head}, though the {before} tokens of the last request went again unchanged, {} \
-             after it. The provider no longer had them, or did not look.",
+             after it. {why}",
             span(gap)
         ),
         unchanged: true,
@@ -210,6 +219,19 @@ mod tests {
             "The cache gave back 0 of 5100 tokens, though the 5000 tokens of the last request \
              went again unchanged, 6 minutes after it. The provider no longer had them, or did \
              not look."
+        );
+        let soon = explain_miss(
+            &last,
+            grown.to_string().as_bytes(),
+            &usage(5100, 0),
+            Some(&served("P")),
+            Duration::from_secs(1),
+            false,
+        );
+        assert!(
+            soon.unwrap()
+                .text
+                .ends_with("a request sent right after another may miss.")
         );
         let mut system = grown.clone();
         system["messages"][0]["content"] = json!("t");

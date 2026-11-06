@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use crossterm::style::Color;
 
 use super::screen::Style;
-use super::text::{clip, width};
+use super::text::{clip, clip_start, width};
 use super::transcript::Line;
 use crate::access::{Access, Seen};
 use crate::tools::Tools;
@@ -238,10 +238,13 @@ impl Files {
             if i == self.selected {
                 style.reverse = true;
             }
-            let left = clip(
-                &format!("{}{mark}{name}{slash}", "  ".repeat(row.depth)),
-                w.saturating_sub(width(&tag) + 1),
-            );
+            let room = w.saturating_sub(width(&tag) + 1);
+            let left = if row.depth == 0 {
+                format!("{mark}{}", clip_start(&name, room.saturating_sub(2)))
+            } else {
+                format!("{}{mark}{name}{slash}", "  ".repeat(row.depth))
+            };
+            let left = clip(&left, room);
             let gap = w.saturating_sub(width(&left) + width(&tag));
             out.push(Line::new(format!("{left}{}{tag}", " ".repeat(gap)), style));
         }

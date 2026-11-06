@@ -30,6 +30,10 @@ impl Journal {
         Self::new(data_dir().join("edits").join(name))
     }
 
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     pub fn record(&self, mut entry: Value) -> std::io::Result<()> {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

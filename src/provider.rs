@@ -125,6 +125,21 @@ pub fn find(name: &str, settings: &Settings) -> Result<Provider> {
 }
 
 impl Provider {
+    /// Request fields sent unless the settings change them: OpenRouter
+    /// caches Claude's prompt only when asked to, with `cache_control`;
+    /// it then keeps the cache at the end of each request.
+    pub fn builtin_fields(&self) -> Vec<(String, serde_json::Map<String, serde_json::Value>)> {
+        if !self.base_url.contains("openrouter.ai") {
+            return Vec::new();
+        }
+        let mut cache = serde_json::Map::new();
+        cache.insert(
+            "cache_control".into(),
+            serde_json::json!({"type": "ephemeral"}),
+        );
+        vec![("anthropic/".into(), cache)]
+    }
+
     pub fn api_key(&self) -> Result<Option<String>> {
         let Some(var) = &self.key_env else {
             return Ok(None);
@@ -132,13 +147,23 @@ impl Provider {
         match std::env::var(var) {
             Ok(k) if !k.trim().is_empty() => Ok(Some(k.trim().to_string())),
             _ => {
-                let mut e = format!("{} needs an API key in {var}", self.name);
+                let mut e = format!("{} needs an API key in {var}.", self.name);
                 if let Some(page) = keys_page(&self.name) {
-                    e += &format!("; get one at {page}");
+                    e += &format!("\nGet one at {page}");
+                    if self.name == "openrouter" {
+                        e += "; its free models, the default, need no credit";
+                    }
+                    e += ".";
                 }
-                if self.name == "openrouter" {
-                    e += " (its free models, the default, need no credit)";
-                }
+                let set = if cfg!(windows) {
+                    format!("set {var}=...")
+                } else {
+                    format!("export {var}=...")
+                };
+                e += &format!(
+                    "\nThen: {set}\nOr use a model on this computer, which needs no key: \
+                     --provider ollama, llamacpp or lmstudio."
+                );
                 Err(e.into())
             }
         }

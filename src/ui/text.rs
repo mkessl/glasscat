@@ -21,6 +21,54 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
+/// `wrap` for the agent's own lists: a wrapped line goes on under where
+/// its text began, after its indent and, in a `name   what it does` row,
+/// under the second column.
+pub fn wrap_hanging(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.split('\n') {
+        // As `wrap` sees it, so that its first line is a prefix of this one.
+        let line = &line.trim_end_matches('\r').replace('\t', "    ");
+        let mut pieces = wrap(line, width).into_iter();
+        let first = pieces.next().unwrap_or_default();
+        if pieces.len() == 0 {
+            out.push(first);
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let body = &line[indent..];
+        let digits = body.len() - body.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        // A list item goes on under its text, past "1. " or "- ".
+        let marker = if digits > 0 && body[digits..].starts_with(". ") {
+            Some(indent + digits + 2)
+        } else if body.starts_with("- ") || body.starts_with("• ") {
+            Some(indent + body.chars().next().map_or(0, char::len_utf8) + 1)
+        } else {
+            None
+        };
+        // The last column the first row starts, past a run of spaces, in
+        // the left half of the screen.
+        let fits = |&c: &usize| c < first.len() && self::width(&line[..c]) <= width / 2;
+        let column = body
+            .match_indices("  ")
+            .map(|(i, _)| indent + i)
+            .filter_map(|i| Some(i + line[i..].find(|c| c != ' ')?))
+            .filter(fits)
+            .last()
+            .or(marker.filter(fits));
+        let hang = column.map_or(indent, |c| self::width(&line[..c]));
+        let hang = if hang <= width / 2 { hang } else { 0 };
+        // `wrap` may drop an indent wider than the screen.
+        let end = line.find(first.as_str()).unwrap_or(0) + first.len();
+        let rest = line[end..].trim_start();
+        out.push(first);
+        for piece in wrap(rest, width - hang) {
+            out.push(format!("{}{piece}", " ".repeat(hang)));
+        }
+    }
+    out
+}
+
 /// `wrap` for styled text: each line keeps the styles of its pieces.
 pub fn wrap_spans(spans: &[Span], width: usize) -> Vec<Vec<Span>> {
     let width = width.max(1);
@@ -49,6 +97,7 @@ pub fn wrap_spans(spans: &[Span], width: usize) -> Vec<Vec<Span>> {
 }
 
 fn wrap_para(para: &[(char, Style)], width: usize, lines: &mut Vec<Vec<Span>>) {
+    let start = lines.len();
     let mut line: Vec<(char, Style)> = Vec::new();
     let mut used = 0;
     let mut rest = para;
@@ -68,8 +117,12 @@ fn wrap_para(para: &[(char, Style)], width: usize, lines: &mut Vec<Vec<Span>>) {
             continue;
         }
         if space {
-            lines.push(spans_of(trim_end(std::mem::take(&mut line))));
-            used = 0;
+            // Spaces where a line breaks are dropped, and never make a
+            // line of their own.
+            if used > 0 {
+                lines.push(spans_of(trim_end(std::mem::take(&mut line))));
+                used = 0;
+            }
             continue;
         }
         if used > 0 {
@@ -86,7 +139,9 @@ fn wrap_para(para: &[(char, Style)], width: usize, lines: &mut Vec<Vec<Span>>) {
             used += cw;
         }
     }
-    lines.push(spans_of(line));
+    if !line.is_empty() || lines.len() == start {
+        lines.push(spans_of(line));
+    }
 }
 
 /// Drops the spaces a line ends with where it wraps.
@@ -107,6 +162,17 @@ fn spans_of(chars: Vec<(char, Style)>) -> Vec<Span> {
         }
     }
     out
+}
+
+/// Dollars to four places, or to two significant digits when that would
+/// show a cost as nothing.
+pub fn money(dollars: f64) -> String {
+    if dollars > 0.0 && dollars < 0.000_05 {
+        let places = (-dollars.log10()).ceil() as usize + 1;
+        format!("${dollars:.places$}")
+    } else {
+        format!("${dollars:.4}")
+    }
 }
 
 /// Cuts text to at most `width` columns, ending with … when cut.
@@ -131,6 +197,28 @@ pub fn clip(s: &str, width: usize) -> String {
     out
 }
 
+/// Cuts text to at most `width` columns from the start, beginning with …
+/// when cut: for paths, whose end says the most.
+pub fn clip_start(s: &str, width: usize) -> String {
+    if s.width() <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut used = 1;
+    let mut start = s.len();
+    for (i, c) in s.char_indices().rev() {
+        let cw = c.width().unwrap_or(0);
+        if used + cw > width {
+            break;
+        }
+        used += cw;
+        start = i;
+    }
+    format!("…{}", &s[start..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +233,60 @@ mod tests {
     fn breaks_long_words_and_wide_chars() {
         assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
         assert_eq!(wrap("界界界", 5), ["界界", "界"]);
+    }
+
+    #[test]
+    fn clips_from_either_end() {
+        assert_eq!(clip("/home/me/project", 8), "/home/m…");
+        assert_eq!(clip_start("/home/me/project", 8), "…project");
+        assert_eq!(clip_start("/a/界界", 4), "…界");
+        assert_eq!(clip_start("short", 8), "short");
+        assert_eq!(clip_start("abc", 0), "");
+    }
+
+    #[test]
+    fn hangs_wrapped_lines_under_their_column() {
+        assert_eq!(
+            wrap_hanging(
+                "  /clear   start a new conversation\n  plain words go on and on",
+                24
+            ),
+            [
+                "  /clear   start a new",
+                "           conversation",
+                "  plain words go on and",
+                "  on"
+            ]
+        );
+        assert_eq!(wrap_hanging("short\n\nx", 10), ["short", "", "x"]);
+        assert_eq!(wrap_hanging("abc ", 3), ["abc"]);
+        assert_eq!(
+            wrap_hanging("  12. one two three", 12),
+            ["  12. one", "      two", "      three"]
+        );
+        assert_eq!(wrap_hanging("• one two", 6), ["• one", "  two"]);
+        assert_eq!(
+            wrap_hanging("  a  b   one two three four", 24),
+            ["  a  b   one two three", "         four"]
+        );
+        assert_eq!(
+            wrap_hanging("  a  b   one two three", 16),
+            ["  a  b   one two", "     three"]
+        );
+        assert_eq!(wrap_hanging("  a b", 1), ["a", "b"]);
+        assert_eq!(
+            wrap_hanging("界 \tab cd ef", 14),
+            ["界     ab cd", "       ef"]
+        );
+    }
+
+    #[test]
+    fn money_never_shows_a_cost_as_nothing() {
+        assert_eq!(money(0.0012), "$0.0012");
+        assert_eq!(money(0.000034), "$0.000034");
+        assert_eq!(money(0.0000051), "$0.0000051");
+        assert_eq!(money(0.0), "$0.0000");
+        assert_eq!(money(1.5), "$1.5000");
     }
 
     #[test]

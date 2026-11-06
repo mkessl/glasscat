@@ -45,7 +45,8 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
   limits and overloaded servers, are retried up to three times, in plain view.
 - **File tools**: read, list, find, search, write, edit and delete. Several reads run at the
   same time, and search walks the tree on every core. Edits and overwrites keep a file's line
-  endings and byte order mark, and each edit shows the lines it took out and put in.
+  endings and byte order mark. Each edit or overwrite shows the lines it took out and put
+  in, and a new file shows its first lines.
 - **Tools of your own.** Give the model any program to run, such as your build or tests,
   with its arguments put into the command line and no shell in between
   ([how](#tools-of-your-own)).
@@ -97,8 +98,8 @@ glasscat "what does src/main.rs do?"      # one answer, printed to stdout
 glasscat -c                               # pick up the last conversation held here
 ```
 
-With a prompt, the answer goes to stdout; tool calls, retries and the cost of the run go to
-stderr.
+With a prompt, the answer goes to stdout; tool calls, the lines each change took out and
+put in, retries and the cost of the run go to stderr.
 
 | Option | Meaning |
 | --- | --- |
@@ -121,13 +122,14 @@ Inside a session:
 | <kbd>Tab</kbd> | complete a command; typing `/` lists them |
 | <kbd>Esc</kbd> | stop the reply |
 | <kbd>Ctrl</kbd>+<kbd>T</kbd> | the exact context sent to the model |
-| <kbd>Ctrl</kbd>+<kbd>O</kbd> | show or fold reasoning |
+| <kbd>Ctrl</kbd>+<kbd>O</kbd> | show or fold reasoning and long pasted messages |
 | <kbd>Shift</kbd>+drag | select text (in most terminals) |
 | `/model <id>` | switch the model |
 | `/resume` | earlier conversations held in this directory; `/resume N` picks one up |
 | `/retry` | drop the last answer and ask again, say after switching the model |
-| `/models <words>` | find models by id, with context window and price |
+| `/models <words>` | find models by id, with context window and price; on OpenRouter, `ZDR` marks those a provider keeping no data runs, and the word `zdr` keeps to them |
 | `/undo` | undo the agent's last file change |
+| `/changes` | the agent's file changes in this session, which `/undo` takes back in turn |
 | `/access` | a tree of what the model may see, to hide or show paths; or `hide`, `show`, `allow` PATH |
 | `/tools` | the model's tools: which only read, and what your own ones run |
 | `/report` | open the model's last report about a glasscat fault as a new issue |
@@ -162,6 +164,10 @@ a free OpenRouter key. Free models may keep what you send, or train on it; `/pro
 what the provider of each reply publishes about that. To have OpenRouter use only providers
 that keep nothing, put `"request": {"provider": {"zdr": true}}` in the settings, with a
 model that such providers serve.
+
+OpenRouter caches the prompt of Claude models only when the request asks for it, so for
+`anthropic/` models glasscat adds `"cache_control": {"type": "ephemeral"}`. `/set` lists it
+with the other request fields; `/set cache_control null` leaves it out.
 
 ## Settings
 
@@ -258,7 +264,7 @@ it changes: it does exactly what the program does.
 | Which model and provider ran each reply | status bar, when a router such as OpenRouter says |
 | That provider's quantization, data retention, location and privacy policy | `/provider` (OpenRouter) |
 | The model's reasoning | as it streams; <kbd>Ctrl</kbd>+<kbd>O</kbd> afterwards |
-| Every file change, old and new text | under the edit, lines taken out and put in; in full in `~/.local/share/glasscat/edits/` |
+| Every file change, old and new text | under the edit or write, lines taken out and put in; `/changes` lists them; in full in `~/.local/share/glasscat/edits/` |
 | Every conversation | `~/.local/share/glasscat/conversations/` |
 | Reports the model wrote about faults of glasscat | `~/.local/share/glasscat/reports/` |
 

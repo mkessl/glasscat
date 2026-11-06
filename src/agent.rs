@@ -67,6 +67,8 @@ pub enum Shown<'a> {
         /// paths, paths outside the allowed folders), or where a report
         /// was saved.
         note: Option<&'a str>,
+        /// A file's text before the tool overwrote it.
+        before: Option<&'a str>,
     },
 }
 
@@ -328,16 +330,17 @@ impl Session {
                 return Ok(());
             }
             let results = self.run_calls(&calls, cancel);
-            for (call, (result, note)) in calls.into_iter().zip(results) {
+            for (call, ran) in calls.into_iter().zip(results) {
                 on(Shown::ToolDone {
                     name: &call.name,
                     args: &call.args,
-                    result: &result,
-                    note: note.as_deref(),
+                    result: &ran.result,
+                    note: ran.note.as_deref(),
+                    before: ran.before.as_deref(),
                 });
                 self.items.push(Item::ToolResult {
                     call_id: call.id,
-                    content: result,
+                    content: ran.result,
                 });
             }
         }
@@ -348,7 +351,7 @@ impl Session {
         &self,
         calls: &[crate::context::ToolCall],
         cancel: &AtomicBool,
-    ) -> Vec<(String, Option<String>)> {
+    ) -> Vec<crate::tools::Ran> {
         let tools = &self.tools;
         if calls.len() > 1 && calls.iter().all(|c| tools.reads_only(&c.name)) {
             std::thread::scope(|s| {
@@ -359,8 +362,11 @@ impl Session {
                 handles
                     .into_iter()
                     .map(|h| {
-                        h.join()
-                            .unwrap_or_else(|_| ("error: the tool crashed".into(), None))
+                        h.join().unwrap_or_else(|_| crate::tools::Ran {
+                            result: "error: the tool crashed".into(),
+                            note: None,
+                            before: None,
+                        })
                     })
                     .collect()
             })
@@ -393,6 +399,9 @@ fn sleep_unless_cancelled(wait: Duration, cancel: &AtomicBool) -> bool {
 /// Request fields in layers; a later layer wins.
 #[derive(Debug, Default)]
 pub struct Fields {
+    /// Built in for the provider: fields for the models whose id starts
+    /// with the given text.
+    pub builtin: Vec<(String, Map)>,
     /// From the settings: the general ones, then the provider's.
     pub settings: Map,
     /// From the settings, by model id.
@@ -405,11 +414,17 @@ impl Fields {
     /// Each field sent with `model`, and which layer it comes from.
     pub fn sources(&self, model: &str) -> Vec<(&str, &serde_json::Value, &'static str)> {
         let mut out: Vec<(&str, &serde_json::Value, &'static str)> = Vec::new();
-        let layers = [
+        let id = model.trim_start_matches('~');
+        let builtin = self
+            .builtin
+            .iter()
+            .filter(|(start, _)| id.starts_with(start.as_str()))
+            .map(|(_, m)| (Some(m), "the default for this model"));
+        let layers = builtin.chain([
             (Some(&self.settings), "settings"),
             (self.models.get(model), "settings for this model"),
             (Some(&self.session), "this session"),
-        ];
+        ]);
         for (layer, from) in layers {
             for (k, v) in layer.into_iter().flatten() {
                 match out.iter_mut().find(|f| f.0 == k) {
@@ -436,7 +451,8 @@ The user owns you and can see everything you are given, this text included; \
 answer questions about yourself plainly. \
 You may call several tools in one reply; those that only read run at the same time. \
 You can run only what your tools offer; the built-in ones work on files, and cannot run \
-programs, builds or tests. Say what is unchecked instead of claiming it works.\n\
+programs, builds or tests; a script you write is not run. Say what is unchecked instead of \
+claiming it works.\n\
 Working directory: {cwd}\n\
 System: {os}\n\
 Date (UTC): {date}",
@@ -726,6 +742,15 @@ mod tests {
             ]
         );
         assert_eq!(f.for_model("other")["temperature"], 0.6);
+        f.builtin = vec![(
+            "anthropic/".into(),
+            map(serde_json::json!({"cache_control": 1})),
+        )];
+        assert_eq!(f.for_model("~anthropic/c")["cache_control"], 1);
+        assert!(f.for_model("r1").get("cache_control").is_none());
+        f.session
+            .insert("cache_control".into(), serde_json::Value::Null);
+        assert!(f.for_model("anthropic/c")["cache_control"].is_null());
     }
 
     fn session(url: String, prefill: Prefill) -> (Session, std::path::PathBuf) {

@@ -19,21 +19,21 @@ pub fn lines(body: &[u8], raw: bool, width: usize, sent: bool) -> Vec<Line> {
         add("Nothing has been sent yet.".into(), Style::dim());
         return out;
     }
-    add(
-        format!(
-            "{}: {} · about {} tokens (bytes / 4) · {} for {}",
-            if sent {
-                "Exact request"
-            } else {
-                "Not sent yet, the next request so far"
-            },
-            bytes(body.len()),
-            body.len() / 4,
-            if raw { "raw bytes" } else { "parts" },
-            if raw { "parts: r" } else { "raw bytes: r" },
-        ),
-        Style::dim(),
+    let head = format!(
+        "{}: {} · about {} tokens (bytes / 4) · {} for {}",
+        if sent {
+            "Exact request"
+        } else {
+            "Not sent yet, the next request so far"
+        },
+        bytes(body.len()),
+        body.len() / 4,
+        if raw { "raw bytes" } else { "parts" },
+        if raw { "parts: r" } else { "raw bytes: r" },
     );
+    for l in wrap(&head, width) {
+        add(l, Style::dim());
+    }
     add(String::new(), Style::default());
     let text = String::from_utf8_lossy(body);
     if raw {
@@ -167,6 +167,6 @@ mod tests {
             .into_iter()
             .map(|l| l.text())
             .collect();
-        assert_eq!(text[2], "{\"a\":1}");
+        assert_eq!(text.last().unwrap(), "{\"a\":1}");
     }
 }

@@ -10,7 +10,8 @@ mod screen;
 mod text;
 mod transcript;
 
-pub use transcript::outcome;
+pub use text::money;
+pub use transcript::{change, outcome, summary};
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -72,6 +73,7 @@ enum AgentMsg {
         args: String,
         result: String,
         note: Option<String>,
+        before: Option<String>,
     },
     Usage(Value),
     Served(Served),
@@ -200,6 +202,7 @@ pub fn run(session: Session) -> Result<()> {
     };
     let model = app.model.clone();
     app.look_up_window(&model);
+    app.check_model(&model);
     let (dir, tx) = (
         app.session.as_ref().map(|s| s.tools.cwd().to_path_buf()),
         app.tx.clone(),
@@ -219,7 +222,18 @@ pub fn run(session: Session) -> Result<()> {
         replay(items, &mut app.transcript);
         app.hint_unanswered(false);
     }
-    app.event_loop(rx)
+    let r = app.event_loop(rx);
+    drop(term);
+    // Left in the terminal: how to go on, and what it cost.
+    if app.transcript.has_user_message() {
+        println!("{} -c picks this conversation up again.", crate::NAME);
+        let (cost, n) = app.spent;
+        if n > 0 {
+            let s = if n == 1 { "" } else { "s" };
+            println!("cost {} for {n} request{s}", text::money(cost));
+        }
+    }
+    r
 }
 
 impl App {
@@ -316,10 +330,22 @@ impl App {
                 self.session = Some(session);
                 self.busy = None;
                 let cancelled = self.cancel.swap(false, Ordering::Relaxed);
+                let long = err.as_deref().is_some_and(too_long);
                 if let Some(e) = err {
                     self.transcript.push(Block::Error(e));
+                    if long {
+                        self.transcript.push(Block::Info(
+                            "The conversation is longer than the model takes. /edit can cut \
+                             it down; /model switches to one with a larger window; /clear \
+                             starts anew."
+                                .into(),
+                        ));
+                    }
                 }
-                self.hint_unanswered(cancelled);
+                // Asking again would fail the same way.
+                if !long {
+                    self.hint_unanswered(cancelled);
+                }
             }
         }
     }
@@ -348,6 +374,29 @@ impl App {
 
     /// Asks the provider for the context window of `model` on a thread,
     /// unless that model's is known or on its way.
+    /// Warns when OpenRouter, whose list holds every id it takes, routers
+    /// too, has no such model.
+    fn check_model(&self, id: &str) {
+        if !self.api.base_url.contains("openrouter.ai") {
+            return;
+        }
+        let (api, id, tx) = (self.api.clone(), id.to_string(), self.tx.clone());
+        std::thread::spawn(move || {
+            let Ok(list) = crate::models::list(&api.base_url, None, api.proxy.as_deref()) else {
+                return;
+            };
+            let known = list["data"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|m| m["id"] == id.as_str()));
+            if !known {
+                let _ = tx.send(Msg::Block(Block::Error(format!(
+                    "OpenRouter has no model {id}, so the next request will fail; \
+                     /models WORDS finds ids."
+                ))));
+            }
+        });
+    }
+
     fn look_up_window(&mut self, model: &str) {
         if self.window.as_ref().is_some_and(|w| w.0 == model) {
             return;
@@ -518,9 +567,15 @@ impl App {
                 args,
                 result,
                 note,
+                before,
             } => {
                 let report = name == crate::report::TOOL;
-                self.transcript.push(Block::Tool { name, args, result });
+                self.transcript.push(Block::Tool {
+                    name,
+                    args,
+                    result,
+                    before,
+                });
                 if let Some(mut n) = note {
                     if report {
                         n += " /report opens it as a new issue on the project's page, for you to send.";
@@ -609,7 +664,9 @@ impl App {
             self.input.clear();
             None
         } else {
+            // Blank lines around a pasted message are left out.
             let p = self.input.take();
+            let p = p.trim_end().trim_start_matches(['\n', '\r']).to_string();
             self.transcript.push(Block::User(p.clone()));
             Some(p)
         };
@@ -649,11 +706,13 @@ impl App {
                     args,
                     result,
                     note,
+                    before,
                 } => send(AgentMsg::Tool {
                     name: name.into(),
                     args: args.into(),
                     result: result.into(),
                     note: note.map(Into::into),
+                    before: before.map(Into::into),
                 }),
             };
             let r = match prompt {
@@ -863,7 +922,7 @@ impl App {
 
         // What a command shows, over the bottom of the chat.
         if let Some((text, scroll)) = &mut self.panel {
-            let lines = text::wrap(text, (w as usize).saturating_sub(2).max(1));
+            let lines = text::wrap_hanging(text, (w as usize).saturating_sub(2).max(1));
             let room = (sep_y as usize).saturating_sub(1);
             let shown = lines.len().min(room);
             *scroll = (*scroll).min(lines.len() - shown);
@@ -906,6 +965,18 @@ impl App {
         let x = self.screen.put(0, sep_y, w, &sep, Style::dim());
         self.screen
             .put(x, sep_y, w, &"─".repeat(w as usize), Style::dim());
+        // A message taller than its box says how much of it is out of view.
+        if rows.len() > shown {
+            let lines = self.input.text().split('\n').count();
+            let size = match lines {
+                1 => format!(" message: {} rows ──", rows.len()),
+                n => format!(" message: {n} lines ──"),
+            };
+            let sw = text::width(&size) as u16;
+            if x + sw + 2 <= w {
+                self.screen.put(w - sw, sep_y, w, &size, Style::dim());
+            }
+        }
 
         // Input.
         let prompt_style = Style::fg(Color::Cyan).bold();
@@ -1066,6 +1137,7 @@ fn replay(items: &[Item], t: &mut Transcript) {
                         name: c.name.clone(),
                         args: c.args.clone(),
                         result: results.get(c.id.as_str()).unwrap_or(&"").to_string(),
+                        before: None,
                     });
                 }
             }
@@ -1121,8 +1193,12 @@ fn usage_text(u: Option<&Value>, window: Option<u64>, spent: Option<f64>) -> Str
     }
     if let Some(cost) = u.get("cost").and_then(Value::as_f64) {
         match spent {
-            Some(all) => parts.push(format!("${cost:.4} (${all:.4} in all)")),
-            None => parts.push(format!("${cost:.4}")),
+            Some(all) => parts.push(format!(
+                "{} ({} in all)",
+                text::money(cost),
+                text::money(all)
+            )),
+            None => parts.push(text::money(cost)),
         }
     }
     if parts.is_empty() {
@@ -1214,10 +1290,41 @@ fn restore(keyboard: bool) {
     let _ = terminal::disable_raw_mode();
 }
 
+/// Whether a provider's error says the request is longer than the
+/// model's context window; each words it its own way.
+fn too_long(error: &str) -> bool {
+    let e = error.to_lowercase();
+    [
+        "context length",
+        "context_length",
+        "context window",
+        "maximum context",
+        "prompt is too long",
+        "too many tokens",
+        "context size",
+        "input token count",
+    ]
+    .iter()
+    .any(|w| e.contains(w))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn knows_a_request_too_long_for_the_model() {
+        for e in [
+            "HTTP 400: This endpoint's maximum context length is 131072 tokens.",
+            "prompt is too long: 210000 tokens > 200000 maximum",
+            "the request exceeds the available context size, try increasing it",
+            "The input token count (1200000) exceeds the maximum number of tokens allowed",
+        ] {
+            assert!(too_long(e), "{e}");
+        }
+        assert!(!too_long("HTTP 429: Rate limit reached for tokens per min"));
+    }
 
     #[test]
     fn usage_line() {

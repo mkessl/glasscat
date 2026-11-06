@@ -174,6 +174,7 @@ fn run() -> Result<()> {
     };
 
     let show_request = args.show_request;
+    let cwd = session.tools.cwd().display().to_string();
     let mut out = std::io::stdout().lock();
     let mut write_err = None;
     let mut at_line_start = true;
@@ -201,6 +202,7 @@ fn run() -> Result<()> {
                 args,
                 result,
                 note,
+                before,
             } => {
                 fresh = true;
                 if !at_line_start {
@@ -210,7 +212,13 @@ fn run() -> Result<()> {
                 let failed = result.starts_with("error:");
                 let outcome = ui::outcome(name, result, failed);
                 let note = note.map(|n| format!("\n  {n}")).unwrap_or_default();
-                writeln!(std::io::stderr(), "› {name} {args}\n  {outcome}{note}")
+                let mut shown = format!("› {name} {}\n  {outcome}", ui::summary(args, &cwd));
+                if !failed {
+                    for (line, _) in ui::change(name, args, result, before) {
+                        shown += &format!("\n{line}");
+                    }
+                }
+                writeln!(std::io::stderr(), "{shown}{note}")
             }
             agent::Shown::Usage(u) => {
                 if let Some(c) = u.get("cost").and_then(serde_json::Value::as_f64) {
@@ -234,7 +242,7 @@ fn run() -> Result<()> {
     }
     if spent.1 > 0 {
         let s = if spent.1 == 1 { "" } else { "s" };
-        eprintln!("cost ${:.4} for {} request{s}", spent.0, spent.1);
+        eprintln!("cost {} for {} request{s}", ui::money(spent.0), spent.1);
     }
     turn?;
     if let Some(e) = write_err {

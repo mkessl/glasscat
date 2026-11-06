@@ -193,7 +193,8 @@ impl Input {
         self.goal = None;
     }
 
-    /// The text cut into rows of at most `width` columns.
+    /// The text cut into rows of at most `width` columns, after a space
+    /// where there is one, else inside a word too long for a row.
     pub fn rows(&self, width: usize) -> Vec<Row> {
         let width = width.max(1);
         let mut rows = Vec::new();
@@ -201,17 +202,27 @@ impl Input {
         for line in self.text.split('\n') {
             let mut start = line_start;
             let mut used = 0;
+            // Just after the row's last space, and the columns since.
+            let mut space: Option<(usize, usize)> = None;
             for (i, c) in line.char_indices() {
                 let w = c.width().unwrap_or(0);
                 if used + w > width {
-                    rows.push(Row {
-                        start,
-                        end: line_start + i,
-                    });
-                    start = line_start + i;
-                    used = 0;
+                    let at = line_start + i;
+                    let (end, since) = match space {
+                        Some((after, since)) if c != ' ' => (after, since),
+                        _ => (at, 0),
+                    };
+                    rows.push(Row { start, end });
+                    start = end;
+                    used = since;
+                    space = None;
                 }
                 used += w;
+                match (c, &mut space) {
+                    (' ', _) => space = Some((line_start + i + 1, 0)),
+                    (_, Some((_, since))) => *since += w,
+                    _ => {}
+                }
             }
             let end = line_start + line.len();
             rows.push(Row { start, end });
@@ -292,6 +303,19 @@ mod tests {
             .map(|r| &i.text()[r.start..r.end])
             .collect();
         assert_eq!(rows, ["abcd", "ef", "gh"]);
+        let rows_of = |text: &str, w: usize| -> Vec<String> {
+            let i = with(text);
+            i.rows(w)
+                .iter()
+                .map(|r| i.text()[r.start..r.end].to_string())
+                .collect()
+        };
+        assert_eq!(rows_of("aaa bbb ccc", 5), ["aaa ", "bbb ", "ccc"]);
+        assert_eq!(rows_of("aaaa bb", 4), ["aaaa", " bb"]);
+        assert_eq!(rows_of("a bcdefgh", 4), ["a ", "bcde", "fgh"]);
+        assert_eq!(rows_of("界 界界", 4), ["界 ", "界界", ""]);
+        let i = with("aaa bbb");
+        assert_eq!(i.cursor(5), (3, 1));
     }
 
     #[test]

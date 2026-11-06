@@ -1,7 +1,7 @@
 //! What a provider's model list says about a model: for now, its context
 //! window. OpenAI-compatible servers name that field differently.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -31,8 +31,30 @@ pub fn context_window(
 
 /// The provider's `/models` list, fetched once per run.
 pub fn list(base_url: &str, api_key: Option<&str>, proxy: Option<&str>) -> Result<Arc<Value>> {
-    static LISTS: Mutex<Option<HashMap<String, Arc<Value>>>> = Mutex::new(None);
     let url = format!("{}/models", base_url.trim_end_matches('/'));
+    once(url, api_key, proxy)
+}
+
+/// The ids of the models that OpenRouter can run on a provider that keeps
+/// no data (zero data retention); None from other providers.
+pub fn zdr(base_url: &str, proxy: Option<&str>) -> Result<Option<HashSet<String>>> {
+    if !base_url.contains("openrouter.ai") {
+        return Ok(None);
+    }
+    let url = format!("{}/endpoints/zdr", base_url.trim_end_matches('/'));
+    let list = once(url, None, proxy)?;
+    let ids = list["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e["model_id"].as_str().map(String::from))
+        .collect();
+    Ok(Some(ids))
+}
+
+/// A JSON answer from `url`, fetched once per run.
+fn once(url: String, api_key: Option<&str>, proxy: Option<&str>) -> Result<Arc<Value>> {
+    static LISTS: Mutex<Option<HashMap<String, Arc<Value>>>> = Mutex::new(None);
     let cached = LISTS
         .lock()
         .unwrap()
@@ -70,8 +92,9 @@ pub fn short(n: u64) -> String {
 
 /// The models whose id contains every word of `filter`, one per line with
 /// the context window and price where the list gives them; at most `max`.
-pub fn matching(list: &Value, filter: &str, max: usize) -> String {
+pub fn matching(list: &Value, filter: &str, max: usize, zdr: Option<&HashSet<String>>) -> String {
     let words: Vec<String> = filter.split_whitespace().map(str::to_lowercase).collect();
+    let is_zdr = |m: &Value| zdr.is_some_and(|z| z.contains(m["id"].as_str().unwrap_or_default()));
     let mut found: Vec<&Value> = list["data"]
         .as_array()
         .map(|a| a.iter())
@@ -79,7 +102,10 @@ pub fn matching(list: &Value, filter: &str, max: usize) -> String {
         .flatten()
         .filter(|m| {
             let id = m["id"].as_str().unwrap_or_default().to_lowercase();
-            words.iter().all(|w| id.contains(w.as_str()))
+            // The word zdr keeps to the models a no-data provider runs.
+            words
+                .iter()
+                .all(|w| id.contains(w.as_str()) || (w == "zdr" && zdr.is_some() && is_zdr(m)))
         })
         .collect();
     found.sort_by_key(|m| m["id"].as_str().unwrap_or_default().to_string());
@@ -102,6 +128,9 @@ pub fn matching(list: &Value, filter: &str, max: usize) -> String {
                 (Some(i), Some(o)) if i == 0.0 && o == 0.0 => line += " · free",
                 (Some(i), Some(o)) => line += &format!(" · ${i:.2} in, ${o:.2} out per M"),
                 _ => {}
+            }
+            if is_zdr(m) {
+                line += " · ZDR";
             }
             line
         })
@@ -135,15 +164,25 @@ mod tests {
             {"id": "a/small"},
         ]});
         assert_eq!(
-            matching(&list, "a/", 5),
+            matching(&list, "a/", 5, None),
             "a/big · 200k · $3.00 in, $15.00 out per M\na/small"
         );
-        assert_eq!(matching(&list, "FREE one", 5), "z/free-one · 32k · free");
         assert_eq!(
-            matching(&list, "", 1),
+            matching(&list, "FREE one", 5, None),
+            "z/free-one · 32k · free"
+        );
+        assert_eq!(
+            matching(&list, "", 1, None),
             "a/big · 200k · $3.00 in, $15.00 out per M\nand 2 more; add words to narrow it down."
         );
-        assert!(matching(&list, "nope", 5).starts_with("No model"));
+        assert!(matching(&list, "nope", 5, None).starts_with("No model"));
+        let zdr: HashSet<String> = ["a/small".to_string()].into();
+        assert_eq!(matching(&list, "zdr", 5, Some(&zdr)), "a/small · ZDR");
+        assert_eq!(
+            matching(&list, "a/", 5, Some(&zdr)),
+            "a/big · 200k · $3.00 in, $15.00 out per M\na/small · ZDR"
+        );
+        assert!(matching(&list, "zdr", 5, None).starts_with("No model"));
     }
 
     #[test]
