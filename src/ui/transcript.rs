@@ -36,7 +36,6 @@ impl Line {
         }
     }
 
-    #[cfg(test)]
     pub fn text(&self) -> String {
         self.spans.iter().map(|(t, _)| t.as_str()).collect()
     }

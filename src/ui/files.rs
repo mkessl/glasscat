@@ -214,7 +214,7 @@ impl Files {
                 _ => "  ",
             };
             let name = if row.depth == 0 {
-                row.path.display().to_string()
+                crate::access::shown(&row.path)
             } else {
                 row.path
                     .file_name()
@@ -294,7 +294,7 @@ mod tests {
         };
         let t = text(&mut f, &access);
         assert_eq!(t[1], "Nothing is hidden.");
-        assert!(t[3].starts_with("▾ /"), "{t:?}");
+        assert!(t[3].starts_with("▾ "), "{t:?}");
         assert_eq!(&t[4..], ["  ▸ src/", "    .env"]);
         f.down(1);
         f.right();

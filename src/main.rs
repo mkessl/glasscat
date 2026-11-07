@@ -1,12 +1,16 @@
 mod access;
 mod agent;
+mod auth;
 mod cache;
+mod compact;
 mod context;
 mod custom;
 mod history;
 mod image;
 mod journal;
+mod login;
 mod models;
+mod oauth;
 mod openai;
 mod policy;
 mod provider;
@@ -28,10 +32,14 @@ pub type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::
 pub const NAME: &str = env!("CARGO_BIN_NAME");
 
 const USAGE: &str = "usage: NAME [OPTIONS] [PROMPT...]
+       NAME login [PROVIDER]
+       NAME logout [PROVIDER]
 
 Without PROMPT, opens the full-screen interface. With PROMPT, gives it to
 the model, lets it work with its tools in the current directory, and
-streams the answer to stdout; tool calls go to stderr.
+streams the answer to stdout; tool calls go to stderr. login signs in to
+a provider (OpenRouter through the browser, others with a pasted key or
+one piped in); logout removes the stored key.
 
   -c, --continue    pick up the last conversation held in this directory
   --provider NAME   one of: PROVIDERS (default: openrouter)
@@ -105,11 +113,16 @@ fn parse_args() -> Result<Args> {
 fn usage() -> String {
     let names: Vec<&str> = provider::PRESETS.iter().map(|p| p.name).collect();
     USAGE
-        .replace("NAME [", &format!("{NAME} ["))
+        .replace("usage: NAME", &format!("usage: {NAME}"))
+        .replace("       NAME", &format!("       {NAME}"))
         .replace("PROVIDERS", &names.join(", "))
 }
 
 fn run() -> Result<()> {
+    let mut raw = std::env::args().skip(1);
+    if let Some(cmd @ ("login" | "logout")) = raw.next().as_deref() {
+        return login::run(cmd == "logout", raw.next());
+    }
     let args = parse_args()?;
     let settings = settings::load()?;
     let instruction_files = settings.instruction_files();
@@ -127,7 +140,7 @@ fn run() -> Result<()> {
         .or_else(|| settings.provider.clone())
         .unwrap_or_else(|| "openrouter".into());
     let provider = provider::find(&name, &settings)?;
-    let key = provider.api_key()?;
+    let key = provider.api_key();
     let model = args
         .model
         .or_else(|| {
@@ -148,6 +161,7 @@ fn run() -> Result<()> {
     let access = access::Access::new(&cwd, std::slice::from_ref(&cwd), &[])?;
     let tools = tools::Tools::new(access, journal::Journal::for_session());
     let mut session = agent::Session::new(provider.base_url, model, key, provider.prefill, tools);
+    session.key_env = provider.key_env.clone();
     session.launch = settings::Launch {
         provider: name.clone(),
         allow: args.allow,
@@ -173,6 +187,9 @@ fn run() -> Result<()> {
         }
         return ui::run(session);
     };
+    if let (None, Some(var)) = (&session.api_key, &session.key_env) {
+        return Err(provider::no_key(&session.launch.provider, var).into());
+    }
 
     let show_request = args.show_request;
     let cwd = session.tools.cwd().display().to_string();
@@ -244,6 +261,17 @@ fn run() -> Result<()> {
                 std::io::stderr(),
                 "{error}\ntrying again in {}s",
                 wait.as_secs()
+            ),
+            agent::Shown::Cleared { results, saved } => writeln!(
+                std::io::stderr(),
+                "cleared {results} old tool results, about {} tokens, to make room",
+                models::short(saved)
+            ),
+            agent::Shown::Compacted { before, after, .. } => writeln!(
+                std::io::stderr(),
+                "compacted the context from about {} to {} tokens",
+                models::short(before),
+                models::short(after)
             ),
             _ => Ok(()),
         };

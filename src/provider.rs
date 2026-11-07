@@ -140,38 +140,38 @@ impl Provider {
         vec![("anthropic/".into(), cache)]
     }
 
-    pub fn api_key(&self) -> Result<Option<String>> {
-        let Some(var) = &self.key_env else {
-            return Ok(None);
-        };
+    /// The key: the environment variable if set, else the stored login.
+    /// `None` also for a provider that needs none.
+    pub fn api_key(&self) -> Option<String> {
+        let var = self.key_env.as_ref()?;
         match std::env::var(var) {
-            Ok(k) if !k.trim().is_empty() => Ok(Some(k.trim().to_string())),
-            _ => {
-                let mut e = format!("{} needs an API key in {var}.", self.name);
-                if let Some(page) = keys_page(&self.name) {
-                    e += &format!("\nGet one at {page}");
-                    if self.name == "openrouter" {
-                        e += "; its free models, the default, need no credit";
-                    }
-                    e += ".";
-                }
-                let set = if cfg!(windows) {
-                    format!("set {var}=...")
-                } else {
-                    format!("export {var}=...")
-                };
-                e += &format!(
-                    "\nThen: {set}\nOr use a model on this computer, which needs no key: \
-                     --provider ollama, llamacpp or lmstudio."
-                );
-                Err(e.into())
-            }
+            Ok(k) if !k.trim().is_empty() => Some(k.trim().to_string()),
+            _ => crate::auth::key(&self.name),
         }
     }
 }
 
+/// What to do when `provider` has no key.
+pub fn no_key(provider: &str, var: &str) -> String {
+    let mut e = format!(
+        "Not signed in to {provider}: run {} login {provider}",
+        crate::NAME
+    );
+    if let Some(page) = keys_page(provider) {
+        e += &format!(". Keys are at {page}");
+        if provider == "openrouter" {
+            e += "; its free models need no credit";
+        }
+    }
+    e += &format!(
+        ". {var} overrides the stored key. A model on this computer needs no key: \
+         --provider ollama, llamacpp or lmstudio."
+    );
+    e
+}
+
 /// Where a preset provider hands out API keys.
-fn keys_page(provider: &str) -> Option<&'static str> {
+pub fn keys_page(provider: &str) -> Option<&'static str> {
     Some(match provider {
         "openrouter" => "https://openrouter.ai/keys",
         "groq" => "https://console.groq.com/keys",

@@ -35,7 +35,7 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
 - **Full-screen terminal interface** with its own renderer: only changed cells are redrawn,
   and frames are synchronized, so nothing flickers.
 - **The exact context, live.** <kbd>Ctrl</kbd>+<kbd>T</kbd> shows the last request the model
-  got, either split into labelled parts with their sizes or as the raw bytes.
+  got, either split into labelled parts with their sizes or as the raw bytes; `/` finds text in it.
 - **Edit the context by hand.** `/edit` opens the whole conversation in your editor as plain
   text: the system prompt, every message, tool call and result. What you save is what the
   model gets next.
@@ -95,11 +95,17 @@ This puts `glasscat` in `~/.cargo/bin`. To build without installing, run
 ## Use
 
 ```sh
-export OPENROUTER_API_KEY=sk-or-...
+glasscat login                            # sign in to OpenRouter in the browser
 glasscat                                  # full-screen session in this directory
 glasscat "what does src/main.rs do?"      # one answer, printed to stdout
 glasscat -c                               # pick up the last conversation held here
 ```
+
+`glasscat login <provider>` signs in elsewhere: other providers take a pasted key, or one
+piped in. Keys are kept in one file only you can read (`~/.local/share/glasscat/auth.json`;
+`%LOCALAPPDATA%\glasscat` on Windows); `glasscat logout` removes it. A key variable such
+as `OPENROUTER_API_KEY` overrides the stored key. Over SSH, the OpenRouter page shows a code
+to paste instead.
 
 With a prompt, the answer goes to stdout; tool calls, the lines each change took out and
 put in, retries and the cost of the run go to stderr.
@@ -143,8 +149,17 @@ Inside a session:
 | `/set <name> <value>` | set a request field for this session, such as `temperature 0.3`; `/set` lists them |
 | `/provider` | who ran the last reply, and what they publish about your data |
 | `/usage` | each request of this run: tokens in, from the cache and out, cost, time to the first token and in all, speed, and who ran it |
+| `/login`, `/logout` | sign in to the provider, or remove its stored key |
+| `/compact` | make the context shorter now: the older part becomes a summary |
 | `/clear` | start a new conversation |
 | `/help` | all commands and keys |
+
+A long conversation keeps fitting the model's window on its own. From half the window, old
+tool results the model can fetch again are cleared, when that frees a tenth of it. From 70%
+the model writes a summary of the older part on the side, on the same cached prompt, so
+nobody waits for it; at 85%, or when the provider says the context is too long, it takes the
+older part's place. Your own messages stay word for word next to it, and the whole
+conversation before is kept next to the saved one.
 
 What a command only shows, such as `/help` or `/tools`, opens over the chat; <kbd>Esc</kbd>
 closes it and leaves the chat where you had scrolled it.
@@ -153,7 +168,7 @@ closes it and leaves the chat where you had scrolled it.
 
 Any server that speaks the OpenAI chat completions API works. These are built in:
 
-| `--provider` | Key variable | Continues a cut-off reply |
+| `--provider` | Key variable (overrides `login`) | Continues a cut-off reply |
 | --- | --- | :---: |
 | `openrouter` | `OPENROUTER_API_KEY` | ✓ (depends on the model) |
 | `groq` | `GROQ_API_KEY` | ✓ |

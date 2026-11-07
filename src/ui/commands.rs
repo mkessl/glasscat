@@ -1,6 +1,8 @@
 //! The slash commands of the full-screen interface, and its help.
 
 use std::io::{self, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
 
@@ -148,19 +150,38 @@ impl App {
                         .push(Block::Error("There is no reply to copy yet.".into()));
                     return;
                 };
-                // OSC 52: the terminal puts the text on the clipboard, also over SSH.
-                let mut out = io::stdout();
-                let _ = write!(
-                    out,
-                    "\x1b]52;c;{}\x07",
-                    crate::image::base64(text.as_bytes())
-                );
-                let _ = out.flush();
+                clipboard(text);
                 self.transcript.push(Block::Info(format!(
                     "Copied the last reply ({} characters) to the clipboard, if the terminal \
                      allows it. In tmux that needs set-clipboard on.",
                     text.chars().count()
                 )));
+            }
+            "/login" => self.login(),
+            "/compact" => {
+                self.transcript.push(Block::Info(
+                    "Compacting: the model summarises the older part of the conversation…".into(),
+                ));
+                self.work(super::Work::Compact);
+            }
+            "/logout" => {
+                let name = session.launch.provider.clone();
+                let text = match crate::auth::remove(&name) {
+                    Ok(0) => format!("No key for {name} was stored."),
+                    Ok(_) => format!("Removed the stored key for {name}."),
+                    Err(e) => return self.transcript.push(Block::Error(e.to_string())),
+                };
+                let key = session
+                    .key_env
+                    .as_ref()
+                    .and_then(|v| std::env::var(v).ok().filter(|k| !k.trim().is_empty()));
+                let text = match (&key, &session.key_env) {
+                    (Some(_), Some(var)) => format!("{text} {var} is still set, and it is used."),
+                    _ => text,
+                };
+                session.api_key = key.clone();
+                self.api.api_key = key;
+                self.transcript.push(Block::Info(text));
             }
             "/provider" => {
                 let name = session.log.as_ref().map_or("unnamed", |l| l.1.as_str());
@@ -498,6 +519,148 @@ pub(super) fn complete_path(typed: &str, cwd: &std::path::Path) -> (String, Vec<
     )
 }
 
+/// OSC 52: the terminal puts the text on the clipboard, also over SSH.
+fn clipboard(text: &str) {
+    let mut out = io::stdout();
+    let _ = write!(
+        out,
+        "\x1b]52;c;{}\x07",
+        crate::image::base64(text.as_bytes())
+    );
+    let _ = out.flush();
+}
+
+impl App {
+    /// Starts a sign-in: the input then takes a key, or for OpenRouter
+    /// the code its page shows, hidden as it is typed.
+    pub(super) fn login(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let name = session.launch.provider.clone();
+        if session.key_env.is_none() {
+            return self.show(format!("{name} needs no key."));
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        if name != "openrouter" || !session.base_url.contains("openrouter.ai") {
+            let page = crate::provider::keys_page(&name)
+                .map(|p| format!(" Get one at {p}."))
+                .unwrap_or_default();
+            self.transcript.push(Block::Info(format!(
+                "Paste a key for {name} and press Enter; it stays hidden.{page} Esc cancels."
+            )));
+            self.login = Some(super::LoginWait {
+                provider: name,
+                oauth: None,
+                cancel,
+            });
+            return;
+        }
+        let headless = crate::oauth::headless();
+        let login = match crate::oauth::start(!headless) {
+            Ok(l) => Arc::new(l),
+            Err(e) => {
+                return self
+                    .transcript
+                    .push(Block::Error(format!("sign-in failed: {e}")));
+            }
+        };
+        let text = if headless {
+            clipboard(&login.url);
+            format!(
+                "Open this page in a browser (it is on the clipboard, if the terminal allows \
+                 it), sign in, and paste the code it shows here:\n\n{}\n\nA key works too. \
+                 Esc cancels.",
+                login.url
+            )
+        } else {
+            let verb = if crate::oauth::open_browser(&login.url) {
+                "Opened"
+            } else {
+                "Open"
+            };
+            let (l, tx, stop) = (login.clone(), self.tx.clone(), cancel.clone());
+            let proxy = session.proxy.clone();
+            let provider = name.clone();
+            std::thread::spawn(move || {
+                let got = l
+                    .wait(&stop, crate::login::WAIT)
+                    .and_then(|code| l.exchange(&code, proxy.as_deref()));
+                if !stop.load(Ordering::Relaxed) {
+                    let _ = tx.send(Msg::Login(provider, got.map_err(|e| e.to_string())));
+                }
+            });
+            format!(
+                "{verb} this page to sign in:\n\n{}\n\nOr paste a key here. Esc cancels.",
+                login.url
+            )
+        };
+        self.transcript.push(Block::Info(text));
+        self.login = Some(super::LoginWait {
+            provider: name,
+            oauth: Some(login),
+            cancel,
+        });
+    }
+
+    /// The input sent while signing in: a key, or OpenRouter's code.
+    pub(super) fn login_input(&mut self) {
+        let text = self.input.text().trim().to_string();
+        self.input.forget();
+        let Some(wait) = self.login.take() else {
+            return;
+        };
+        if text.is_empty() {
+            self.login = Some(wait);
+            return;
+        }
+        wait.cancel.store(true, Ordering::Relaxed);
+        match wait.oauth {
+            Some(login) if !crate::login::looks_like_key(&text) => {
+                let tx = self.tx.clone();
+                let proxy = self.api.proxy.clone();
+                self.transcript.push(Block::Info("Signing in…".into()));
+                std::thread::spawn(move || {
+                    let got = login.exchange(&text, proxy.as_deref());
+                    let _ = tx.send(Msg::Login(wait.provider, got.map_err(|e| e.to_string())));
+                });
+            }
+            _ => self.logged_in(&wait.provider, Ok(text)),
+        }
+    }
+
+    /// Keeps the key a sign-in gave, and uses it from the next request.
+    pub(super) fn logged_in(&mut self, provider: &str, got: Result<String, String>) {
+        let key = match got.and_then(|k| {
+            crate::auth::add(provider, &k, crate::NAME)
+                .map(|()| k.trim().to_string())
+                .map_err(|e| e.to_string())
+        }) {
+            Ok(k) => k,
+            Err(e) => {
+                self.transcript
+                    .push(Block::Error(format!("sign-in failed: {e}")));
+                return self.restore_message();
+            }
+        };
+        let mut text = format!(
+            "Signed in to {provider}. The key is kept in {}.",
+            crate::auth::path().display()
+        );
+        let var = self.session.as_ref().and_then(|s| s.key_env.clone());
+        if let Some(var) = var.filter(|v| std::env::var(v).is_ok_and(|k| !k.trim().is_empty())) {
+            text += &format!(" {var} is set and overrides it.");
+        } else {
+            self.api.api_key = Some(key.clone());
+            if let Some(s) = self.session.as_mut() {
+                s.api_key = Some(key);
+            }
+        }
+        self.transcript.push(Block::Info(text));
+        self.send_after_login();
+    }
+}
+
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "this list"),
     ("/clear", "start a new conversation"),
@@ -534,6 +697,15 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "/provider",
         "who ran the last reply, and what they publish about your data",
+    ),
+    (
+        "/login",
+        "sign in to the provider: OpenRouter in the browser, others with a key",
+    ),
+    ("/logout", "remove the stored key for the provider"),
+    (
+        "/compact",
+        "make the context shorter now: the older part becomes a summary",
     ),
     (
         "/usage",

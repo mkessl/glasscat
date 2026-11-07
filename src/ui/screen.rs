@@ -57,6 +57,10 @@ impl Style {
         self.underline = true;
         self
     }
+    pub const fn reverse(mut self) -> Self {
+        self.reverse = true;
+        self
+    }
     pub const fn strike(mut self) -> Self {
         self.strike = true;
         self

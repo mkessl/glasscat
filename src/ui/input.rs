@@ -78,6 +78,17 @@ impl Input {
         text
     }
 
+    /// Clears the text and every undo step, keeping nothing of it: for a
+    /// key typed in.
+    pub fn forget(&mut self) {
+        self.undo.clear();
+        self.last = Edit::None;
+        self.text.clear();
+        self.cur = 0;
+        self.goal = None;
+        self.hist = None;
+    }
+
     pub fn clear(&mut self) {
         self.save(Edit::Other);
         self.text.clear();

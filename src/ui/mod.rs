@@ -53,6 +53,25 @@ enum Msg {
     Window(String, Option<u64>),
     /// Prompts from earlier conversations held here, for the input history.
     History(Vec<String>),
+    /// A sign-in that ended: the provider, and its key or what went wrong.
+    Login(String, Result<String, String>),
+}
+
+/// What a thread does with the session.
+pub(super) enum Work {
+    Turn(String),
+    Resume,
+    Compact,
+}
+
+/// A sign-in in progress: the input takes a key, or OpenRouter's code,
+/// hidden as it is typed.
+struct LoginWait {
+    provider: String,
+    /// OpenRouter's browser sign-in.
+    oauth: Option<Arc<crate::oauth::Login>>,
+    /// Stops waiting for the browser.
+    cancel: Arc<AtomicBool>,
 }
 
 /// Where the provider is, for lookups made beside the conversation.
@@ -82,6 +101,9 @@ enum AgentMsg {
     Timing(Option<Duration>, Duration),
     Retrying(String, Duration, u32),
     StartedOver,
+    Compacting,
+    Cleared(usize, u64),
+    Compacted(u64, u64, Option<String>),
     ImagesDropped(String, bool),
     ToolsOff(String, bool),
 }
@@ -103,6 +125,33 @@ pub const NO_TOOLS: &str = "so it is sent none: it can answer but cannot read or
 /// Said when the provider refused the tools.
 pub const TOOLS_OFF: &str = "The model is sent no tools from now on, so it can answer but cannot \
                              read or change anything; the request goes again without them.";
+
+/// A search in the context view: what is typed, whether it is still being
+/// typed, the line it started from, and the line found.
+#[derive(Default)]
+struct Find {
+    query: String,
+    typing: bool,
+    from: usize,
+    at: Option<usize>,
+}
+
+/// The first line from `from` on (or back from it) that holds `query`,
+/// in any case of ASCII letters, going round the end.
+fn find_line(lines: &[transcript::Line], query: &str, from: usize, forward: bool) -> Option<usize> {
+    if query.is_empty() || lines.is_empty() {
+        return None;
+    }
+    let q = query.to_ascii_lowercase();
+    let n = lines.len();
+    let from = from.min(n);
+    let holds = |i: usize| lines[i].text().to_ascii_lowercase().contains(&q);
+    if forward {
+        (from..n).chain(0..from).find(|&i| holds(i))
+    } else {
+        (0..from).rev().chain((from..n).rev()).find(|&i| holds(i))
+    }
+}
 
 /// The most lines of paths shown above the input after Tab.
 const PATH_LINES: usize = 6;
@@ -145,6 +194,8 @@ struct App {
     served: Option<Served>,
     /// The last request's time to first token and in all.
     timing: Option<(Option<Duration>, Duration)>,
+    /// The search in the context view.
+    find: Find,
     /// The input when Tab found several paths, and the paths.
     paths: Option<(String, Vec<String>)>,
     /// Every request of this run that was answered, for /usage.
@@ -167,6 +218,9 @@ struct App {
     reading: Arc<AtomicBool>,
     /// A hand-edited context that did not parse, to be opened again.
     kept_edit: Option<std::path::PathBuf>,
+    login: Option<LoginWait>,
+    /// A message sent before signing in, to go once signed in.
+    after_login: Option<String>,
 }
 
 pub fn run(session: Session) -> Result<()> {
@@ -223,6 +277,7 @@ pub fn run(session: Session) -> Result<()> {
         call: None,
         usage: None,
         requests: Vec::new(),
+        find: Find::default(),
         paths: None,
         spent: (0.0, 0),
         cancel: Arc::new(AtomicBool::new(false)),
@@ -233,6 +288,8 @@ pub fn run(session: Session) -> Result<()> {
         paused,
         reading,
         kept_edit: None,
+        login: None,
+        after_login: None,
         served: None,
         timing: None,
         api,
@@ -256,6 +313,9 @@ pub fn run(session: Session) -> Result<()> {
         crate::NAME,
         app.model
     )));
+    if let Some(t) = app.not_signed_in() {
+        app.transcript.push(Block::Info(t));
+    }
     let items = &app.session.as_ref().expect("not started yet").items;
     if items.len() > 1 {
         replay(items, &mut app.transcript);
@@ -359,17 +419,26 @@ impl App {
                 self.scroll = 0;
             }
             Msg::History(h) => self.input.add_older(h),
+            Msg::Login(provider, got) => {
+                self.login = None;
+                self.input.forget();
+                self.logged_in(&provider, got);
+            }
             Msg::Window(model, n) => {
                 if self.window.as_ref().is_some_and(|w| w.0 == model) {
                     self.window = Some((model, n));
                     self.warn_if_full();
                 }
             }
-            Msg::Done(session, err) => {
+            Msg::Done(mut session, err) => {
+                // A sign-in made while the turn ran.
+                if session.api_key != self.api.api_key {
+                    session.api_key = self.api.api_key.clone();
+                }
                 self.session = Some(session);
                 self.busy = None;
                 let cancelled = self.cancel.swap(false, Ordering::Relaxed);
-                let long = err.as_deref().is_some_and(too_long);
+                let long = err.as_deref().is_some_and(crate::agent::too_long);
                 if let Some(e) = err {
                     self.transcript.push(Block::Error(e));
                     if long {
@@ -719,6 +788,26 @@ impl App {
                 )));
                 self.busy = Some(format!("waiting {}s to try again", wait.as_secs()));
             }
+            AgentMsg::Compacting => self.busy = Some("compacting".into()),
+            AgentMsg::Cleared(n, saved) => {
+                let s = if n == 1 { "" } else { "s" };
+                self.transcript.push(Block::Info(format!(
+                    "Cleared {n} old tool result{s}, about {} tokens, to make room; the model \
+                     can run those tools again.",
+                    crate::models::short(saved)
+                )));
+            }
+            AgentMsg::Compacted(before, after, kept) => {
+                let kept = kept
+                    .map(|p| format!(" The whole conversation before it is kept in {p}."))
+                    .unwrap_or_default();
+                self.transcript.push(Block::Info(format!(
+                    "Compacted the context from about {} to {} tokens: the older part is now a \
+                     summary the model wrote, with your messages word for word.{kept}",
+                    crate::models::short(before),
+                    crate::models::short(after)
+                )));
+            }
             AgentMsg::StartedOver => self.transcript.push(Block::Info(
                 "The model wrote the reply anew instead of continuing it; only the new one is kept.".into(),
             )),
@@ -749,7 +838,39 @@ impl App {
     }
 
     /// Runs the input as a command if its first word names one.
+    /// Puts a message held for the sign-in back into the input.
+    fn restore_message(&mut self) {
+        if let Some(m) = self.after_login.take() {
+            self.input.insert(&m);
+        }
+    }
+
+    /// Sends the message held for the sign-in.
+    fn send_after_login(&mut self) {
+        if self.session.is_none() {
+            return self.restore_message();
+        }
+        if let Some(p) = self.after_login.take() {
+            let p = p.trim_end().trim_start_matches(['\n', '\r']).to_string();
+            self.transcript.push(Block::User(p.clone()));
+            self.start(Some(p));
+        }
+    }
+
+    /// What to do first, when the provider needs a key and has none.
+    fn not_signed_in(&self) -> Option<String> {
+        let s = self.session.as_ref()?;
+        let var = s.key_env.as_ref().filter(|_| s.api_key.is_none())?;
+        Some(format!(
+            "Not signed in to {}: /login signs in. {var} would also do.",
+            s.launch.provider
+        ))
+    }
+
     fn send(&mut self) {
+        if self.login.is_some() {
+            return self.login_input();
+        }
         if self.command() {
             return;
         }
@@ -760,6 +881,15 @@ impl App {
         }
         if self.session.is_none() {
             self.busy = Some("still working; Esc stops it".into());
+            return;
+        }
+        // The message waits for the sign-in, then goes.
+        if self.not_signed_in().is_some() && !empty {
+            self.after_login = Some(self.input.take());
+            self.login();
+            if self.login.is_none() {
+                self.restore_message();
+            }
             return;
         }
         let prompt = if resume {
@@ -777,6 +907,15 @@ impl App {
 
     /// Runs a turn with `prompt`, or picks up the unanswered one.
     fn start(&mut self, prompt: Option<String>) {
+        self.work(match prompt {
+            Some(p) => Work::Turn(p),
+            None => Work::Resume,
+        });
+    }
+
+    /// Runs `work` on a thread of its own; the session comes back with
+    /// `Msg::Done`.
+    pub(super) fn work(&mut self, work: Work) {
         let Some(mut session) = self.session.take() else {
             return;
         };
@@ -803,6 +942,17 @@ impl App {
                     attempt,
                 } => send(AgentMsg::Retrying(error.into(), wait, attempt)),
                 Shown::StartedOver => send(AgentMsg::StartedOver),
+                Shown::Compacting => send(AgentMsg::Compacting),
+                Shown::Cleared { results, saved } => send(AgentMsg::Cleared(results, saved)),
+                Shown::Compacted {
+                    before,
+                    after,
+                    kept,
+                } => send(AgentMsg::Compacted(
+                    before,
+                    after,
+                    kept.map(|p| p.display().to_string()),
+                )),
                 Shown::ToolsOff { why, refused } => send(AgentMsg::ToolsOff(why.into(), refused)),
                 Shown::ImagesDropped { why, refused } => {
                     send(AgentMsg::ImagesDropped(why.into(), refused))
@@ -821,9 +971,10 @@ impl App {
                     before: before.map(Into::into),
                 }),
             };
-            let r = match prompt {
-                Some(p) => session.turn(p, &cancel, on),
-                None => session.resume(&cancel, on),
+            let r = match work {
+                Work::Turn(p) => session.turn(p, &cancel, on),
+                Work::Resume => session.resume(&cancel, on),
+                Work::Compact => session.compact_now(&cancel, on),
             };
             let _ = tx.send(Msg::Done(session, r.err().map(|e| e.to_string())));
         });
@@ -863,6 +1014,15 @@ impl App {
                 };
                 self.input.insert(&rest);
             }
+            KeyCode::Esc if self.login.is_some() => {
+                if let Some(w) = self.login.take() {
+                    w.cancel.store(true, Ordering::Relaxed);
+                }
+                self.input.forget();
+                self.transcript
+                    .push(Block::Info("Sign-in cancelled.".into()));
+                self.restore_message();
+            }
             KeyCode::Esc => self.stop(),
             KeyCode::Char('c') if ctrl => {
                 if self.session.is_none() {
@@ -877,6 +1037,7 @@ impl App {
                 self.quit = true;
             }
             KeyCode::Char('t') if ctrl => {
+                self.find = Find::default();
                 self.view = View::Context {
                     raw: false,
                     scroll: 0,
@@ -928,7 +1089,48 @@ impl App {
     fn context_key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let page = self.page() as isize;
+        if self.find.typing {
+            match k.code {
+                KeyCode::Esc => {
+                    self.find = Find::default();
+                }
+                KeyCode::Enter => self.find.typing = false,
+                KeyCode::Char('c' | 't') if ctrl => {
+                    self.find = Find::default();
+                    self.view = View::Chat;
+                }
+                KeyCode::Backspace => {
+                    self.find.query.pop();
+                    self.find_next(self.find.from, true);
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    self.find.query.push(c);
+                    self.find_next(self.find.from, true);
+                }
+                _ => {}
+            }
+            return;
+        }
         match k.code {
+            KeyCode::Char('/') => {
+                let from = match &self.view {
+                    View::Context { scroll, .. } => *scroll,
+                    _ => 0,
+                };
+                self.find = Find {
+                    typing: true,
+                    from,
+                    ..Find::default()
+                };
+            }
+            KeyCode::Char('n') => {
+                let from = self.find.at.map_or(0, |a| a + 1);
+                self.find_next(from, true);
+            }
+            KeyCode::Char('N') => {
+                let from = self.find.at.unwrap_or(0);
+                self.find_next(from, false);
+            }
             KeyCode::Esc | KeyCode::Char('q') => self.view = View::Chat,
             KeyCode::Char('t') if ctrl => self.view = View::Chat,
             KeyCode::Char('c') if ctrl => self.view = View::Chat,
@@ -945,6 +1147,18 @@ impl App {
             KeyCode::Home => self.scroll_by(isize::MIN / 2),
             KeyCode::End => self.scroll_by(isize::MAX / 2),
             _ => {}
+        }
+    }
+
+    /// Goes to the line the search finds from line `from` on, or back.
+    fn find_next(&mut self, from: usize, forward: bool) {
+        let Some((.., lines)) = &self.context_lines else {
+            return;
+        };
+        self.find.at = find_line(lines, &self.find.query, from, forward);
+        if let (Some(at), View::Context { scroll, .. }) = (self.find.at, &mut self.view) {
+            // A few lines above the match stay in view.
+            *scroll = at.saturating_sub(3);
         }
     }
 
@@ -1146,11 +1360,24 @@ impl App {
         let prompt_style = Style::fg(Color::Cyan).bold();
         let px = text::width(PROMPT) as u16;
         self.screen.put(0, input_y, w, PROMPT, prompt_style);
+        let hint = match &self.login {
+            Some(LoginWait { oauth: Some(_), .. }) => "Paste the code or a key…",
+            Some(_) => "Paste the key…",
+            None => "Message…",
+        };
         if self.input.is_empty() {
-            self.screen.put(px, input_y, w, "Message…", Style::dim());
+            self.screen.put(px, input_y, w, hint, Style::dim());
         }
         for (i, r) in rows.iter().skip(top).take(shown).enumerate() {
             let text = &self.input.text()[r.start..r.end];
+            // A key is never drawn; each character shows as a dot.
+            let dots;
+            let text = if self.login.is_some() {
+                dots = "•".repeat(text.chars().count());
+                dots.as_str()
+            } else {
+                text
+            };
             self.screen
                 .put(px, input_y + i as u16, w, text, Style::default());
         }
@@ -1231,8 +1458,27 @@ impl App {
         if let View::Context { scroll: s, .. } = &mut self.view {
             *s = scroll;
         }
+        let q = self.find.query.to_ascii_lowercase();
         for (i, line) in lines.iter().skip(scroll).take(height).enumerate() {
             put_line(&mut self.screen, i as u16, w, line);
+            if q.is_empty() {
+                continue;
+            }
+            // Each match shows in reverse.
+            let t = line.text();
+            let low = t.to_ascii_lowercase();
+            let mut start = 0;
+            while let Some(j) = low[start..].find(&q) {
+                let (a, b) = (start + j, start + j + q.len());
+                let x = text::width(&t[..a]) as u16;
+                let st = if Some(scroll + i) == self.find.at {
+                    Style::fg(Color::Yellow).reverse()
+                } else {
+                    Style::default().reverse()
+                };
+                self.screen.put(x, i as u16, w, &t[a..b], st);
+                start = b;
+            }
         }
         let at = format!(
             "context · lines {}-{} of {}",
@@ -1240,10 +1486,20 @@ impl App {
             (scroll + height).min(lines.len()),
             lines.len()
         );
-        let status = text::fit_parts(
-            &[&at, "r raw/parts", "↑↓ PgUp PgDn", "Esc back"],
-            w as usize,
-        );
+        let status = if self.find.typing {
+            format!("/{}", self.find.query)
+        } else if self.find.query.is_empty() {
+            text::fit_parts(
+                &[&at, "r raw/parts", "↑↓ PgUp PgDn", "/ finds", "Esc back"],
+                w as usize,
+            )
+        } else {
+            let found = match self.find.at {
+                Some(a) => format!("{:?} on line {}", self.find.query, a + 1),
+                None => format!("no {:?}", self.find.query),
+            };
+            text::fit_parts(&[&at, &found, "n next", "N back", "Esc back"], w as usize)
+        };
         self.screen.put(0, h - 1, w, &status, Style::dim());
     }
 }
@@ -1574,22 +1830,6 @@ fn restore(keyboard: bool) {
 
 /// Whether a provider's error says the request is longer than the
 /// model's context window; each words it its own way.
-fn too_long(error: &str) -> bool {
-    let e = error.to_lowercase();
-    [
-        "context length",
-        "context_length",
-        "context window",
-        "maximum context",
-        "prompt is too long",
-        "too many tokens",
-        "context size",
-        "input token count",
-    ]
-    .iter()
-    .any(|w| e.contains(w))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1603,9 +1843,11 @@ mod tests {
             "the request exceeds the available context size, try increasing it",
             "The input token count (1200000) exceeds the maximum number of tokens allowed",
         ] {
-            assert!(too_long(e), "{e}");
+            assert!(crate::agent::too_long(e), "{e}");
         }
-        assert!(!too_long("HTTP 429: Rate limit reached for tokens per min"));
+        assert!(!crate::agent::too_long(
+            "HTTP 429: Rate limit reached for tokens per min"
+        ));
     }
 
     #[test]
@@ -1626,6 +1868,21 @@ mod tests {
             .map(crate::models::short)
             .collect();
         assert_eq!(shorts, ["950", "8.2k", "131k", "1M", "1.5M"]);
+    }
+
+    #[test]
+    fn finds_lines_round_the_end() {
+        let lines: Vec<transcript::Line> = ["Alpha", "beta", "ALPHA beta", "gamma"]
+            .iter()
+            .map(|t| transcript::Line::new(t.to_string(), Style::default()))
+            .collect();
+        assert_eq!(find_line(&lines, "alpha", 0, true), Some(0));
+        assert_eq!(find_line(&lines, "alpha", 1, true), Some(2));
+        assert_eq!(find_line(&lines, "alpha", 3, true), Some(0));
+        assert_eq!(find_line(&lines, "alpha", 2, false), Some(0));
+        assert_eq!(find_line(&lines, "alpha", 0, false), Some(2));
+        assert_eq!(find_line(&lines, "delta", 0, true), None);
+        assert_eq!(find_line(&lines, "", 0, true), None);
     }
 
     #[test]

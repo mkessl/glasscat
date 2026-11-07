@@ -2,10 +2,12 @@
 //! add the results and go again until the model answers without tools.
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::Result;
+use crate::compact;
 use crate::context::{Item, Reply, ToolSpec};
 use crate::history;
 use crate::openai::{self, Event, Prefill};
@@ -19,6 +21,8 @@ pub struct Session {
     pub fields: Fields,
     pub model: String,
     pub api_key: Option<String>,
+    /// The variable that holds the key, for a provider that needs one.
+    pub key_env: Option<String>,
     /// How this provider continues a cut-off reply.
     pub prefill: Prefill,
     pub items: Vec<Item>,
@@ -34,6 +38,99 @@ pub struct Session {
     pub log: Option<(PathBuf, String)>,
     /// What the command line set, which the settings do not override.
     pub launch: crate::settings::Launch,
+    /// Input tokens of the last request, and how many items it held.
+    last_input: Option<(u64, usize)>,
+    /// A summary being written on the side before it is needed.
+    prepared: Option<Prepared>,
+}
+
+/// Share of the window, in percent, from which old tool results are
+/// cleared, when that frees a tenth of the window or more.
+const CLEAR_AT: u64 = 50;
+/// From here a summary of the older part is written on the side, so it
+/// is ready when needed and nobody waits for it.
+const PREPARE_AT: u64 = 70;
+/// From here the older part is replaced by that summary.
+const COMPACT_AT: u64 = 85;
+/// What `/compact` keeps of the recent part, in tokens.
+const MANUAL_KEEP: u64 = 2_000;
+/// Below this many tokens the context is never looked at for fitting.
+const SMALL: u64 = 16_000;
+
+/// A summary of `items[1..cut]` being written on a thread of its own.
+struct Prepared {
+    cut: usize,
+    /// The request, to be shown when the summary is put in.
+    body: Vec<u8>,
+    cancel: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<Result<Summary>>>,
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A summary the model wrote, with what its request took.
+struct Summary {
+    text: String,
+    usage: Option<serde_json::Value>,
+    served: Option<openai::Served>,
+    first: Option<Duration>,
+    total: Duration,
+}
+
+/// Asks for a summary with the request `body`.
+fn summarise(
+    base_url: &str,
+    api_key: Option<&str>,
+    proxy: Option<&str>,
+    body: &[u8],
+    cancel: &AtomicBool,
+) -> Result<Summary> {
+    let start = Instant::now();
+    let Some(stream) = openai::send(base_url, api_key, proxy, body, cancel)? else {
+        return Err("stopped".into());
+    };
+    let mut first = None;
+    let outcome = openai::read_stream(stream, cancel, |_| {
+        first.get_or_insert_with(|| start.elapsed());
+    });
+    if let Some(e) = outcome.error {
+        return Err(e.into());
+    }
+    if outcome.cancelled {
+        return Err("stopped".into());
+    }
+    let text = outcome.reply.text.trim().to_string();
+    if text.is_empty() {
+        return Err("the model wrote no summary".into());
+    }
+    Ok(Summary {
+        text,
+        usage: outcome.usage,
+        served: outcome.served,
+        first,
+        total: start.elapsed(),
+    })
+}
+
+/// Whether a provider's error says the context is longer than the model takes.
+pub fn too_long(error: &str) -> bool {
+    let e = error.to_lowercase();
+    [
+        "context length",
+        "context_length",
+        "context window",
+        "maximum context",
+        "prompt is too long",
+        "too many tokens",
+        "context size",
+        "input token count",
+    ]
+    .iter()
+    .any(|s| e.contains(s))
 }
 
 /// What a turn shows as it goes.
@@ -75,6 +172,22 @@ pub enum Shown<'a> {
         why: &'a str,
         refused: bool,
     },
+    /// The older part of the conversation is being summarised, or the
+    /// summary written on the side is awaited.
+    Compacting,
+    /// Old tool results were cleared to free about `saved` tokens.
+    Cleared {
+        results: usize,
+        saved: u64,
+    },
+    /// The older part was replaced by a summary; the context went from
+    /// about `before` tokens to `after`. The whole conversation as it was
+    /// is kept in `kept`.
+    Compacted {
+        before: u64,
+        after: u64,
+        kept: Option<&'a std::path::Path>,
+    },
     ToolDone {
         name: &'a str,
         args: &'a str,
@@ -104,6 +217,7 @@ impl Session {
             fields: Fields::default(),
             model,
             api_key,
+            key_env: None,
             prefill,
             items,
             tools,
@@ -112,6 +226,8 @@ impl Session {
             notes: Vec::new(),
             log: None,
             launch: Default::default(),
+            last_input: None,
+            prepared: None,
         }
     }
 
@@ -128,6 +244,8 @@ impl Session {
     /// Puts in a context edited by hand, and saves it.
     pub fn set_items(&mut self, items: Vec<Item>) -> Result<()> {
         self.items = items;
+        self.prepared = None;
+        self.last_input = None;
         self.save(Ok(()))
     }
 
@@ -158,6 +276,8 @@ impl Session {
     /// Forgets the conversation; the system prompt stays.
     pub fn clear(&mut self) {
         self.items.truncate(1);
+        self.prepared = None;
+        self.last_input = None;
         self.notes.clear();
         // The old conversation stays saved; the new one gets its own file.
         if let Some((path, _)) = &mut self.log {
@@ -173,6 +293,9 @@ impl Session {
             .items
             .iter()
             .rposition(|i| matches!(i, Item::User(_)))?;
+        if self.prepared.as_ref().is_some_and(|p| p.cut > last + 1) {
+            self.prepared = None;
+        }
         Some(self.items.split_off(last + 1))
     }
 
@@ -270,7 +393,13 @@ impl Session {
     }
 
     fn run(&mut self, cancel: &AtomicBool, mut on: impl FnMut(Shown)) -> Result<()> {
+        // Compacted once already for a "too long" error in this turn.
+        let mut compacted = false;
         'request: loop {
+            self.fit(cancel, &mut on)?;
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             let images = self.items.iter().any(|i| matches!(i, Item::Image { .. }));
             if images
                 && self.takes_images() == Some(false)
@@ -303,6 +432,7 @@ impl Session {
                 });
             }
             let body = self.body();
+            let held = self.items.len();
             on(Shown::Request(&body));
             let mut attempt = 0;
             let (stream, start) = loop {
@@ -329,6 +459,11 @@ impl Session {
                             why: &e.to_string(),
                             refused: true,
                         });
+                        continue 'request;
+                    }
+                    if too_long(&e.to_string()) && !compacted {
+                        compacted = true;
+                        self.compact(None, cancel, &mut on)?;
                         continue 'request;
                     }
                     if sends_tools && refuses_tools(&*e) {
@@ -372,6 +507,9 @@ impl Session {
             }
             if let Some(u) = &outcome.usage {
                 on(Shown::Usage(u));
+                if let Some(t) = u.get("prompt_tokens").and_then(serde_json::Value::as_u64) {
+                    self.last_input = Some((t, held));
+                }
             }
             let cut = outcome.cut();
             let mut reply = outcome.reply;
@@ -429,6 +567,219 @@ impl Session {
             }
             self.items.append(&mut images);
         }
+    }
+
+    /// About how many tokens the context holds: the last request's count
+    /// plus an estimate of what came after it.
+    pub fn context_tokens(&self) -> u64 {
+        match self.last_input {
+            Some((t, n)) if n <= self.items.len() => t + compact::tokens(&self.items[n..]),
+            _ => compact::tokens(&self.items),
+        }
+    }
+
+    /// The model's context window, from the provider's model list.
+    fn window(&self) -> Option<u64> {
+        let list = crate::models::fetched(&self.base_url).or_else(|| {
+            crate::models::list(
+                &self.base_url,
+                self.api_key.as_deref(),
+                self.proxy.as_deref(),
+            )
+            .ok()
+        })?;
+        crate::models::window_in(&list, &self.model)
+    }
+
+    /// Before a request, makes the context fit the window: clears old tool
+    /// results, writes a summary on the side, and puts it in place of the
+    /// older part when the context nears the end of the window.
+    fn fit(&mut self, cancel: &AtomicBool, on: &mut impl FnMut(Shown)) -> Result<()> {
+        let used = self.context_tokens();
+        if used < SMALL {
+            return Ok(());
+        }
+        let Some(window) = self.window() else {
+            return Ok(());
+        };
+        let share = |t: u64| t * 100 / window.max(1);
+        let mut used = used;
+        if share(used) >= CLEAR_AT {
+            let before = compact::tokens(&self.items);
+            let full = self.items.clone();
+            let cleared = compact::clear_old_results(&mut self.items, window / 4);
+            let saved = before.saturating_sub(compact::tokens(&self.items));
+            // Each clearing costs the provider's cache, so only a large one.
+            if saved >= window / 10 {
+                self.keep_whole(&full);
+                self.last_input = None;
+                self.prepared = None;
+                on(Shown::Cleared {
+                    results: cleared.len(),
+                    saved,
+                });
+                used = self.context_tokens();
+            } else {
+                self.items = full;
+            }
+        }
+        let keep = (window / 5).min(30_000);
+        if share(used) >= PREPARE_AT
+            && self.prepared.is_none()
+            && let Some(cut) = compact::cut_point(&self.items, keep)
+        {
+            self.prepare(cut);
+        }
+        if share(used) >= COMPACT_AT {
+            self.compact(None, cancel, on)?;
+        }
+        Ok(())
+    }
+
+    /// The request that asks the model for a summary of `items[1..cut]`:
+    /// the conversation itself, so the provider's cache serves it, then
+    /// the summary prompt.
+    fn summary_body(&self, cut: usize) -> Vec<u8> {
+        let mut items = self.items[..cut].to_vec();
+        items.push(Item::User(compact::PROMPT.into()));
+        openai::request_body(
+            &self.model,
+            &items,
+            if self.no_tools.as_ref() == Some(&self.model) {
+                &[]
+            } else {
+                &self.specs
+            },
+            self.prefill,
+            &self.fields.for_model(&self.model),
+        )
+    }
+
+    /// Starts writing the summary of `items[1..cut]` on a thread.
+    fn prepare(&mut self, cut: usize) {
+        let body = self.summary_body(cut);
+        let (url, key, proxy) = (
+            self.base_url.clone(),
+            self.api_key.clone(),
+            self.proxy.clone(),
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        let sent = body.clone();
+        let handle = std::thread::spawn(move || {
+            summarise(&url, key.as_deref(), proxy.as_deref(), &sent, &stop)
+        });
+        self.prepared = Some(Prepared {
+            cut,
+            body,
+            cancel,
+            handle: Some(handle),
+        });
+    }
+
+    /// Replaces the older part of the conversation with a summary the
+    /// model writes, keeping the recent part and the user's own messages
+    /// word for word. Uses the summary written on the side if there is one.
+    /// `keep` is how many tokens of the recent part stay as they are.
+    fn compact(
+        &mut self,
+        keep: Option<u64>,
+        cancel: &AtomicBool,
+        on: &mut impl FnMut(Shown),
+    ) -> Result<()> {
+        let window = self.window();
+        let keep = keep.unwrap_or_else(|| window.map_or(20_000, |w| (w / 5).min(30_000)));
+        on(Shown::Compacting);
+        let prepared = self.prepared.take().filter(|p| p.cut < self.items.len());
+        let ready = match prepared {
+            Some(mut p) => {
+                let handle = p.handle.take();
+                while handle.as_ref().is_some_and(|h| !h.is_finished()) {
+                    if !sleep_unless_cancelled(Duration::from_millis(50), cancel) {
+                        return Ok(());
+                    }
+                }
+                let got = handle.map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("the summary thread failed".into()))
+                });
+                if got.as_ref().is_some_and(|r| r.is_ok()) {
+                    on(Shown::Request(&p.body));
+                }
+                got.and_then(|r| r.ok()).map(|s| (p.cut, s))
+            }
+            None => None,
+        };
+        let (cut, summary) = match ready {
+            Some(r) => r,
+            None => {
+                let cut = compact::cut_point(&self.items, keep)
+                    .ok_or("nothing to compact: all of the conversation is recent")?;
+                let body = self.summary_body(cut);
+                on(Shown::Request(&body));
+                let s = summarise(
+                    &self.base_url,
+                    self.api_key.as_deref(),
+                    self.proxy.as_deref(),
+                    &body,
+                    cancel,
+                );
+                match s {
+                    Ok(s) => (cut, s),
+                    Err(_) if cancel.load(Ordering::Relaxed) => return Ok(()),
+                    Err(e) => return Err(format!("compacting failed: {e}").into()),
+                }
+            }
+        };
+        on(Shown::Timing {
+            first: summary.first,
+            total: summary.total,
+        });
+        if let Some(s) = &summary.served {
+            on(Shown::Served(s));
+        }
+        if let Some(u) = &summary.usage {
+            on(Shown::Usage(u));
+        }
+        let before = self.context_tokens();
+        let full = self.items.clone();
+        let kept = self.keep_whole(&full);
+        // The user's own words may take a tenth of the window.
+        let max_user = window.map_or(40_000, |w| (w * 4 / 10) as usize);
+        compact::apply(&mut self.items, cut, &summary.text, max_user);
+        self.last_input = None;
+        on(Shown::Compacted {
+            before,
+            after: self.context_tokens(),
+            kept: kept.as_deref(),
+        });
+        Ok(())
+    }
+
+    /// `/compact`: compacts now, keeping only about the last exchange as
+    /// it was, and saves.
+    pub fn compact_now(&mut self, cancel: &AtomicBool, mut on: impl FnMut(Shown)) -> Result<()> {
+        let r = self.compact(Some(MANUAL_KEEP), cancel, &mut on);
+        self.save(r)
+    }
+
+    /// Saves `items`, the whole conversation before it was made shorter,
+    /// next to the conversation's file; returns where.
+    fn keep_whole(&self, items: &[Item]) -> Option<PathBuf> {
+        let (path, provider) = self.log.as_ref()?;
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let stem = path.file_stem()?.to_string_lossy();
+        let whole = path.with_file_name(format!("{stem}.before-{n}.json"));
+        let saved = history::Saved {
+            cwd: self.tools.cwd().to_path_buf(),
+            provider: provider.clone(),
+            model: self.model.clone(),
+            items: items.to_vec(),
+        };
+        history::save(&whole, &saved).ok()?;
+        Some(whole)
     }
 
     /// Takes every image out of the context, and tells the model in the
@@ -931,6 +1282,53 @@ mod tests {
         );
         assert!(matches!(session.items.last(), Some(Item::Assistant(r)) if r.text == "ok"));
         assert_eq!(server.join().unwrap().len(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn compacts_when_the_provider_says_the_context_is_too_long() {
+        let long = "HTTP/1.1 400 Bad Request\r\nContent-Length: 46\r\n\r\nThis model's maximum context length is 1000 t.";
+        let models = r#"{"data":[{"id":"m","context_length":1000}]}"#;
+        let list = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{models}",
+            models.len()
+        );
+        let (url, server) = serve(vec![
+            long.into(),
+            list,
+            sse(&[r#"{"choices":[{"delta":{"content":"Goal: sum"},"finish_reason":"stop"}]}"#]),
+            sse(&[r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#]),
+        ]);
+        let (mut session, dir) = session(url, Prefill::None);
+        session
+            .items
+            .push(Item::User("first, keep my words".into()));
+        session.items.push(Item::Assistant(Reply {
+            text: "an answer".repeat(50),
+            ..Default::default()
+        }));
+        let mut shown = Vec::new();
+        session
+            .turn(
+                "second ".repeat(300),
+                &AtomicBool::new(false),
+                |s| match s {
+                    Shown::Compacting => shown.push("compacting".to_string()),
+                    Shown::Compacted { .. } => shown.push("compacted".to_string()),
+                    _ => {}
+                },
+            )
+            .unwrap();
+        assert_eq!(shown, ["compacting", "compacted"]);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[1].starts_with("GET "), "{}", requests[1]);
+        assert!(requests[2].contains("Write the summary"), "{}", requests[2]);
+        let last = &requests[3];
+        assert!(last.contains("was compacted"), "{last}");
+        assert!(last.contains("first, keep my words"), "{last}");
+        assert!(!last.contains("an answeran answer"), "{last}");
+        assert!(matches!(session.items.last(), Some(Item::Assistant(r)) if r.text == "done"));
         fs::remove_dir_all(dir).unwrap();
     }
 

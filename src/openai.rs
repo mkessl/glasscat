@@ -427,6 +427,27 @@ pub fn get_json(url: &str, api_key: Option<&str>, proxy: Option<&str>) -> Result
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Posts a JSON document and reads a JSON reply; a status other than 2xx is an error carrying the reply text.
+pub fn post_json(url: &str, body: &Value, proxy: Option<&str>) -> Result<Value> {
+    let mut resp = agent(proxy)?
+        .post(url)
+        .content_type("application/json")
+        .send(body.to_string())?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        let text = error_text(&text);
+        let text: String = text.trim().chars().take(300).collect();
+        return Err(format!("{url}: HTTP {status}: {text}").into());
+    }
+    let bytes = resp
+        .body_mut()
+        .with_config()
+        .limit(32 << 20)
+        .read_to_vec()?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 fn post(
     base_url: &str,
     api_key: Option<&str>,

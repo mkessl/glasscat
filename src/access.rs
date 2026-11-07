@@ -167,9 +167,19 @@ impl Access {
     pub fn show(&self, real: &Path) -> String {
         match real.strip_prefix(&self.cwd) {
             Ok(rel) if rel.as_os_str().is_empty() => ".".into(),
-            Ok(rel) => rel.display().to_string(),
-            Err(_) => real.display().to_string(),
+            Ok(rel) => shown(rel),
+            Err(_) => shown(real),
         }
+    }
+}
+
+/// A path as text for the model and the user, always with `/` separators.
+pub fn shown(p: &Path) -> String {
+    let text = p.display().to_string();
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text
     }
 }
 

@@ -173,7 +173,7 @@ pub fn takes_tools(list: &Value, model: &str) -> Option<bool> {
     Some(params.iter().any(|p| p == "tools"))
 }
 
-fn window_in(list: &Value, model: &str) -> Option<u64> {
+pub fn window_in(list: &Value, model: &str) -> Option<u64> {
     let entry = list["data"].as_array()?.iter().find(|m| m["id"] == model)?;
     WINDOW_KEYS.iter().find_map(|k| entry[k].as_u64())
 }
