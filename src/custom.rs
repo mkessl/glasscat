@@ -4,7 +4,7 @@
 
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -106,17 +106,38 @@ fn is_name(s: &str) -> bool {
 /// Runs the tool in `cwd` and returns the exit status and output for the
 /// model. Stops the program when `cancel` is set or the timeout passes.
 pub fn run(t: &CustomTool, cmd: &[String], cwd: &Path, cancel: &AtomicBool) -> String {
-    let mut child = match Command::new(&cmd[0])
-        .args(&cmd[1..])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
+    let mut c = Command::new(&cmd[0]);
+    c.args(&cmd[1..]).current_dir(cwd);
+    match spawn(c) {
+        Ok(child) => finish(child, Duration::from_secs(t.timeout), cancel),
+        Err(e) => format!("error: could not start {}: {e}", cmd[0]),
+    }
+}
+
+/// Starts `cmd` with no input and its output captured, in a process
+/// group of its own, so stopping it stops what it started too.
+pub fn spawn(mut cmd: Command) -> std::io::Result<Child> {
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return format!("error: could not start {}: {e}", cmd[0]),
-    };
+}
+
+/// Stops a process started by `spawn` and all it started.
+fn stop(child: &mut Child) {
+    #[cfg(unix)]
+    // SAFETY: a signal to the group the child leads.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+/// Waits for a process started by `spawn`, stopping it when `cancel` is
+/// set or `timeout` passes: its exit status and output, for the model.
+pub fn finish(mut child: Child, timeout: Duration, cancel: &AtomicBool) -> String {
     let read = |mut r: Box<dyn Read + Send>| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -126,24 +147,26 @@ pub fn run(t: &CustomTool, cmd: &[String], cwd: &Path, cancel: &AtomicBool) -> S
     };
     let out = read(Box::new(child.stdout.take().expect("piped")));
     let err = read(Box::new(child.stderr.take().expect("piped")));
-    let deadline = Instant::now() + Duration::from_secs(t.timeout);
+    let deadline = Instant::now() + timeout;
     let ended = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.to_string(),
             Ok(None) if cancel.load(Ordering::Relaxed) => {
-                let _ = child.kill();
+                stop(&mut child);
                 let _ = child.wait();
                 break "stopped by the user".into();
             }
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
+                stop(&mut child);
                 let _ = child.wait();
-                break format!("stopped after {} seconds", t.timeout);
+                break format!("stopped after {} seconds", timeout.as_secs());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(e) => break format!("could not wait for it: {e}"),
         }
     };
+    // What it left running in the background would hold the output open.
+    stop(&mut child);
     let out = out.join().unwrap_or_default();
     let err = err.join().unwrap_or_default();
     let mut text = String::from_utf8_lossy(&out).into_owned();

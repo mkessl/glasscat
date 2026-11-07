@@ -33,6 +33,14 @@ pub struct Tools {
     changes: Mutex<Vec<(u64, Change)>>,
     /// The number the next change gets.
     seq: AtomicU64,
+    /// Whether the model has a shell, and how it is limited.
+    pub shell: crate::shell::Mode,
+    /// What shell commands changed, found by looking before and after.
+    snapshots: Mutex<crate::snapshot::Store>,
+    /// Whether the few commands `danger` names wait for the user's yes.
+    pub confirm: bool,
+    /// Asks the user a yes-or-no question; none where no one can answer.
+    pub ask: Option<Ask>,
     /// The user's own tools, from the settings.
     custom: std::collections::BTreeMap<String, CustomTool>,
     /// Where reports to the developers are saved.
@@ -72,7 +80,16 @@ enum Undo {
     /// The file or directory was moved here from `from`: move it back and
     /// remove the directories made for it, deepest first.
     MoveBack { from: PathBuf, dirs: Vec<PathBuf> },
+    /// A command changed or deleted the file: put back this copy of it.
+    Copy(PathBuf),
+    /// A command made the directory: remove it while it is empty.
+    RemoveDir,
+    /// A command changed a file too large to keep: it cannot be undone.
+    Lost,
 }
+
+/// Asks the user a yes-or-no question and waits for the answer.
+pub type Ask = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 pub fn specs() -> Vec<ToolSpec> {
     let spec = |name: &str, description: &str, parameters: Value| ToolSpec {
@@ -202,6 +219,10 @@ impl Tools {
             journal,
             changes: Mutex::new(Vec::new()),
             seq: AtomicU64::new(0),
+            shell: crate::shell::Mode::default(),
+            snapshots: Mutex::default(),
+            confirm: true,
+            ask: None,
             custom: Default::default(),
             reports: crate::journal::data_dir().join("reports"),
             touched: Mutex::default(),
@@ -217,7 +238,7 @@ impl Tools {
         let builtin = specs();
         if let Some(name) = custom
             .keys()
-            .find(|n| builtin.iter().any(|s| &s.name == *n))
+            .find(|n| *n == "shell" || builtin.iter().any(|s| &s.name == *n))
         {
             return Err(format!(
                 "the tool {name} in the settings has a built-in tool's name"
@@ -230,6 +251,9 @@ impl Tools {
     /// The definitions given to the model: built-in tools, then the user's.
     pub fn all_specs(&self) -> Vec<ToolSpec> {
         let mut all = specs();
+        if self.has_shell() {
+            all.push(crate::shell::spec(self.shell));
+        }
         all.extend(self.custom.iter().map(|(n, t)| crate::custom::spec(n, t)));
         all
     }
@@ -263,10 +287,138 @@ impl Tools {
         read_only(name) || self.custom.get(name).is_some_and(|t| t.read_only)
     }
 
-    /// Whether what tool `name` changes is written down, so /undo,
-    /// /rewind and /retry can take it back: the built-in tools.
-    pub fn tracks(&self, name: &str) -> bool {
-        !self.custom.contains_key(name)
+    /// Runs a command, writing down what it changed in the directories
+    /// the model may use, so it can be taken back.
+    fn watched(&self, line: &str, run: impl FnOnce() -> String) -> String {
+        let roots = self.access.roots().to_vec();
+        let hidden = self.access.hidden().to_vec();
+        let mut store = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        store.before(&roots, &hidden);
+        let result = run();
+        let found = store.after(&roots, &hidden);
+        drop(store);
+        self.remember_command(line, found);
+        result
+    }
+
+    /// Writes down what a command changed, so it can be taken back.
+    fn remember_command(&self, line: &str, found: Vec<crate::snapshot::Found>) {
+        use crate::snapshot::Found;
+        let mut short: String = line
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(40)
+            .collect();
+        if short.len() < line.len() {
+            short += "…";
+        }
+        let hash = |p: &Path| fs::read(p).ok().map(|b| fnv(&b));
+        let mut paths = Vec::new();
+        for f in found {
+            let (path, what, after, undo) = match f {
+                Found::Created(p) => {
+                    let after = hash(&p);
+                    (p, "creation", after, Undo::Remove { dirs: Vec::new() })
+                }
+                Found::CreatedDir(p) => (p, "new directory", None, Undo::RemoveDir),
+                Found::Changed(p, copy) => {
+                    let after = hash(&p);
+                    let undo = copy.map_or(Undo::Lost, Undo::Copy);
+                    (p, "change", after, undo)
+                }
+                Found::Deleted(p, copy) => {
+                    let undo = copy.map_or(Undo::Lost, Undo::Copy);
+                    (p, "deletion", None, undo)
+                }
+                Found::DeletedDir(p) => (p, "deletion", None, Undo::Mkdir),
+            };
+            paths.push(path.clone());
+            self.remember(Change {
+                path,
+                what: format!("the {what} by `{short}`"),
+                after,
+                undo,
+            });
+        }
+        if !paths.is_empty() {
+            let _ = self
+                .journal
+                .record(json!({ "tool": "shell", "command": line, "changed": paths }));
+        }
+    }
+
+    /// Whether the model is given the shell.
+    pub fn has_shell(&self) -> bool {
+        use crate::shell::Mode;
+        match self.shell {
+            Mode::Landlock => crate::landlock::available(),
+            // No shell on Windows yet.
+            Mode::Unrestricted => cfg!(unix),
+            Mode::Off => false,
+        }
+    }
+
+    fn shell(&self, args: &str, cancel: &AtomicBool) -> String {
+        let args: Value = serde_json::from_str(args).unwrap_or_default();
+        let Some(line) = args.get("command").and_then(Value::as_str) else {
+            return "error: command is missing".into();
+        };
+        if !self.has_shell() {
+            return "error: there is no shell tool".into();
+        }
+        if let Some(tool) = crate::shell::duplicate(line) {
+            return format!(
+                "error: refused; use the {tool} tool for that. The other tools leave out what the \
+                 user hid, and their changes can be taken back."
+            );
+        }
+        if let Some(why) = crate::danger::check(line).filter(|_| self.confirm) {
+            let question = format!("The model wants to run a command that {why}:\n  {line}");
+            match &self.ask {
+                Some(ask) if ask(&question) => {}
+                Some(_) => return "error: the user said no to this command".into(),
+                None => {
+                    return format!(
+                        "error: refused: this command {why}, so it needs the user's yes, and no \
+                         one is here to give it"
+                    );
+                }
+            }
+        }
+        let secs = args
+            .get("timeout")
+            .and_then(Value::as_u64)
+            .unwrap_or(crate::shell::TIMEOUT)
+            .clamp(1, crate::shell::TIMEOUT_MAX);
+        let rules = match self.shell {
+            crate::shell::Mode::Landlock => {
+                let roots = self.access.roots();
+                let plan = crate::landlock::plan(roots, self.access.hidden());
+                match crate::landlock::Ruleset::new(&plan) {
+                    Some(r) => Some(r),
+                    None => {
+                        return "error: Landlock could not be set up, so nothing was run".into();
+                    }
+                }
+            }
+            _ => None,
+        };
+        let result = self.watched(line, || {
+            crate::shell::run(
+                line,
+                self.cwd(),
+                std::time::Duration::from_secs(secs),
+                cancel,
+                rules.as_ref(),
+            )
+        });
+        let ended = result.lines().next().unwrap_or_default();
+        let _ = self
+            .journal
+            .record(json!({ "tool": "shell", "command": line, "ended": ended }));
+        result
     }
 
     /// Notes that the model read `path`, or changed it.
@@ -363,6 +515,7 @@ impl Tools {
         let now = fs::read(&change.path).ok();
         let gone = fs::symlink_metadata(&change.path).is_err();
         let same = match (&change.undo, change.after) {
+            (Undo::RemoveDir, _) => change.path.is_dir(),
             // A directory, or a file that could not be read to hash it.
             (Undo::MoveBack { .. }, None) => fs::symlink_metadata(&change.path).is_ok(),
             (_, Some(hash)) => now.as_deref().map(fnv) == Some(hash),
@@ -392,6 +545,29 @@ impl Tools {
                 fs::set_permissions(&change.path, perms.clone()).map_err(io)?;
             }
             Undo::Mkdir => fs::create_dir_all(&change.path).map_err(io)?,
+            Undo::Copy(copy) => {
+                if let Some(dir) = change.path.parent() {
+                    fs::create_dir_all(dir).map_err(io)?;
+                }
+                let bytes = fs::read(copy).map_err(io)?;
+                write_atomic(&change.path, &bytes).map_err(io)?;
+                if let Ok(m) = fs::metadata(copy) {
+                    let _ = fs::set_permissions(&change.path, m.permissions());
+                }
+            }
+            Undo::RemoveDir => {
+                if fs::remove_dir(&change.path).is_err() {
+                    return Err(format!(
+                        "{shown} has files in it now, so it was left as it is."
+                    ));
+                }
+            }
+            Undo::Lost => {
+                return Err(format!(
+                    "{shown} was too large to keep a copy of, so {} stays.",
+                    change.what
+                ));
+            }
             Undo::Replace { at, old, new } => {
                 let mut bytes = now.expect("hash matched");
                 for &i in at.iter().rev() {
@@ -463,6 +639,7 @@ impl Tools {
         IMAGE.take();
         let result = match self.custom.get(name) {
             Some(t) => self.run_custom(name, t, args, cancel),
+            None if name == "shell" => self.shell(args, cancel),
             None => self.run(name, args),
         };
         let kept = crate::access::take_withheld();
@@ -487,7 +664,14 @@ impl Tools {
             Ok(c) => c,
             Err(e) => return format!("error: {e}"),
         };
-        let result = crate::custom::run(t, &cmd, self.cwd(), cancel);
+        // One that only reads runs beside others, and changes nothing.
+        let result = if t.read_only {
+            crate::custom::run(t, &cmd, self.cwd(), cancel)
+        } else {
+            self.watched(&cmd.join(" "), || {
+                crate::custom::run(t, &cmd, self.cwd(), cancel)
+            })
+        };
         let ended = result.lines().next().unwrap_or_default();
         let _ = self
             .journal
@@ -1320,6 +1504,35 @@ mod tests {
 
     fn run(f: &Fixture, name: &str, args: Value) -> String {
         f.tools.run(name, &args.to_string())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn what_a_command_changes_is_taken_back() {
+        let mut f = fixture("command");
+        f.tools.shell = crate::shell::Mode::Unrestricted;
+        let p = f.base.join("proj");
+        let main = fs::read(p.join("src/main.rs")).unwrap();
+        let line = "printf x > src/lib.rs && mkdir -p gen && echo y > gen/new.txt && sh -c 'rm src/main.rs'";
+        let ran = f.tools.run_noting(
+            "shell",
+            &json!({ "command": line }).to_string(),
+            &AtomicBool::new(false),
+        );
+        assert!(ran.result.starts_with("exit status: 0"), "{}", ran.result);
+        let listed = f.tools.changes();
+        assert!(
+            listed.contains("src/lib.rs: the change by `printf x > src/lib.rs"),
+            "{listed}"
+        );
+        let (done, failed) = f.tools.rewind(0);
+        assert_eq!((done.len(), failed), (4, Vec::<String>::new()));
+        assert_eq!(fs::read(p.join("src/main.rs")).unwrap(), main);
+        assert_eq!(
+            fs::read_to_string(p.join("src/lib.rs")).unwrap(),
+            "pub fn a() {}\npub fn b() {}\n"
+        );
+        assert!(!p.join("gen").exists());
     }
 
     #[test]

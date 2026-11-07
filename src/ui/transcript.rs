@@ -288,6 +288,33 @@ pub fn outcome(name: &str, result: &str, failed: bool) -> String {
             _ => format!("{} lines", lines.len()),
         };
     }
+    if name == "shell" && !failed {
+        // "exit status: 0" or "stopped after 120 seconds", then the output,
+        // whose last line usually says how it went.
+        let status = lines.first().copied().unwrap_or("");
+        let status = match status.strip_prefix("exit status: ") {
+            Some("0") | Some("0, no output") => "ok",
+            Some(code) => code.split(',').next().unwrap_or(code),
+            None => status,
+        };
+        let status = if status.chars().all(|c| c.is_ascii_digit()) {
+            format!("exit {status}")
+        } else {
+            status.to_string()
+        };
+        let last = lines[1..]
+            .iter()
+            .rev()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty());
+        let more = lines.len().saturating_sub(2);
+        return match (last, more) {
+            (None, _) => status,
+            (Some(l), 0) => format!("{status} · {l}"),
+            (Some(l), 1) => format!("{status} · {l}  (+1 line)"),
+            (Some(l), n) => format!("{status} · {l}  (+{n} lines)"),
+        };
+    }
     if !failed && lines.len() > 1 {
         // A note such as "[3 more entries not shown]" ends a long answer.
         let (items, more) = match lines.split_last() {
@@ -463,6 +490,15 @@ pub fn summary(args: &str, cwd: &str) -> String {
             p => p.into(),
         }
     };
+    if let Some(c) = get("command") {
+        let mut lines = c.trim().lines();
+        let first = lines.next().unwrap_or_default().to_string();
+        return if lines.next().is_some() {
+            first + " …"
+        } else {
+            first
+        };
+    }
     if let (Some(from), Some(to)) = (get("from"), get("to")) {
         return format!("{} → {}", rel(from), rel(to));
     }
@@ -568,6 +604,27 @@ mod tests {
             before: None,
         });
         assert_eq!(texts(&mut t, 40)[6], "● search fn");
+    }
+
+    #[test]
+    fn shell_shows_how_it_ended() {
+        assert_eq!(
+            outcome("shell", "exit status: 0\nrustc 1.99", false),
+            "ok · rustc 1.99"
+        );
+        assert_eq!(outcome("shell", "exit status: 0, no output", false), "ok");
+        assert_eq!(
+            outcome("shell", "exit status: 101\na\nerror: failed\n", false),
+            "exit 101 · error: failed  (+1 line)"
+        );
+        assert_eq!(
+            outcome("shell", "stopped after 5 seconds, no output", false),
+            "stopped after 5 seconds, no output"
+        );
+        assert_eq!(
+            summary(r#"{"command":"cargo test\nls"}"#, "/p"),
+            "cargo test …"
+        );
     }
 
     #[test]

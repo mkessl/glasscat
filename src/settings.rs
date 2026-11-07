@@ -35,6 +35,10 @@ pub struct Settings {
     /// Files in the working directory whose text goes into the system
     /// prompt; `AGENTS.md` when not set.
     pub instructions: Option<Vec<String>>,
+    /// The model's shell: `landlock`, `unrestricted` or `off`.
+    pub shell: crate::shell::Mode,
+    /// Whether the most dangerous commands wait for the user's yes.
+    pub confirm: Option<bool>,
 }
 
 impl Settings {
@@ -132,6 +136,8 @@ pub fn apply(session: &mut crate::agent::Session, s: &Settings) -> Result<()> {
     if let Some(p) = &proxy {
         crate::openai::parse_proxy(p)?;
     }
+    session.tools.shell = s.shell;
+    session.tools.confirm = s.confirm.unwrap_or(true);
     session
         .set_custom(s.tools.clone())
         .map_err(|e| format!("{}: {e}", path().display()))?;

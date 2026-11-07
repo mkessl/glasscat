@@ -4,7 +4,6 @@
 //! gets no panels, and text keeps the terminal's palette either way.
 
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
 
 use crossterm::style::Color;
 
@@ -100,6 +99,7 @@ fn color((r, g, b): (u8, u8, u8), truecolor: bool) -> Color {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 /// Parses an OSC 11 answer: `rgb:RRRR/GGGG/BBBB`, 1 to 4 hex digits each.
 fn parse(reply: &str) -> Option<(u8, u8, u8)> {
     let rgb = reply.split("rgb:").nth(1)?;
@@ -116,6 +116,7 @@ fn parse(reply: &str) -> Option<(u8, u8, u8)> {
 fn background() -> Option<(u8, u8, u8)> {
     use std::io::{Read, Write};
     use std::os::unix::fs::OpenOptionsExt;
+    use std::time::{Duration, Instant};
     #[cfg(any(target_os = "linux", target_os = "android"))]
     const NONBLOCK: i32 = 0o4000;
     #[cfg(not(any(target_os = "linux", target_os = "android")))]

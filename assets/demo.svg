@@ -5,50 +5,71 @@
 <circle cx="40" cy="18" r="6" fill="#febc2e"/>
 <circle cx="60" cy="18" r="6" fill="#28c840"/>
 <g font-family="ui-monospace, SFMono-Regular, &#x27;SF Mono&#x27;, Menlo, Consolas, &#x27;DejaVu Sans Mono&#x27;, &#x27;Liberation Mono&#x27;, monospace" font-size="14">
-<text x="16" y="67" textLength="218.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#f2cc60">▸ read tests/test_stats.py</text>
-<text x="16" y="87" textLength="403.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">  from src.stats import mean, median  (+8 lines)</text>
-<text x="16" y="127" textLength="268.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">thought · 6 lines · ctrl+o shows</text>
-<text x="16" y="167" textLength="159.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#f2cc60">▸ edit src/stats.py</text>
-<text x="16" y="187" textLength="260.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">  edited src/stats.py at line 1</text>
-<text x="16" y="207" textLength="478.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#ffa198">  -     return sum(xs) / len(xs) - 1  # TODO: off by one?</text>
-<text x="16" y="227" textLength="268.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">  +     return sum(xs) / len(xs)</text>
-<text x="16" y="267" textLength="159.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#f2cc60">▸ edit src/stats.py</text>
-<text x="16" y="287" textLength="260.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">  edited src/stats.py at line 5</text>
-<text x="16" y="307" textLength="428.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#ffa198">  -     return s[len(s) // 2]  # TODO: even lengths</text>
-<text x="16" y="327" textLength="151.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">  +     n = len(s)</text>
-<text x="16" y="347" textLength="142.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">  +     if n % 2:</text>
-<text x="16" y="367" textLength="235.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">  +         return s[n // 2]</text>
-<text x="16" y="387" textLength="386.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">  +     return (s[n // 2 - 1] + s[n // 2]) / 2</text>
-<text x="16" y="427" textLength="260.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">thought · 1 line · ctrl+o shows</text>
-<text x="16" y="467" textLength="159.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#f2cc60">▸ read src/stats.py</text>
-<text x="16" y="487" textLength="226.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">  def mean(xs):  (+9 lines)</text>
-<text x="16" y="527" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">Fixed </text>
-<text x="66.4" y="527" textLength="100.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">src/stats.py</text>
-<text x="167.2" y="527" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> with two minimal edits:</text>
-<text x="16" y="567" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">1. </text>
-<text x="41.2" y="567" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">mean</text>
-<text x="74.8" y="567" textLength="168" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">: removed the bogus </text>
-<text x="242.8" y="567" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">- 1</text>
-<text x="268" y="567" textLength="134.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">, so it returns </text>
-<text x="402.4" y="567" textLength="142.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">sum(xs) / len(xs)</text>
-<text x="545.2" y="567" textLength="84" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> (matches </text>
-<text x="629.2" y="567" textLength="151.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">mean([1,2,3]) == 2</text>
-<text x="780.4" y="567" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">).</text>
-<text x="16" y="587" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">2. </text>
-<text x="41.2" y="587" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">median</text>
-<text x="91.6" y="587" textLength="319.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">: handled even-length lists — for odd </text>
-<text x="410.8" y="587" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">n</text>
-<text x="419.2" y="587" textLength="344.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> it returns the middle element; for even </text>
-<text x="763.6" y="587" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">n</text>
-<text x="772" y="587" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> it</text>
-<text x="16" y="607" textLength="378" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">   averages the two middle elements (matches </text>
-<text x="394" y="607" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">median([1,2,3,4]) == 2.5</text>
-<text x="595.6" y="607" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">).</text>
-<text x="16" y="647" textLength="789.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">I can&#x27;t run the tests (no test runner available), but both failing assertions are addressed by</text>
-<text x="16" y="667" textLength="117.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">these changes.</text>
+<rect x="16" y="52" width="478.8" height="20" fill="#391a22"/>
+<text x="16" y="67" textLength="478.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#ffa198">  -     return sum(xs) / len(xs) - 1  # TODO: off by one?</text>
+<rect x="494.8" y="52" width="327.6" height="20" fill="#391a22"/>
+<rect x="16" y="72" width="268.8" height="20" fill="#133221"/>
+<text x="16" y="87" textLength="268.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">  +     return sum(xs) / len(xs)</text>
+<rect x="284.8" y="72" width="537.6" height="20" fill="#133221"/>
+<text x="16" y="127" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">● </text>
+<text x="32.8" y="127" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" font-weight="700">edit</text>
+<text x="66.4" y="127" textLength="756" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> src/stats.py                                                                             </text>
+<text x="16" y="147" textLength="277.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">  ⎿ edited src/stats.py at line 5</text>
+<rect x="16" y="152" width="428.4" height="20" fill="#391a22"/>
+<text x="16" y="167" textLength="428.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#ffa198">  -     return s[len(s) // 2]  # TODO: even lengths</text>
+<rect x="444.4" y="152" width="378" height="20" fill="#391a22"/>
+<rect x="16" y="172" width="151.2" height="20" fill="#133221"/>
+<text x="16" y="187" textLength="151.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">  +     n = len(s)</text>
+<rect x="167.2" y="172" width="655.2" height="20" fill="#133221"/>
+<text x="16" y="207" textLength="184.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">  +     if n % 2 == 0:</text>
+<text x="16" y="227" textLength="420" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">  +         return (s[n // 2 - 1] + s[n // 2]) / 2</text>
+<text x="16" y="247" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">  +     return s[n // 2]</text>
+<text x="16" y="287" textLength="806.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">Now let&#x27;s run the tests to confirm everything passes:                                           </text>
+<text x="16" y="327" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">● </text>
+<text x="32.8" y="327" textLength="42" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" font-weight="700">shell</text>
+<text x="74.8" y="327" textLength="747.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> cd /home/me/stats &amp;&amp; python -m pytest tests/test_stats.py -v                            </text>
+<text x="16" y="347" textLength="436.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">  ⎿ exit 1 · /usr/bin/python: No module named pytest</text>
+<text x="16" y="387" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">● </text>
+<text x="32.8" y="387" textLength="42" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" font-weight="700">shell</text>
+<text x="74.8" y="387" textLength="747.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> cd /home/me/stats &amp;&amp; python -m unittest tests/test_stats.py -v                          </text>
+<text x="16" y="407" textLength="310.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">  ⎿ exit 5 · NO TESTS RAN  (+4 lines)</text>
+<text x="16" y="447" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">● </text>
+<text x="32.8" y="447" textLength="42" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" font-weight="700">shell</text>
+<text x="74.8" y="447" textLength="747.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> cd /home/me/stats &amp;&amp; python -c &quot; …                                                      </text>
+<text x="16" y="467" textLength="210" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">  ⎿ ok · All tests passed</text>
+<text x="16" y="507" textLength="806.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">Both tests pass. Here&#x27;s a summary of what was fixed:                                            </text>
+<text x="16" y="547" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">1. </text>
+<text x="41.2" y="547" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">mean</text>
+<text x="74.8" y="547" textLength="193.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">: Removed the spurious </text>
+<text x="268" y="547" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">- 1</text>
+<text x="293.2" y="547" textLength="386.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> that caused an off-by-one error. The mean of </text>
+<text x="679.6" y="547" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">[1,2,3]</text>
+<text x="738.4" y="547" textLength="84" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> is now   </text>
+<text x="16" y="567" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">   correctly </text>
+<text x="125.2" y="567" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">2</text>
+<text x="133.6" y="567" textLength="688.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">.                                                                                 </text>
+<text x="16" y="607" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">2. </text>
+<text x="41.2" y="607" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">median</text>
+<text x="91.6" y="607" textLength="730.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">: For even-length lists, the median is the average of the two middle values. The old   </text>
+<text x="16" y="627" textLength="546" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">   code just took the single middle element (the upper one, e.g. </text>
+<text x="562" y="627" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">3</text>
+<text x="570.4" y="627" textLength="42" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> for </text>
+<text x="612.4" y="627" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">[1,2,3,4]</text>
+<text x="688" y="627" textLength="134.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">). The fix      </text>
+<text x="16" y="647" textLength="84" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">   checks </text>
+<text x="100" y="647" textLength="84" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">n % 2 == 0</text>
+<text x="184" y="647" textLength="327.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> and averages the two middle elements (</text>
+<text x="511.6" y="647" textLength="92.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">s[n//2 - 1]</text>
+<text x="604" y="647" textLength="42" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3"> and </text>
+<text x="646" y="647" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#56d364">s[n//2]</text>
+<text x="704.8" y="647" textLength="117.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">), falling    </text>
+<text x="16" y="667" textLength="806.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3">   back to the middle element for odd-length lists.                                             </text>
 <text x="16" y="687" textLength="806.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">────────────────────────────────────────────────────────────────────────────────────────────────</text>
+<rect x="16" y="692" width="16.8" height="20" fill="#20242a"/>
 <text x="16" y="707" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#b3f0ff" font-weight="700">› </text>
+<rect x="32.8" y="692" width="67.2" height="20" fill="#20242a"/>
 <text x="32.8" y="707" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">Message…</text>
+<rect x="100" y="692" width="722.4" height="20" fill="#20242a"/>
 <text x="16" y="727" textLength="218.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">deepseek/deepseek-v4-flash</text>
-<text x="301.6" y="727" textLength="512.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">in 2273/1M (2048 cached) · out 134 · $0.0001 · ctrl+t context</text>
+<text x="301.6" y="727" textLength="520.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" fill="#e6edf3" fill-opacity="0.55">in 2641/1M (2560 cached) · out 161 · $0.0001 ($0.0006 in all) </text>
 </g></svg>

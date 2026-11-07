@@ -56,6 +56,8 @@ enum Msg {
     History(Vec<String>),
     /// A sign-in that ended: the provider, and its key or what went wrong.
     Login(String, Result<String, String>),
+    /// A question for the user, and where the answer goes.
+    Ask(String, mpsc::Sender<bool>),
 }
 
 /// What a thread does with the session.
@@ -220,11 +222,13 @@ struct App {
     /// A hand-edited context that did not parse, to be opened again.
     kept_edit: Option<std::path::PathBuf>,
     login: Option<LoginWait>,
+    /// Where the answer to the question shown goes: Enter says yes, Esc no.
+    asked: Option<mpsc::Sender<bool>>,
     /// A message sent before signing in, to go once signed in.
     after_login: Option<String>,
 }
 
-pub fn run(session: Session) -> Result<()> {
+pub fn run(mut session: Session) -> Result<()> {
     // Before the input thread: the terminal queries here read input too.
     let term = TermGuard::enter()?;
     theme::detect();
@@ -254,6 +258,14 @@ pub fn run(session: Session) -> Result<()> {
             }
         }
     });
+    let ask_tx = std::sync::Mutex::new(tx.clone());
+    session.tools.ask = Some(Arc::new(move |question: &str| {
+        let (reply, answer) = mpsc::channel();
+        let sent = ask_tx
+            .lock()
+            .is_ok_and(|t| t.send(Msg::Ask(question.into(), reply)).is_ok());
+        sent && answer.recv().unwrap_or(false)
+    }));
     let cwd = session.tools.cwd().display().to_string();
     let api = Api {
         base_url: session.base_url.clone(),
@@ -291,6 +303,7 @@ pub fn run(session: Session) -> Result<()> {
         reading,
         kept_edit: None,
         login: None,
+        asked: None,
         after_login: None,
         served: None,
         timing: None,
@@ -429,6 +442,14 @@ impl App {
                 self.scroll = 0;
             }
             Msg::History(h) => self.input.add_older(h),
+            Msg::Ask(question, reply) => {
+                self.transcript.push(Block::Error(format!(
+                    "{question}\nEnter runs it, Esc refuses."
+                )));
+                self.asked = Some(reply);
+                self.busy = Some("waiting for you".into());
+                self.scroll = 0;
+            }
             Msg::Login(provider, got) => {
                 self.login = None;
                 self.input.forget();
@@ -996,6 +1017,23 @@ impl App {
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         let width = self.input_width();
         let page = self.page();
+        if let Some(reply) = self.asked.take() {
+            let yes = match k.code {
+                KeyCode::Enter if self.input.is_empty() => Some(true),
+                KeyCode::Esc => Some(false),
+                _ => None,
+            };
+            match yes {
+                Some(yes) => {
+                    let _ = reply.send(yes);
+                    let said = if yes { "Allowed." } else { "Refused." };
+                    self.transcript.push(Block::Info(said.into()));
+                    self.busy = Some("running".into());
+                    return;
+                }
+                None => self.asked = Some(reply),
+            }
+        }
         if let Some((_, scroll)) = &mut self.panel {
             match k.code {
                 KeyCode::Esc => return self.panel = None,
@@ -1206,6 +1244,10 @@ impl App {
     }
 
     fn stop(&mut self) {
+        // A question waiting for an answer gets no.
+        if let Some(reply) = self.asked.take() {
+            let _ = reply.send(false);
+        }
         if self.session.is_none() {
             self.cancel.store(true, Ordering::Relaxed);
             self.busy = Some("stopping".into());

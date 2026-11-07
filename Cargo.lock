@@ -10,6 +10,7 @@ dependencies = [
  "crossterm",
  "globset",
  "ignore",
+ "libc",
  "regex",
  "ring",
  "serde",

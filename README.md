@@ -48,12 +48,24 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
   endings and byte order mark. Each edit or overwrite shows the lines it took out and put
   in, and a new file shows its first lines. A PNG, JPEG, GIF or WebP image that the model reads
   is shown to it, when the model takes images.
+- **A shell** for builds, tests, git and scripts, held by Linux's Landlock to what the model
+  may see: commands write only in its directories, the temporary directory and tool caches,
+  cannot read your home outside them, and find hidden paths empty, all checked by the kernel
+  for every program a command starts. Commands that do what a file tool does are refused, so
+  hidden paths stay out of view and changes stay undoable. No container or other user; on
+  systems without Landlock there is no shell unless you allow it ([how](#settings)). The few
+  commands whose harm undo cannot reach, such as a force push, a publish, destroying remote
+  infrastructure, dropping a table or a reboot, wait for your yes.
 - **Tools of your own.** Give the model any program to run, such as your build or tests,
   with its arguments put into the command line and no shell in between
   ([how](#tools-of-your-own)).
 - **Undo.** Every change the agent makes is written to a journal. `/undo` takes changes back,
   the last one or the last few; `/rewind` goes back to an earlier message with every file change
-  since. A file you changed yourself in the meantime is left alone.
+  since. Commands, of the shell or your own tools, are undone the same way: the directories the
+  model may use are looked at right before and after each one, and each file it changed is kept
+  as it was (not inside directories `.gitignore` leaves out, such as build output; an ignored
+  file such as `.env` is kept). A file you changed
+  yourself in the meantime is left alone.
 - **Instructions.** `AGENTS.md` in the working directory and your own
   `~/.config/glasscat/AGENTS.md` go into the system prompt of a new conversation, where
   <kbd>Ctrl</kbd>+<kbd>T</kbd> shows them. A hidden `AGENTS.md` stays out.
@@ -224,6 +236,8 @@ allowed and hidden paths, and your own tools. Add any OpenAI-compatible server u
 | `request` | fields set in every request body, such as `temperature` or `reasoning`; `null` removes one |
 | `models` | settings for one model by its id; for now its own `request` fields, over the others |
 | `tools` | tools of your own: programs the model may run, see below |
+| `shell` | the model's shell: `landlock` (the default: limited, and none without Landlock), `unrestricted` (reaches all you can, hidden paths too) or `off` |
+| `confirm` | whether the few commands undo cannot take back wait for your yes (default `true`) |
 | `instructions` | files in the working directory added to the system prompt (default `["AGENTS.md"]`) |
 | `proxy` | a proxy for every provider; a provider's own `proxy` wins, and `--proxy` wins over both |
 
@@ -269,8 +283,8 @@ run as a command. The program runs in the working directory and is stopped after
 seconds (default 120) or when you press <kbd>Esc</kbd>; the model gets the exit status and
 the output. `read_only` lets it run at the same time as other reading calls.
 
-A tool of your own is outside the rules for hidden paths, and `/undo` cannot take back what
-it changes: it does exactly what the program does.
+A tool of your own is outside the rules for hidden paths: it does exactly what the program
+does. What it changes in the directories the model may use, `/undo` takes back.
 
 ## What you can see
 

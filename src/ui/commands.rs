@@ -292,19 +292,15 @@ impl App {
                     return;
                 };
                 let undone = session.undo_answer();
-                let known = undone.is_some();
-                let (done, failed) = undone.unwrap_or_default();
-                // Changes by the user's own tools, or made before this run.
-                let tools = &session.tools;
-                let changing = |tracked: bool| {
-                    dropped.iter().any(|i| match i {
-                        Item::Assistant(r) => r.calls.iter().any(|c| {
-                            !tools.reads_only(&c.name) && tools.tracks(&c.name) == tracked
-                        }),
+                // Changes made before this run are not known.
+                let untracked = undone.is_none()
+                    && dropped.iter().any(|i| match i {
+                        Item::Assistant(r) => {
+                            r.calls.iter().any(|c| !session.tools.reads_only(&c.name))
+                        }
                         _ => false,
-                    })
-                };
-                let untracked = changing(false) || (!known && changing(true));
+                    });
+                let (done, failed) = undone.unwrap_or_default();
                 let mut text = format!("Asking {} again.", session.model);
                 match done.len() {
                     0 => {}
@@ -317,7 +313,7 @@ impl App {
                 }
                 if untracked {
                     text +=
-                        " What it changed in files in another run or with your own tools stays.";
+                        " What it changed in files in an earlier run stays; /undo cannot reach it.";
                 }
                 let items = session.items.clone();
                 self.transcript.clear();
