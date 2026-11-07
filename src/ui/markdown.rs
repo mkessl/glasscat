@@ -43,6 +43,9 @@ pub fn lines(text: &str, width: usize) -> Vec<Line> {
                 && trimmed.trim_matches(|c| c == '`' || c == '~').is_empty()
             {
                 fence = None;
+                if !code_pad().is_empty() {
+                    fill_code(&mut out, Line::default());
+                }
             } else {
                 let mut spans = if f.diff {
                     highlight::diff_line(line)
@@ -54,12 +57,21 @@ pub fn lines(text: &str, width: usize) -> Vec<Line> {
                 if spans.is_empty() {
                     spans.push((String::new(), Style::default()));
                 }
-                block(&mut out, "", "", spans, width);
+                let mut lines = Vec::new();
+                block(&mut lines, code_pad(), code_pad(), spans, width);
+                for l in lines {
+                    fill_code(&mut out, l);
+                }
             }
             continue;
         }
         if let Some(marker) = fence_marker(trimmed) {
             let info = trimmed[marker.len()..].trim();
+            // A panel gets a first line, naming the language.
+            if !code_pad().is_empty() {
+                let label = info.split_whitespace().next().unwrap_or("");
+                fill_code(&mut out, Line::new(format!(" {label}"), Style::dim()));
+            }
             fence = Some(Fence {
                 lang: highlight::lang(info),
                 diff: highlight::is_diff(info),
@@ -72,10 +84,10 @@ pub fn lines(text: &str, width: usize) -> Vec<Line> {
         if trimmed.is_empty() {
             out.push(Line::default());
         } else if let Some((level, title)) = heading(trimmed) {
-            let style = if level <= 2 {
-                Style::default().bold()
-            } else {
-                Style::dim().bold()
+            let style = match level {
+                1 | 2 => Style::fg(Color::Blue).bold(),
+                3 => Style::default().bold(),
+                _ => Style::dim().bold(),
             };
             block(&mut out, "", "", inline(title, style), width);
         } else if is_rule(trimmed) {
@@ -106,6 +118,23 @@ pub fn lines(text: &str, width: usize) -> Vec<Line> {
     out
 }
 
+/// Room left of code in a panel; none without one.
+fn code_pad() -> &'static str {
+    if super::theme::get().code.is_some() {
+        " "
+    } else {
+        ""
+    }
+}
+
+/// Adds a line of code, on the code panel.
+fn fill_code(out: &mut Vec<Line>, l: Line) {
+    out.push(Line {
+        fill: super::theme::get().code,
+        ..l
+    });
+}
+
 /// An open code block.
 struct Fence {
     /// What closes it.
@@ -131,7 +160,7 @@ fn block(out: &mut Vec<Line>, first: &str, next: &str, spans: Vec<Span>, width: 
             };
             l.insert(0, (prefix.to_string(), style));
         }
-        out.push(Line { spans: l });
+        out.push(Line::spans(l));
     }
 }
 
@@ -272,7 +301,7 @@ fn table(out: &mut Vec<Line>, rows: &[Vec<String>], align: &[Align], width: usiz
                     line.push((" ".repeat(after), Style::default()));
                 }
             }
-            out.push(Line { spans: line });
+            out.push(Line::spans(line));
         }
         if r == 0 {
             rule(out);
@@ -395,10 +424,22 @@ fn spans(s: &str, base: Style, literal: &[usize]) -> (Vec<Span>, Option<usize>) 
         if c == '['
             && let Some((text, url, len)) = link(rest)
         {
-            push(text, style(bold, italic, strike).underline());
+            let id = super::screen::link(url);
+            push(text, style(bold, italic, strike).underline().link(id));
             if url != text {
-                push(&format!(" ({url})"), Style::dim());
+                push(&format!(" ({url})"), Style::dim().link(id));
             }
+            rest = &rest[len..];
+            continue;
+        }
+        if let Some(len) = bare_url(rest)
+            && !word(s[..at].chars().next_back())
+        {
+            let url = &rest[..len];
+            push(
+                url,
+                style(bold, italic, strike).link(super::screen::link(url)),
+            );
             rest = &rest[len..];
             continue;
         }
@@ -486,6 +527,39 @@ fn closes(s: &str) -> bool {
     })
 }
 
+/// The length of an http or https address at the start of `s`, without
+/// the punctuation that ends a sentence or closes a bracket around it.
+fn bare_url(s: &str) -> Option<usize> {
+    let after = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))?;
+    let end = s.len() - after.len()
+        + after
+            .find(|c: char| c.is_whitespace() || "<>\"`".contains(c))
+            .unwrap_or(after.len());
+    let mut url = &s[..end];
+    loop {
+        let trimmed = url.trim_end_matches(['.', ',', ';', ':', '!', '?', '\'', '*', '_']);
+        // A closing bracket stays when the address opened one: wiki links.
+        let trimmed = match trimmed.chars().last() {
+            Some(c @ (')' | ']')) => {
+                let open = if c == ')' { '(' } else { '[' };
+                if trimmed.matches(open).count() < trimmed.matches(c).count() {
+                    &trimmed[..trimmed.len() - 1]
+                } else {
+                    trimmed
+                }
+            }
+            _ => trimmed,
+        };
+        if trimmed.len() == url.len() {
+            break;
+        }
+        url = trimmed;
+    }
+    (url.len() > s.len() - after.len()).then_some(url.len())
+}
+
 /// `[text](url)` at the start of `s`: the text, the address, and the
 /// length of the whole.
 fn link(s: &str) -> Option<(&str, &str, usize)> {
@@ -504,6 +578,27 @@ fn link(s: &str) -> Option<(&str, &str, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_addresses_end_where_the_sentence_does() {
+        fn at(s: &str) -> Option<&str> {
+            bare_url(s).map(|n| &s[..n])
+        }
+        assert_eq!(at("https://a.io/x_y."), Some("https://a.io/x_y"));
+        assert_eq!(
+            at("https://en.wikipedia.org/wiki/Rust_(language))"),
+            Some("https://en.wikipedia.org/wiki/Rust_(language)")
+        );
+        assert_eq!(at("http://a.io), and"), Some("http://a.io"));
+        assert_eq!(at("https:// no"), None);
+        assert_eq!(at("ftp://a"), None);
+        // Underscores in an address are not italic markers.
+        let spans = inline("see https://a.io/_x_ now", Style::default());
+        assert_eq!(
+            spans.iter().map(|s| s.0.as_str()).collect::<String>(),
+            "see https://a.io/_x_ now"
+        );
+    }
 
     fn texts(md: &str, width: usize) -> Vec<String> {
         lines(md, width).iter().map(Line::text).collect()

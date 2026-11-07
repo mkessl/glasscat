@@ -18,6 +18,8 @@ pub struct Style {
     pub underline: bool,
     pub reverse: bool,
     pub strike: bool,
+    /// The address the text opens, from `link`; 0 for none.
+    pub link: u16,
 }
 
 impl Style {
@@ -31,6 +33,7 @@ impl Style {
             underline: false,
             reverse: false,
             strike: false,
+            link: 0,
         }
     }
     pub const fn dim() -> Self {
@@ -43,6 +46,7 @@ impl Style {
             underline: false,
             reverse: false,
             strike: false,
+            link: 0,
         }
     }
     pub const fn bold(mut self) -> Self {
@@ -65,6 +69,51 @@ impl Style {
         self.strike = true;
         self
     }
+    pub const fn link(mut self, id: u16) -> Self {
+        self.link = id;
+        self
+    }
+}
+
+/// Addresses that text opens when clicked (OSC 8), each kept once.
+static LINKS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The id of `url` for `Style::link`; 0 when it cannot be a link: a scheme
+/// other than http, https or mailto, or a terminal known not to take links.
+/// Anything but printable ASCII is percent-encoded, so the address cannot
+/// carry escape sequences of its own.
+pub fn link(url: &str) -> u16 {
+    let scheme = ["https://", "http://", "mailto:"];
+    let term = std::env::var("TERM").unwrap_or_default();
+    if !scheme.iter().any(|s| url.starts_with(s)) || term == "linux" || term == "dumb" {
+        return 0;
+    }
+    let mut safe = String::with_capacity(url.len());
+    for b in url.bytes() {
+        if (0x21..0x7f).contains(&b) {
+            safe.push(b as char);
+        } else {
+            safe.push_str(&format!("%{b:02X}"));
+        }
+    }
+    let mut links = LINKS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = links.iter().position(|l| *l == safe) {
+        return i as u16 + 1;
+    }
+    if links.len() >= u16::MAX as usize - 1 {
+        return 0;
+    }
+    links.push(safe);
+    links.len() as u16
+}
+
+/// Opens the link `id` from here on, or closes the open one with 0.
+fn open_link(out: &mut impl Write, id: u16) -> io::Result<()> {
+    let links = LINKS.lock().unwrap_or_else(|e| e.into_inner());
+    let url = links
+        .get((id as usize).wrapping_sub(1))
+        .map_or("", String::as_str);
+    write!(out, "\x1b]8;;{url}\x1b\\")
 }
 
 /// One cell's text: a character and any zero-width marks after it, inline.
@@ -126,6 +175,7 @@ const BLANK: Cell = Cell {
         underline: false,
         reverse: false,
         strike: false,
+        link: 0,
     },
 };
 
@@ -215,6 +265,15 @@ impl Screen {
         x
     }
 
+    /// The address the text shown at `x`, `y` opens, if it is a link.
+    pub fn link_at(&self, x: u16, y: u16) -> Option<String> {
+        let cell = self.shown.get(y as usize * self.w as usize + x as usize)?;
+        let links = LINKS.lock().unwrap_or_else(|e| e.into_inner());
+        links
+            .get((cell.style.link as usize).checked_sub(1)?)
+            .cloned()
+    }
+
     /// Sends the frame to the terminal.
     pub fn flush(&mut self, out: &mut impl Write) -> io::Result<()> {
         queue!(out, terminal::BeginSynchronizedUpdate, cursor::Hide)?;
@@ -228,6 +287,7 @@ impl Screen {
             self.stale = false;
         }
         let mut style: Option<Style> = None;
+        let mut open = 0;
         let mut at: Option<(u16, u16)> = None;
         for y in 0..self.h {
             for x in 0..self.w {
@@ -243,12 +303,19 @@ impl Screen {
                     set_style(out, cell.style)?;
                     style = Some(cell.style);
                 }
+                if open != cell.style.link {
+                    open_link(out, cell.style.link)?;
+                    open = cell.style.link;
+                }
                 out.write_all(cell.sym.as_str().as_bytes())?;
                 let wide = x + 1 < self.w && self.cells[i + 1].sym == Sym::CONT;
                 at = Some((x + 1 + u16::from(wide), y));
             }
         }
         self.shown.copy_from_slice(&self.cells);
+        if open != 0 {
+            open_link(out, 0)?;
+        }
         queue!(out, SetAttribute(Attribute::Reset))?;
         if let Some((x, y)) = self.cursor {
             queue!(out, cursor::MoveTo(x, y), cursor::Show)?;
@@ -325,5 +392,23 @@ mod tests {
         s.flush(&mut second).unwrap();
         let text = String::from_utf8_lossy(&second);
         assert!(text.contains('O') && !text.contains("hell"), "{text:?}");
+    }
+
+    #[test]
+    fn links_open_and_close_and_stay_plain_text() {
+        let id = link("https://example.com/a\x1b]0;x\x07b");
+        assert!(id > 0 || std::env::var("TERM").is_ok_and(|t| t == "linux" || t == "dumb"));
+        assert_eq!(link("javascript:alert(1)"), 0);
+        let mut s = Screen::new(10, 1);
+        s.put(0, 0, 10, "ab", Style::default().link(id));
+        s.put(2, 0, 10, "c", Style::default());
+        let mut out = Vec::new();
+        s.flush(&mut out).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        if id > 0 {
+            let opened = "\x1b]8;;https://example.com/a%1B]0;x%07b\x1b\\ab";
+            assert!(text.contains(opened), "{text:?}");
+            assert!(text.contains("\x1b]8;;\x1b\\"), "{text:?}");
+        }
     }
 }

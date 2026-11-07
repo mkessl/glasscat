@@ -52,7 +52,8 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
   with its arguments put into the command line and no shell in between
   ([how](#tools-of-your-own)).
 - **Undo.** Every change the agent makes is written to a journal. `/undo` takes changes back,
-  the last one or the last few, and leaves alone a file you changed yourself in the meantime.
+  the last one or the last few; `/rewind` goes back to an earlier message with every file change
+  since. A file you changed yourself in the meantime is left alone.
 - **Instructions.** `AGENTS.md` in the working directory and your own
   `~/.config/glasscat/AGENTS.md` go into the system prompt of a new conversation, where
   <kbd>Ctrl</kbd>+<kbd>T</kbd> shows them. A hidden `AGENTS.md` stays out.
@@ -69,7 +70,10 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
 - **Markdown** in replies is rendered: headings, lists and task lists, quotes, tables, links,
   bold, italic and struck text, and code in colour for the common languages and diffs, in your
   terminal's own palette.
-  A table too wide for the screen wraps its widest cells.
+  Your messages, the input, code blocks and changed lines sit on soft panels worked out from
+  the terminal's background, light or dark; a terminal that does not report it gets none.
+  A table too wide for the screen wraps its widest cells. Links and web addresses open with a
+  click, even where an address wraps onto the next line.
 - **Usage, cost and speed** of each request in the status bar: the context used out of the
   model's window, cache hits, time to the first token, tokens per second, and what all the
   requests so far cost together; `/usage` lists each request. When the provider's cache gives
@@ -136,8 +140,9 @@ Inside a session:
 | <kbd>Shift</kbd>+drag | select text (in most terminals) |
 | `/model <id>` | switch the model |
 | `/resume` | earlier conversations held in this directory; `/resume N` picks one up |
-| `/retry` | drop the last answer and ask again, say after switching the model |
+| `/retry` | drop the last answer and its file changes, and ask again, say after switching the model |
 | `/models <words>` | find models by id, with context window and price; on OpenRouter, `ZDR` marks those a provider keeping no data runs, and the word `zdr` keeps to them; `no tools` marks those that can only talk, which are sent no tools |
+| `/rewind` | go back to an earlier message: the conversation as it was then, the file changes since taken back, the message in the input |
 | `/undo` | undo the agent's last file change; `/undo 3`, the last three |
 | `/changes` | the agent's file changes in this session, which `/undo` takes back in turn |
 | `/access` | a tree of what the model may see, to hide or show paths; or `hide`, `show`, `allow` PATH |

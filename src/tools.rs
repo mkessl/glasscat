@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 
@@ -28,8 +28,11 @@ pub struct Tools {
     /// What the model may see; the user may change it as it runs.
     pub access: Access,
     journal: Journal,
-    /// This run's changes, last at the end, for /undo.
-    changes: Mutex<Vec<Change>>,
+    /// This run's changes, last at the end, for /undo and /rewind, each
+    /// with its number in the order they were made.
+    changes: Mutex<Vec<(u64, Change)>>,
+    /// The number the next change gets.
+    seq: AtomicU64,
     /// The user's own tools, from the settings.
     custom: std::collections::BTreeMap<String, CustomTool>,
     /// Where reports to the developers are saved.
@@ -198,6 +201,7 @@ impl Tools {
             access,
             journal,
             changes: Mutex::new(Vec::new()),
+            seq: AtomicU64::new(0),
             custom: Default::default(),
             reports: crate::journal::data_dir().join("reports"),
             touched: Mutex::default(),
@@ -259,6 +263,12 @@ impl Tools {
         read_only(name) || self.custom.get(name).is_some_and(|t| t.read_only)
     }
 
+    /// Whether what tool `name` changes is written down, so /undo,
+    /// /rewind and /retry can take it back: the built-in tools.
+    pub fn tracks(&self, name: &str) -> bool {
+        !self.custom.contains_key(name)
+    }
+
     /// Notes that the model read `path`, or changed it.
     fn touch(&self, path: &Path, changed: bool) {
         let mut t = self.touched.lock().unwrap_or_else(|e| e.into_inner());
@@ -274,10 +284,44 @@ impl Tools {
 
     fn remember(&self, change: Change) {
         self.touch(&change.path, true);
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         self.changes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(change);
+            .push((seq, change));
+    }
+
+    /// The number the next change will get: `rewind` to it takes back
+    /// all that come after this moment.
+    pub fn next_change(&self) -> u64 {
+        self.seq.load(Ordering::Relaxed)
+    }
+
+    /// How many changes not yet undone were made from change `from` on.
+    pub fn changes_since(&self, from: u64) -> usize {
+        let changes = self.changes.lock().unwrap_or_else(|e| e.into_inner());
+        changes.iter().filter(|(n, _)| *n >= from).count()
+    }
+
+    /// Undoes every change from change `from` on, last first: what was
+    /// undone, and what could not be, each as a line for the user.
+    pub fn rewind(&self, from: u64) -> (Vec<String>, Vec<String>) {
+        let (mut done, mut failed) = (Vec::new(), Vec::new());
+        loop {
+            let change = {
+                let mut changes = self.changes.lock().unwrap_or_else(|e| e.into_inner());
+                match changes.last() {
+                    Some((n, _)) if *n >= from => changes.pop().map(|c| c.1),
+                    _ => None,
+                }
+            };
+            let Some(change) = change else { break };
+            match self.undo_change(change) {
+                Ok(d) => done.push(d),
+                Err(e) => failed.push(e),
+            }
+        }
+        (done, failed)
     }
 
     /// This run's changes still to undo, one per line, the next to undo
@@ -290,7 +334,7 @@ impl Tools {
         let mut out = String::from(
             "Changes to files in this run, oldest first; /undo takes back the last.\n\n",
         );
-        for c in changes.iter() {
+        for (_, c) in changes.iter() {
             out += &format!("  {}: {}\n", self.access.show(&c.path), c.what);
         }
         out + &format!(
@@ -307,7 +351,14 @@ impl Tools {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .pop()
-            .ok_or("No changes to undo.")?;
+            .ok_or("No changes to undo.")?
+            .1;
+        self.undo_change(change)
+            .map_err(|e| e + " /undo again goes one change further back.")
+    }
+
+    /// Takes back one change; it is gone from the list either way.
+    fn undo_change(&self, change: Change) -> Result<String, String> {
         let shown = self.access.show(&change.path);
         let now = fs::read(&change.path).ok();
         let gone = fs::symlink_metadata(&change.path).is_err();
@@ -319,7 +370,7 @@ impl Tools {
         };
         if !same {
             return Err(format!(
-                "{shown} was changed after {}, so it was left as it is. /undo again goes one change further back.",
+                "{shown} was changed after {}, so it was left as it is.",
                 change.what
             ));
         }
@@ -352,7 +403,7 @@ impl Tools {
                 let back = self.access.show(from);
                 if fs::symlink_metadata(from).is_ok() {
                     return Err(format!(
-                        "{back} exists again, so {shown} was left where it is. /undo again goes one change further back."
+                        "{back} exists again, so {shown} was left where it is."
                     ));
                 }
                 if let Some(dir) = from.parent() {

@@ -183,6 +183,8 @@ pub fn open_browser(url: &str) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
+        // Waited for, so it leaves no finished process behind.
+        .map(|mut child| std::thread::spawn(move || child.wait()))
         .is_ok()
 }
 

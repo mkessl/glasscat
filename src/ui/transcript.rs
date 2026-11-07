@@ -27,13 +27,20 @@ pub enum Block {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Line {
     pub spans: Vec<Span>,
+    /// A background the line has to the edge of the screen.
+    pub fill: Option<Color>,
 }
 
 impl Line {
     pub fn new(text: String, style: Style) -> Self {
         Self {
             spans: vec![(text, style)],
+            fill: None,
         }
+    }
+
+    pub fn spans(spans: Vec<Span>) -> Self {
+        Self { spans, fill: None }
     }
 
     pub fn text(&self) -> String {
@@ -42,7 +49,6 @@ impl Line {
 }
 
 const USER: Style = Style::fg(Color::Cyan);
-const TOOL: Style = Style::fg(Color::Yellow);
 const ERROR: Style = Style::fg(Color::Red);
 const ADDED: Style = Style::fg(Color::Green);
 
@@ -146,7 +152,10 @@ impl Transcript {
     }
 }
 
-static BLANK: Line = Line { spans: Vec::new() };
+static BLANK: Line = Line {
+    spans: Vec::new(),
+    fill: None,
+};
 
 fn layout(b: &Block, width: usize, reasoning_open: bool, last: bool, cwd: &str) -> Vec<Line> {
     let mut out = Vec::new();
@@ -159,14 +168,22 @@ fn layout(b: &Block, width: usize, reasoning_open: bool, last: bool, cwd: &str) 
             if !reasoning_open && more > 1 {
                 lines.truncate(USER_LINES);
             }
+            let panel = super::theme::get().panel;
             for (i, l) in lines.into_iter().enumerate() {
-                add(format!("{} {l}", if i == 0 { '›' } else { ' ' }), USER);
+                let mark = if i == 0 { "› " } else { "  " };
+                out.push(Line {
+                    spans: vec![(mark.into(), USER.bold()), (l, Style::default())],
+                    fill: panel,
+                });
             }
             if !reasoning_open && more > 1 {
-                add(
-                    clip(&format!("  … {more} more lines · ctrl+o shows"), width),
-                    Style::dim(),
-                );
+                out.push(Line {
+                    spans: vec![(
+                        clip(&format!("  … {more} more lines · ctrl+o shows"), width),
+                        Style::dim(),
+                    )],
+                    fill: panel,
+                });
             }
         }
         // A block that so far holds only whitespace takes no room.
@@ -185,12 +202,10 @@ fn layout(b: &Block, width: usize, reasoning_open: bool, last: bool, cwd: &str) 
                 && !t.contains('\n')
                 && super::text::width(&label) + super::text::width(t) <= width
             {
-                out.push(Line {
-                    spans: vec![
-                        (label, Style::dim()),
-                        (t.to_string(), Style::dim().italic()),
-                    ],
-                });
+                out.push(Line::spans(vec![
+                    (label, Style::dim()),
+                    (t.to_string(), Style::dim().italic()),
+                ]));
                 return out;
             }
             let lines = wrap(t, width);
@@ -215,19 +230,34 @@ fn layout(b: &Block, width: usize, reasoning_open: bool, last: bool, cwd: &str) 
             result,
             before,
         } => {
-            add(
-                clip(&format!("▸ {name} {}", summary(args, cwd)), width),
-                TOOL,
-            );
             let failed = result.starts_with("error:");
-            let style = if failed { ERROR } else { Style::dim() };
-            add(
-                clip(&format!("  {}", outcome(name, result, failed)), width),
-                style,
+            let dot = if failed { ERROR } else { ADDED };
+            let what = clip(
+                &format!(" {}", summary(args, cwd)),
+                width.saturating_sub(3 + super::text::width(name)),
             );
+            out.push(Line::spans(vec![
+                ("● ".into(), dot),
+                (name.clone(), Style::default().bold()),
+                (what, Style::default()),
+            ]));
+            let style = if failed { ERROR } else { Style::dim() };
+            out.push(Line::new(
+                clip(&format!("  ⎿ {}", outcome(name, result, failed)), width),
+                style,
+            ));
             if !failed {
+                let theme = super::theme::get();
                 for (text, style) in change(name, args, result, before.as_deref()) {
-                    add(clip(&text, width), style);
+                    let fill = match text.trim_start().chars().next() {
+                        Some('+') if style == ADDED => theme.added,
+                        Some('-') if style == ERROR => theme.removed,
+                        _ => None,
+                    };
+                    out.push(Line {
+                        spans: vec![(clip(&text, width), style)],
+                        fill,
+                    });
                 }
             }
         }
@@ -481,7 +511,7 @@ mod tests {
             result: "a\nb\nc".into(),
             before: None,
         });
-        assert_eq!(texts(&mut t, 40), ["▸ read src/main.rs", "  3 lines"]);
+        assert_eq!(texts(&mut t, 40), ["● read src/main.rs", "  ⎿ 3 lines"]);
         assert_eq!(summary(r#"{"pattern":"x","path":""}"#, "/p"), "x");
         assert_eq!(
             summary(r#"{"pattern":"x","path":"./src"}"#, "/p"),
@@ -530,14 +560,14 @@ mod tests {
             result: String::new(),
             before: None,
         });
-        assert_eq!(texts(&mut t, 40)[3], "▸ find *.rs in src");
+        assert_eq!(texts(&mut t, 40)[3], "● find *.rs in src");
         t.push(Block::Tool {
             name: "search".into(),
             args: r#"{"pattern":"fn","path":"."}"#.into(),
             result: String::new(),
             before: None,
         });
-        assert_eq!(texts(&mut t, 40)[6], "▸ search fn");
+        assert_eq!(texts(&mut t, 40)[6], "● search fn");
     }
 
     #[test]
@@ -552,8 +582,8 @@ mod tests {
         assert_eq!(
             texts(&mut t, 40),
             [
-                "▸ edit a.rs",
-                "  edited a.rs at line 3",
+                "● edit a.rs",
+                "  ⎿ edited a.rs at line 3",
                 "  - let x = 1;",
                 "  - foo();",
                 "  + let x = 2;"
@@ -577,7 +607,7 @@ mod tests {
         });
         assert_eq!(
             texts(&mut t, 40).last().unwrap(),
-            "  error: old text not found"
+            "  ⎿ error: old text not found"
         );
         let mut t = Transcript::default();
         for (result, before) in [
@@ -595,16 +625,16 @@ mod tests {
         assert_eq!(
             texts(&mut t, 40),
             [
-                "▸ write n.md",
-                "  created n.md (2 lines)",
+                "● write n.md",
+                "  ⎿ created n.md (2 lines)",
                 "  + # N",
                 "  + ok",
                 "",
-                "▸ write n.md",
-                "  wrote n.md (2 lines)",
+                "● write n.md",
+                "  ⎿ wrote n.md (2 lines)",
                 "",
-                "▸ write n.md",
-                "  wrote n.md (2 lines)",
+                "● write n.md",
+                "  ⎿ wrote n.md (2 lines)",
                 "  - old",
                 "  + ok"
             ]

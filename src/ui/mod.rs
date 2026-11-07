@@ -8,6 +8,7 @@ mod input;
 mod markdown;
 mod screen;
 mod text;
+mod theme;
 mod transcript;
 
 pub use text::money;
@@ -226,6 +227,7 @@ struct App {
 pub fn run(session: Session) -> Result<()> {
     // Before the input thread: the terminal queries here read input too.
     let term = TermGuard::enter()?;
+    theme::detect();
     let (w, h) = terminal::size()?;
     let (tx, rx) = mpsc::channel();
     let input_tx = tx.clone();
@@ -396,6 +398,14 @@ impl App {
                     {
                         f.click(row);
                     }
+                }
+                MouseEventKind::Down(_)
+                    if matches!(self.view, View::Chat)
+                        && let Some(url) = self.screen.link_at(m.column, m.row) =>
+                {
+                    // Mouse reports take the click from the terminal's own
+                    // link handling, so the link is opened here.
+                    crate::oauth::open_browser(&url);
                 }
                 MouseEventKind::Down(_) if matches!(self.view, View::Chat) => {
                     let (y0, top) = self.input_at;
@@ -1356,8 +1366,24 @@ impl App {
             }
         }
 
-        // Input.
-        let prompt_style = Style::fg(Color::Cyan).bold();
+        // Input, on the same panel as the user's messages.
+        let panel = theme::get().panel;
+        let on_panel = |s: Style| Style {
+            bg: s.bg.or(panel),
+            ..s
+        };
+        if panel.is_some() {
+            for i in 0..shown as u16 {
+                self.screen.put(
+                    0,
+                    input_y + i,
+                    w,
+                    &" ".repeat(w as usize),
+                    on_panel(Style::default()),
+                );
+            }
+        }
+        let prompt_style = on_panel(Style::fg(Color::Cyan).bold());
         let px = text::width(PROMPT) as u16;
         self.screen.put(0, input_y, w, PROMPT, prompt_style);
         let hint = match &self.login {
@@ -1366,7 +1392,8 @@ impl App {
             None => "Message…",
         };
         if self.input.is_empty() {
-            self.screen.put(px, input_y, w, hint, Style::dim());
+            self.screen
+                .put(px, input_y, w, hint, on_panel(Style::dim()));
         }
         for (i, r) in rows.iter().skip(top).take(shown).enumerate() {
             let text = &self.input.text()[r.start..r.end];
@@ -1379,7 +1406,7 @@ impl App {
                 text
             };
             self.screen
-                .put(px, input_y + i as u16, w, text, Style::default());
+                .put(px, input_y + i as u16, w, text, on_panel(Style::default()));
         }
         self.screen
             .set_cursor(Some((px + col as u16, input_y + (row - top) as u16)));
@@ -1588,7 +1615,19 @@ fn replay(items: &[Item], t: &mut Transcript) {
 fn put_line(screen: &mut Screen, y: u16, w: u16, line: &transcript::Line) {
     let mut x = 0;
     for (text, style) in &line.spans {
-        x = screen.put(x, y, w, text, *style);
+        let mut style = *style;
+        style.bg = style.bg.or(line.fill);
+        x = screen.put(x, y, w, text, style);
+    }
+    // A panel runs to the edge of the screen.
+    if let Some(bg) = line.fill
+        && x < w
+    {
+        let fill = Style {
+            bg: Some(bg),
+            ..Style::default()
+        };
+        screen.put(x, y, w, &" ".repeat((w - x) as usize), fill);
     }
 }
 

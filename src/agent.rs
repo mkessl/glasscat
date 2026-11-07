@@ -42,6 +42,10 @@ pub struct Session {
     last_input: Option<(u64, usize)>,
     /// A summary being written on the side before it is needed.
     prepared: Option<Prepared>,
+    /// For each user message of this run still in `items`: where it
+    /// stands there, and the number of the first file change made after
+    /// it was sent, for `rewind`.
+    marks: Vec<(usize, u64)>,
 }
 
 /// Share of the window, in percent, from which old tool results are
@@ -228,6 +232,7 @@ impl Session {
             launch: Default::default(),
             last_input: None,
             prepared: None,
+            marks: Vec::new(),
         }
     }
 
@@ -244,6 +249,7 @@ impl Session {
     /// Puts in a context edited by hand, and saves it.
     pub fn set_items(&mut self, items: Vec<Item>) -> Result<()> {
         self.items = items;
+        self.marks.clear();
         self.prepared = None;
         self.last_input = None;
         self.save(Ok(()))
@@ -276,6 +282,7 @@ impl Session {
     /// Forgets the conversation; the system prompt stays.
     pub fn clear(&mut self) {
         self.items.truncate(1);
+        self.marks.clear();
         self.prepared = None;
         self.last_input = None;
         self.notes.clear();
@@ -299,6 +306,53 @@ impl Session {
         Some(self.items.split_off(last + 1))
     }
 
+    /// Takes back the file changes made since the last user message was
+    /// sent: what was undone, and what could not be; None when it was sent
+    /// before this run, so its changes are not known.
+    pub fn undo_answer(&mut self) -> Option<(Vec<String>, Vec<String>)> {
+        let last = self
+            .items
+            .iter()
+            .rposition(|i| matches!(i, Item::User(_)))?;
+        let &(at, from) = self.marks.last()?;
+        (at == last).then(|| self.tools.rewind(from))
+    }
+
+    /// The user messages `rewind` can go back to, latest first: the
+    /// message, and how many file changes not yet undone came after it.
+    pub fn rewind_points(&self) -> Vec<(&str, usize)> {
+        self.marks
+            .iter()
+            .rev()
+            .filter_map(|&(at, from)| match self.items.get(at) {
+                Some(Item::User(text)) => Some((text.as_str(), self.tools.changes_since(from))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Goes back to just before the `n`th latest user message (1 is the
+    /// last): the conversation as it was then, and every file change made
+    /// since taken back. Returns the message, and what was undone and what
+    /// could not be, as lines for the user.
+    pub fn rewind(&mut self, n: usize) -> Option<(String, Vec<String>, Vec<String>)> {
+        let at = self.marks.len().checked_sub(n).filter(|_| n > 0)?;
+        let (item, from) = self.marks[at];
+        let Some(Item::User(text)) = self.items.get(item) else {
+            return None;
+        };
+        let text = text.clone();
+        let (done, failed) = self.tools.rewind(from);
+        self.marks.truncate(at);
+        self.items.truncate(item);
+        self.prepared = None;
+        self.last_input = None;
+        self.notes.clear();
+        // Saved as it now is; what was cut off is gone from the file too.
+        let _ = self.save(Ok(()));
+        Some((text, done, failed))
+    }
+
     /// Undoes the last file change the tools made; the model is told
     /// with the next message.
     pub fn undo(&mut self) -> std::result::Result<String, String> {
@@ -320,6 +374,8 @@ impl Session {
         } else {
             format!("{}\n\n{prompt}", std::mem::take(&mut self.notes).join("\n"))
         };
+        self.marks
+            .push((self.items.len(), self.tools.next_change()));
         self.items.push(Item::User(prompt));
         let r = self.run(cancel, on);
         self.save(r)
@@ -746,7 +802,14 @@ impl Session {
         let kept = self.keep_whole(&full);
         // The user's own words may take a tenth of the window.
         let max_user = window.map_or(40_000, |w| (w * 4 / 10) as usize);
-        compact::apply(&mut self.items, cut, &summary.text, max_user);
+        let removed = compact::apply(&mut self.items, cut, &summary.text, max_user);
+        if !removed.is_empty() {
+            // A message folded into the summary can no longer be gone back to.
+            self.marks.retain(|m| m.0 >= cut);
+            for m in &mut self.marks {
+                m.0 = m.0 + 1 - removed.len();
+            }
+        }
         self.last_input = None;
         on(Shown::Compacted {
             before,
@@ -1125,6 +1188,53 @@ mod tests {
         assert_eq!(msgs[3]["tool_call_id"], "r1");
         assert_eq!(msgs[4]["content"], "beta\n");
         assert!(matches!(session.items.last(), Some(Item::Assistant(r)) if r.text == "done"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rewind_takes_back_the_conversation_and_the_files() {
+        let dir = std::env::temp_dir().join(format!("agent-rewind-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "one\n").unwrap();
+        let done = |t: &str| {
+            sse(&[
+                &format!(
+                    r#"{{"choices":[{{"delta":{{"content":"{t}"}},"finish_reason":"stop"}}]}}"#
+                ),
+                "[DONE]",
+            ])
+        };
+        let edit = |id: &str, old: &str, new: &str| {
+            sse(&[&format!(
+                r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,"id":"{id}","function":{{"name":"edit","arguments":"{{\"path\":\"a.txt\",\"old\":\"{old}\",\"new\":\"{new}\"}}"}}}}]}},"finish_reason":"tool_calls"}}]}}"#
+            )])
+        };
+        let (url, server) = serve(vec![
+            edit("e1", "one", "two"),
+            done("first"),
+            edit("e2", "two", "three"),
+            done("second"),
+        ]);
+        let access = Access::new(&dir, std::slice::from_ref(&dir), &[]).unwrap();
+        let tools = Tools::new(access, Journal::new(dir.join("j.jsonl")));
+        let mut session = Session::new(url, "m".into(), None, Prefill::None, tools);
+        let stop = AtomicBool::new(false);
+        session.turn("make it two".into(), &stop, |_| {}).unwrap();
+        session.turn("make it three".into(), &stop, |_| {}).unwrap();
+        server.join().unwrap();
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "three\n");
+        assert_eq!(
+            session.rewind_points(),
+            [("make it three", 1), ("make it two", 2)]
+        );
+        assert!(session.rewind(0).is_none() && session.rewind(3).is_none());
+        let (message, done, failed) = session.rewind(2).unwrap();
+        assert_eq!(message, "make it two");
+        assert_eq!((done.len(), failed.len()), (2, 0));
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+        assert_eq!(session.items.len(), 1, "only the system prompt is left");
+        assert!(session.rewind_points().is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 

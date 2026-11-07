@@ -291,20 +291,41 @@ impl App {
                         .push(Block::Error("There is no message to answer again.".into()));
                     return;
                 };
-                let changed = dropped.iter().any(|i| match i {
-                    Item::Assistant(r) => {
-                        r.calls.iter().any(|c| !session.tools.reads_only(&c.name))
-                    }
-                    _ => false,
-                });
+                let undone = session.undo_answer();
+                let known = undone.is_some();
+                let (done, failed) = undone.unwrap_or_default();
+                // Changes by the user's own tools, or made before this run.
+                let tools = &session.tools;
+                let changing = |tracked: bool| {
+                    dropped.iter().any(|i| match i {
+                        Item::Assistant(r) => r.calls.iter().any(|c| {
+                            !tools.reads_only(&c.name) && tools.tracks(&c.name) == tracked
+                        }),
+                        _ => false,
+                    })
+                };
+                let untracked = changing(false) || (!known && changing(true));
                 let mut text = format!("Asking {} again.", session.model);
-                if changed {
-                    text += " What the dropped answer changed in files stays; /undo takes it back.";
+                match done.len() {
+                    0 => {}
+                    1 => text += " The 1 file change the dropped answer made was taken back.",
+                    n => {
+                        text += &format!(
+                            " The {n} file changes the dropped answer made were taken back."
+                        )
+                    }
+                }
+                if untracked {
+                    text +=
+                        " What it changed in files in another run or with your own tools stays.";
                 }
                 let items = session.items.clone();
                 self.transcript.clear();
                 super::replay(&items, &mut self.transcript);
                 self.transcript.push(Block::Info(text));
+                if !failed.is_empty() {
+                    self.transcript.push(Block::Error(failed.join("\n")));
+                }
                 self.start(None);
             }
             "/resume" => {
@@ -392,6 +413,60 @@ impl App {
             "/changes" => {
                 let text = session.tools.changes();
                 self.show(text);
+            }
+            "/rewind" if arg.is_empty() => {
+                let points = session.rewind_points();
+                if points.is_empty() {
+                    return self.show(
+                        "No message of this run to go back to: /rewind goes back to one sent \
+                         since glasscat started, and not past a compaction."
+                            .into(),
+                    );
+                }
+                let mut text = String::from(
+                    "/rewind N goes back to just before message N: the conversation as it was \
+                     then, every file change since taken back, and the message in the input \
+                     to send again or change.\n\n",
+                );
+                for (i, (message, changes)) in points.iter().enumerate() {
+                    let line = message.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                    let line: String = line.chars().take(60).collect();
+                    let changes = match changes {
+                        0 => String::new(),
+                        1 => "  · 1 file change after it".into(),
+                        n => format!("  · {n} file changes after it"),
+                    };
+                    text += &format!("  {:>2}  {line}{changes}\n", i + 1);
+                }
+                self.show(text);
+            }
+            "/rewind" => {
+                let Ok(n) = arg.parse::<usize>() else {
+                    return self.transcript.push(Block::Error(
+                        "/rewind takes the number of a message from the /rewind list.".into(),
+                    ));
+                };
+                let Some((message, done, failed)) = session.rewind(n) else {
+                    return self.transcript.push(Block::Error(format!(
+                        "There is no message {n} to go back to; /rewind lists them."
+                    )));
+                };
+                let items = session.items.clone();
+                self.transcript.clear();
+                super::replay(&items, &mut self.transcript);
+                let mut text = String::from("Went back to before this message, now in the input.");
+                match done.len() {
+                    0 => {}
+                    1 => text += " 1 file change was taken back.",
+                    k => text += &format!(" {k} file changes were taken back."),
+                }
+                self.transcript.push(Block::Info(text));
+                if !failed.is_empty() {
+                    self.transcript.push(Block::Error(failed.join("\n")));
+                }
+                self.input.forget();
+                self.input.insert(&message);
+                self.usage = None;
             }
             "/undo" => {
                 let n = match arg {
@@ -675,6 +750,10 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "/undo",
         "undo the agent's last change to a file; /undo N, the last N",
+    ),
+    (
+        "/rewind",
+        "go back to an earlier message, taking back the file changes since",
     ),
     (
         "/changes",
