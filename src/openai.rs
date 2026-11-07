@@ -390,7 +390,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// An HTTP client; with no proxy given, the usual `HTTPS_PROXY`,
 /// `ALL_PROXY` and `NO_PROXY` variables apply.
-fn agent(proxy: Option<&str>) -> Result<ureq::Agent> {
+pub fn agent(proxy: Option<&str>) -> Result<ureq::Agent> {
     let mut config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_connect(Some(CONNECT_TIMEOUT))

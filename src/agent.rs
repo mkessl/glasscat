@@ -176,6 +176,8 @@ pub enum Shown<'a> {
         why: &'a str,
         refused: bool,
     },
+    /// Something the user should know, such as an MCP server that failed.
+    Notice(&'a str),
     /// The older part of the conversation is being summarised, or the
     /// summary written on the side is awaited.
     Compacting,
@@ -214,7 +216,7 @@ impl Session {
         tools: Tools,
     ) -> Self {
         let items = vec![Item::System(system_prompt(&tools))];
-        let specs = tools.all_specs();
+        let specs = all_specs(&tools);
         Self {
             base_url,
             proxy: None,
@@ -242,7 +244,7 @@ impl Session {
         custom: std::collections::BTreeMap<String, crate::custom::CustomTool>,
     ) -> std::result::Result<(), String> {
         self.tools.set_custom(custom)?;
-        self.specs = self.tools.all_specs();
+        self.specs = all_specs(&self.tools);
         Ok(())
     }
 
@@ -451,6 +453,11 @@ impl Session {
     fn run(&mut self, cancel: &AtomicBool, mut on: impl FnMut(Shown)) -> Result<()> {
         // Compacted once already for a "too long" error in this turn.
         let mut compacted = false;
+        // The first request waits for MCP servers still starting.
+        for e in self.tools.mcp.wait() {
+            on(Shown::Notice(&e));
+        }
+        self.specs = all_specs(&self.tools);
         'request: loop {
             self.fit(cancel, &mut on)?;
             if cancel.load(Ordering::Relaxed) {
@@ -878,12 +885,17 @@ impl Session {
         cancel: &AtomicBool,
     ) -> Vec<crate::tools::Ran> {
         let tools = &self.tools;
-        if calls.len() > 1 && calls.iter().all(|c| tools.reads_only(&c.name)) {
+        let one = |c: &crate::context::ToolCall| match c.name.as_str() {
+            "agent" => self.run_agent(&c.args, cancel),
+            _ => tools.run_noting(&c.name, &c.args, cancel),
+        };
+        if calls.len() > 1
+            && calls
+                .iter()
+                .all(|c| c.name == "agent" || tools.reads_only(&c.name))
+        {
             std::thread::scope(|s| {
-                let handles: Vec<_> = calls
-                    .iter()
-                    .map(|c| s.spawn(move || tools.run_noting(&c.name, &c.args, cancel)))
-                    .collect();
+                let handles: Vec<_> = calls.iter().map(|c| s.spawn(move || one(c))).collect();
                 handles
                     .into_iter()
                     .map(|h| {
@@ -897,13 +909,150 @@ impl Session {
                     .collect()
             })
         } else {
-            calls
-                .iter()
-                .map(|c| tools.run_noting(&c.name, &c.args, cancel))
-                .collect()
+            calls.iter().map(one).collect()
         }
     }
+
+    /// Runs another agent on the task in `args`, with a fresh context and
+    /// the same tools; what comes back is its last answer.
+    fn run_agent(&self, args: &str, cancel: &AtomicBool) -> crate::tools::Ran {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let ran = |result: String, note: Option<String>| crate::tools::Ran {
+            result,
+            note,
+            before: None,
+            image: None,
+        };
+        let task = serde_json::from_str::<serde_json::Value>(args)
+            .ok()
+            .and_then(|v| v.get("task")?.as_str().map(str::to_string))
+            .filter(|t| !t.trim().is_empty());
+        let Some(task) = task else {
+            return ran("error: give the agent its task in `task`".into(), None);
+        };
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut child = Session::new(
+            self.base_url.clone(),
+            self.model.clone(),
+            self.api_key.clone(),
+            self.prefill,
+            self.tools.child(),
+        );
+        child.proxy = self.proxy.clone();
+        child.fields = self.fields.clone();
+        child.key_env = self.key_env.clone();
+        child.launch = self.launch.clone();
+        child.no_tools = self.no_tools.clone();
+        if let Some(Item::System(system)) = self.items.first() {
+            child.items[0] = Item::System(format!("{system}\n\n{SUBAGENT}"));
+        }
+        // Kept where this conversation is kept, if it is.
+        child.log = self.log.as_ref().map(|(_, provider)| {
+            let dir = crate::journal::data_dir().join("agents");
+            let _ = std::fs::create_dir_all(&dir);
+            let name = format!(
+                "{}-{}-{id}.json",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+                std::process::id()
+            );
+            (dir.join(name), provider.clone())
+        });
+        let sink = self.tools.sub.clone();
+        let tell = |s: Sub| {
+            if let Some(sink) = &sink {
+                sink(s)
+            }
+        };
+        tell(Sub::Started {
+            agent: id,
+            task: task.clone(),
+        });
+        let mut steps = 0;
+        let r = child.turn(task, cancel, |shown| match shown {
+            Shown::Usage(u) => tell(Sub::Usage(u.clone())),
+            Shown::ToolDone { name, args, .. } => {
+                steps += 1;
+                tell(Sub::Tool {
+                    agent: id,
+                    name: name.into(),
+                    args: args.into(),
+                })
+            }
+            _ => {}
+        });
+        tell(Sub::Done { agent: id });
+        let answer = child
+            .items
+            .iter()
+            .rev()
+            .find_map(|i| match i {
+                Item::Assistant(r) if !r.text.trim().is_empty() => Some(r.text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let result = match (r, answer.is_empty()) {
+            (Ok(()), false) => answer,
+            (Ok(()), true) => "error: the agent ended without an answer".into(),
+            (Err(e), true) => format!("error: the agent stopped: {e}"),
+            (Err(e), false) => format!("error: the agent stopped: {e}; its last words:\n{answer}"),
+        };
+        let mut note = format!("{steps} tool call{}", if steps == 1 { "" } else { "s" });
+        if let Some((path, _)) = &child.log {
+            note += &format!("; the agent's conversation: {}", path.display());
+        }
+        ran(result, Some(note))
+    }
 }
+
+/// What an agent started by the model does, told as it happens.
+pub enum Sub {
+    Started {
+        agent: u64,
+        task: String,
+    },
+    Tool {
+        agent: u64,
+        name: String,
+        args: String,
+    },
+    /// The provider's usage report for one of its requests.
+    Usage(serde_json::Value),
+    Done {
+        agent: u64,
+    },
+}
+
+/// The tools given to the model: the built-in ones, the user's, and
+/// starting another agent.
+fn all_specs(tools: &Tools) -> Vec<ToolSpec> {
+    let mut specs = tools.all_specs();
+    specs.push(ToolSpec {
+        name: "agent".into(),
+        description: "Start another agent on a task: a fresh context with your tools, this one \
+             included. It sees nothing of this conversation, so `task` must hold everything it \
+             needs: the goal, what you already know, the paths involved, and what to report. \
+             Only its final answer comes back, so your context stays small. Worth it for work \
+             of many steps whose details you will not need: a wide search, studying an \
+             unfamiliar part, an independent change. Several in one reply run at the same time; \
+             give them parts that do not touch the same files. Not worth it for what a few tool \
+             calls do: each agent pays for its own context. Its file changes undo like yours."
+            .into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": { "task": { "type": "string" } },
+            "required": ["task"],
+        }),
+    });
+    specs
+}
+
+/// Added to the system prompt of an agent started by the model.
+const SUBAGENT: &str = "Another agent started you on the task in the user message; it is the \
+only one who reads your answer, and it sees nothing else of your work. Do the task, then end \
+with a complete, plain report: what you found or changed, with paths and line numbers, and \
+what is left unchecked.";
 
 type Map = serde_json::Map<String, serde_json::Value>;
 
@@ -957,7 +1106,7 @@ fn sleep_unless_cancelled(wait: Duration, cancel: &AtomicBool) -> bool {
 }
 
 /// Request fields in layers; a later layer wins.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Fields {
     /// Built in for the provider: fields for the models whose id starts
     /// with the given text.
@@ -1010,13 +1159,17 @@ fn system_prompt(tools: &Tools) -> String {
 The user owns you and can see everything you are given, this text included; \
 answer questions about yourself plainly. \
 You may call several tools in one reply; those that only read run at the same time. \
-You can run only what your tools offer; the built-in ones work on files, and cannot run \
-programs, builds or tests; a script you write is not run. Say what is unchecked instead of \
-claiming it works.\n\
+{run}Say what is unchecked instead of claiming it works.\n\
 Working directory: {cwd}\n\
 System: {os}\n\
 Date (UTC): {date}",
         name = crate::NAME,
+        run = if tools.has_shell() {
+            ""
+        } else {
+            "You can run only what your tools offer; the built-in ones work on files, and cannot \
+             run programs, builds or tests; a script you write is not run. "
+        },
         cwd = tools.cwd().display(),
         os = std::env::consts::OS,
         date = today(),
@@ -1188,6 +1341,49 @@ mod tests {
         assert_eq!(msgs[3]["tool_call_id"], "r1");
         assert_eq!(msgs[4]["content"], "beta\n");
         assert!(matches!(session.items.last(), Some(Item::Assistant(r)) if r.text == "done"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_agent_works_on_its_own_and_its_changes_undo() {
+        let (url, server) = serve(vec![
+            sse(&[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a1","function":{"name":"agent","arguments":"{\"task\":\"make c.txt\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            ]),
+            sse(&[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"w1","function":{"name":"write","arguments":"{\"path\":\"c.txt\",\"content\":\"c\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            ]),
+            sse(&[
+                r#"{"choices":[{"delta":{"content":"made c.txt"},"finish_reason":"stop"}]}"#,
+                "[DONE]",
+            ]),
+            sse(&[
+                r#"{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#,
+                "[DONE]",
+            ]),
+        ]);
+        let (mut session, dir) = session(url, Prefill::None);
+        let mut done = Vec::new();
+        session
+            .turn("go".into(), &AtomicBool::new(false), |s| {
+                if let Shown::ToolDone { name, result, .. } = s {
+                    done.push(format!("{name}: {result}"));
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            done,
+            ["agent: made c.txt"],
+            "only the agent's answer comes back"
+        );
+        let requests: Vec<serde_json::Value> =
+            server.join().unwrap().iter().map(|r| body(r)).collect();
+        let child = requests[1]["messages"].as_array().unwrap();
+        assert!(child[0]["content"].as_str().unwrap().ends_with(SUBAGENT));
+        assert_eq!(child[1]["content"], "make c.txt", "the task is all it sees");
+        assert_eq!(fs::read_to_string(dir.join("c.txt")).unwrap(), "c");
+        session.undo().unwrap();
+        assert!(!dir.join("c.txt").exists(), "its change undoes from here");
         fs::remove_dir_all(dir).unwrap();
     }
 

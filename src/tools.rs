@@ -5,8 +5,8 @@ use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
@@ -27,27 +27,32 @@ const SEARCH_FILE_MAX: u64 = 10 * 1024 * 1024;
 pub struct Tools {
     /// What the model may see; the user may change it as it runs.
     pub access: Access,
-    journal: Journal,
+    journal: Arc<Journal>,
     /// This run's changes, last at the end, for /undo and /rewind, each
-    /// with its number in the order they were made.
-    changes: Mutex<Vec<(u64, Change)>>,
+    /// with its number in the order they were made; shared with the
+    /// agents started from here, so their changes undo the same way.
+    changes: Arc<Mutex<Vec<(u64, Change)>>>,
     /// The number the next change gets.
-    seq: AtomicU64,
+    seq: Arc<AtomicU64>,
     /// Whether the model has a shell, and how it is limited.
     pub shell: crate::shell::Mode,
     /// What shell commands changed, found by looking before and after.
-    snapshots: Mutex<crate::snapshot::Store>,
+    snapshots: Arc<Mutex<crate::snapshot::Store>>,
     /// Whether the few commands `danger` names wait for the user's yes.
     pub confirm: bool,
     /// Asks the user a yes-or-no question; none where no one can answer.
     pub ask: Option<Ask>,
+    /// Where what the agents started from here do is told.
+    pub sub: Option<SubSink>,
+    /// The MCP servers whose tools the model has.
+    pub mcp: Arc<crate::mcp::Servers>,
     /// The user's own tools, from the settings.
     custom: std::collections::BTreeMap<String, CustomTool>,
     /// Where reports to the developers are saved.
     pub reports: PathBuf,
     /// Files the model read or changed in this run, and whether it changed
     /// them.
-    touched: Mutex<std::collections::HashMap<PathBuf, bool>>,
+    touched: Arc<Mutex<std::collections::HashMap<PathBuf, bool>>>,
 }
 
 /// One change to a file and what it takes to undo it.
@@ -89,7 +94,17 @@ enum Undo {
 }
 
 /// Asks the user a yes-or-no question and waits for the answer.
-pub type Ask = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+pub type Ask = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Asks one question at a time, when agents run at once.
+fn asking(ask: &Ask, question: &str) -> bool {
+    static ONE: Mutex<()> = Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    ask(question)
+}
+
+/// Takes what an agent started by the model does, as it happens.
+pub type SubSink = Arc<dyn Fn(crate::agent::Sub) + Send + Sync>;
 
 pub fn specs() -> Vec<ToolSpec> {
     let spec = |name: &str, description: &str, parameters: Value| ToolSpec {
@@ -216,16 +231,38 @@ impl Tools {
     pub fn new(access: Access, journal: Journal) -> Self {
         Self {
             access,
-            journal,
-            changes: Mutex::new(Vec::new()),
-            seq: AtomicU64::new(0),
+            journal: Arc::new(journal),
+            changes: Arc::default(),
+            seq: Arc::default(),
             shell: crate::shell::Mode::default(),
-            snapshots: Mutex::default(),
+            snapshots: Arc::default(),
             confirm: true,
             ask: None,
+            sub: None,
+            mcp: Arc::default(),
             custom: Default::default(),
             reports: crate::journal::data_dir().join("reports"),
-            touched: Mutex::default(),
+            touched: Arc::default(),
+        }
+    }
+
+    /// The tools of an agent started from here: the same, sharing the
+    /// journal, the changes and what was read.
+    pub fn child(&self) -> Self {
+        Self {
+            access: self.access.clone(),
+            journal: self.journal.clone(),
+            changes: self.changes.clone(),
+            seq: self.seq.clone(),
+            shell: self.shell,
+            snapshots: self.snapshots.clone(),
+            confirm: self.confirm,
+            ask: self.ask.clone(),
+            sub: self.sub.clone(),
+            mcp: self.mcp.clone(),
+            custom: self.custom.clone(),
+            reports: self.reports.clone(),
+            touched: self.touched.clone(),
         }
     }
 
@@ -255,6 +292,7 @@ impl Tools {
             all.push(crate::shell::spec(self.shell));
         }
         all.extend(self.custom.iter().map(|(n, t)| crate::custom::spec(n, t)));
+        all.extend(self.mcp.specs());
         all
     }
 
@@ -279,12 +317,17 @@ impl Tools {
                 out += &format!(" (runs {})", c.command.join(" "));
             }
         }
+        for line in self.mcp.summary() {
+            out += &format!("\nMCP server {line}");
+        }
         out
     }
 
     /// Whether a call only reads, so it may run beside others.
     pub fn reads_only(&self, name: &str) -> bool {
-        read_only(name) || self.custom.get(name).is_some_and(|t| t.read_only)
+        read_only(name)
+            || self.custom.get(name).is_some_and(|t| t.read_only)
+            || self.mcp.tool(name).is_some_and(|t| t.1)
     }
 
     /// Runs a command, writing down what it changed in the directories
@@ -377,7 +420,7 @@ impl Tools {
         if let Some(why) = crate::danger::check(line).filter(|_| self.confirm) {
             let question = format!("The model wants to run a command that {why}:\n  {line}");
             match &self.ask {
-                Some(ask) if ask(&question) => {}
+                Some(ask) if asking(ask, &question) => {}
                 Some(_) => return "error: the user said no to this command".into(),
                 None => {
                     return format!(
@@ -637,6 +680,9 @@ impl Tools {
         crate::access::take_withheld();
         BEFORE.take();
         IMAGE.take();
+        if name.starts_with("mcp__") {
+            return self.run_mcp(name, args, cancel);
+        }
         let result = match self.custom.get(name) {
             Some(t) => self.run_custom(name, t, args, cancel),
             None if name == "shell" => self.shell(args, cancel),
@@ -649,6 +695,59 @@ impl Tools {
             before: BEFORE.take(),
             image: IMAGE.take(),
         }
+    }
+
+    /// Calls a tool of an MCP server: one that may change things is
+    /// watched like a command, and one the server calls destructive waits
+    /// for the user's yes.
+    fn run_mcp(&self, name: &str, args: &str, cancel: &AtomicBool) -> Ran {
+        let ran = |result: String, image| Ran {
+            result,
+            note: None,
+            before: None,
+            image,
+        };
+        let Some((server, read_only, destructive)) = self.mcp.tool(name) else {
+            return ran(format!("error: there is no tool {name}"), None);
+        };
+        if destructive && self.confirm {
+            let question = format!(
+                "The model wants to call {name}, which the MCP server {server} says may \
+                 destroy something:\n  {args}"
+            );
+            match &self.ask {
+                Some(ask) if asking(ask, &question) => {}
+                Some(_) => return ran("error: the user said no to this call".into(), None),
+                None => {
+                    return ran(
+                        "error: refused: this tool may destroy something, so it needs the \
+                         user's yes, and no one is here to give it"
+                            .into(),
+                        None,
+                    );
+                }
+            }
+        }
+        let mut image = None;
+        let mut call = || {
+            let c = self.mcp.call(name, args, cancel);
+            let text = c.as_ref().map_or_else(
+                || format!("error: there is no tool {name}"),
+                |c| c.text.clone(),
+            );
+            image = c.and_then(|c| c.image);
+            text
+        };
+        let result = if read_only {
+            call()
+        } else {
+            self.watched(name, call)
+        };
+        let ended = result.lines().next().unwrap_or_default();
+        let _ = self
+            .journal
+            .record(json!({ "tool": name, "args": args, "ended": ended }));
+        ran(result, image)
     }
 
     fn run_custom(&self, name: &str, t: &CustomTool, args: &str, cancel: &AtomicBool) -> String {

@@ -11,6 +11,7 @@ mod image;
 mod journal;
 mod landlock;
 mod login;
+mod mcp;
 mod models;
 mod oauth;
 mod openai;
@@ -181,7 +182,12 @@ fn run() -> Result<()> {
         let user = std::fs::read_to_string(&path)
             .ok()
             .map(|t| (path.display().to_string(), t));
-        let project = session.tools.read_visible(&instruction_files);
+        let (names, first) = &instruction_files;
+        let mut project = session.tools.read_visible(names);
+        if *first {
+            project.retain(|(_, t)| !t.trim().is_empty());
+            project.truncate(1);
+        }
         session.add_instructions(user, project);
     }
     let Some(prompt) = args.prompt else {
@@ -204,6 +210,23 @@ fn run() -> Result<()> {
     let mut fresh = true;
     // What the requests cost together, and how many reported a cost.
     let mut spent = (0.0, 0);
+    // What the agents the model starts spend, and what they do.
+    let sub_spent = std::sync::Arc::new(std::sync::Mutex::new((0.0, 0)));
+    let (counted, sub_cwd) = (sub_spent.clone(), cwd.clone());
+    session.tools.sub = Some(std::sync::Arc::new(move |sub| match sub {
+        agent::Sub::Usage(u) => {
+            if let (Some(c), Ok(mut s)) = (
+                u.get("cost").and_then(serde_json::Value::as_f64),
+                counted.lock(),
+            ) {
+                *s = (s.0 + c, s.1 + 1);
+            }
+        }
+        agent::Sub::Tool { agent, name, args } => {
+            eprintln!("  agent {agent} › {name} {}", ui::summary(&args, &sub_cwd));
+        }
+        _ => {}
+    }));
     let turn = session.turn(prompt, &AtomicBool::new(false), |shown| {
         let r = match shown {
             agent::Shown::Request(body) if show_request => {
@@ -271,6 +294,7 @@ fn run() -> Result<()> {
                 "cleared {results} old tool results, about {} tokens, to make room",
                 models::short(saved)
             ),
+            agent::Shown::Notice(n) => writeln!(std::io::stderr(), "{n}"),
             agent::Shown::Compacted { before, after, .. } => writeln!(
                 std::io::stderr(),
                 "compacted the context from about {} to {} tokens",
@@ -285,6 +309,9 @@ fn run() -> Result<()> {
     });
     if !at_line_start {
         writeln!(out)?;
+    }
+    if let Ok(s) = sub_spent.lock() {
+        spent = (spent.0 + s.0, spent.1 + s.1);
     }
     if spent.1 > 0 {
         let s = if spent.1 == 1 { "" } else { "s" };

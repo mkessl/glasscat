@@ -32,8 +32,10 @@ pub struct Settings {
     pub models: BTreeMap<String, Model>,
     /// Tools of the user's own: programs the model may run.
     pub tools: BTreeMap<String, crate::custom::CustomTool>,
+    /// MCP servers whose tools the model gets.
+    pub mcp: BTreeMap<String, crate::mcp::Config>,
     /// Files in the working directory whose text goes into the system
-    /// prompt; `AGENTS.md` when not set.
+    /// prompt; when not set, the first of `INSTRUCTIONS` there is.
     pub instructions: Option<Vec<String>>,
     /// The model's shell: `landlock`, `unrestricted` or `off`.
     pub shell: crate::shell::Mode,
@@ -42,12 +44,29 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn instruction_files(&self) -> Vec<String> {
-        self.instructions
-            .clone()
-            .unwrap_or_else(|| vec!["AGENTS.md".into()])
+    /// The instruction files to read, and whether only the first found
+    /// is taken.
+    pub fn instruction_files(&self) -> (Vec<String>, bool) {
+        match &self.instructions {
+            Some(list) => (list.clone(), false),
+            None => (INSTRUCTIONS.iter().map(|s| s.to_string()).collect(), true),
+        }
     }
 }
+
+/// Instruction files of a project, as agents name them: `AGENTS.md`,
+/// which most read, then those of single agents. Projects often keep the
+/// same text under several names, so only the first found is taken.
+pub const INSTRUCTIONS: &[&str] = &[
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+    ".github/copilot-instructions.md",
+    ".cursorrules",
+    ".windsurfrules",
+    ".clinerules",
+    "CONVENTIONS.md",
+];
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -142,6 +161,10 @@ pub fn apply(session: &mut crate::agent::Session, s: &Settings) -> Result<()> {
         .set_custom(s.tools.clone())
         .map_err(|e| format!("{}: {e}", path().display()))?;
     session.tools.access = access;
+    let mcp = crate::mcp::with_builtin(&s.mcp);
+    if !session.tools.mcp.same(&mcp) {
+        session.tools.mcp = crate::mcp::Servers::start(&mcp, &cwd);
+    }
     session.proxy = proxy;
     session.fields.builtin = builtin;
     session.fields.settings = provider.request;

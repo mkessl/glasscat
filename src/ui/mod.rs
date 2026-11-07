@@ -109,6 +109,9 @@ enum AgentMsg {
     Compacted(u64, u64, Option<String>),
     ImagesDropped(String, bool),
     ToolsOff(String, bool),
+    /// What an agent the model started is doing.
+    Sub(crate::agent::Sub),
+    Notice(String),
 }
 
 enum View {
@@ -224,6 +227,9 @@ struct App {
     login: Option<LoginWait>,
     /// Where the answer to the question shown goes: Enter says yes, Esc no.
     asked: Option<mpsc::Sender<bool>>,
+    /// The agents the model started that are running, each with what it
+    /// did last.
+    agents: Vec<(u64, String)>,
     /// A message sent before signing in, to go once signed in.
     after_login: Option<String>,
 }
@@ -266,6 +272,12 @@ pub fn run(mut session: Session) -> Result<()> {
             .is_ok_and(|t| t.send(Msg::Ask(question.into(), reply)).is_ok());
         sent && answer.recv().unwrap_or(false)
     }));
+    let sub_tx = std::sync::Mutex::new(tx.clone());
+    session.tools.sub = Some(Arc::new(move |s| {
+        if let Ok(t) = sub_tx.lock() {
+            let _ = t.send(Msg::Agent(AgentMsg::Sub(s)));
+        }
+    }));
     let cwd = session.tools.cwd().display().to_string();
     let api = Api {
         base_url: session.base_url.clone(),
@@ -304,6 +316,7 @@ pub fn run(mut session: Session) -> Result<()> {
         kept_edit: None,
         login: None,
         asked: None,
+        agents: Vec::new(),
         after_login: None,
         served: None,
         timing: None,
@@ -839,6 +852,35 @@ impl App {
                     crate::models::short(after)
                 )));
             }
+            AgentMsg::Notice(n) => self.transcript.push(Block::Error(n)),
+            AgentMsg::Sub(sub) => {
+                use crate::agent::Sub;
+                match sub {
+                    Sub::Started { agent, task } => {
+                        let first = task.lines().next().unwrap_or_default();
+                        self.agents.push((agent, format!("started: {first}")));
+                    }
+                    Sub::Tool {
+                        agent, name, args, ..
+                    } => {
+                        let what = format!("{name} {}", transcript::summary(&args, &self.transcript.cwd));
+                        if let Some(a) = self.agents.iter_mut().find(|a| a.0 == agent) {
+                            a.1 = what;
+                        }
+                    }
+                    Sub::Usage(u) => {
+                        if let Some(c) = u.get("cost").and_then(Value::as_f64) {
+                            self.spent = (self.spent.0 + c, self.spent.1 + 1);
+                        }
+                    }
+                    Sub::Done { agent } => self.agents.retain(|a| a.0 != agent),
+                }
+                self.busy = Some(match self.agents.as_slice() {
+                    [] => "running".into(),
+                    [(_, last)] => format!("agent: {last}"),
+                    [.., (_, last)] => format!("{} agents · {last}", self.agents.len()),
+                });
+            }
             AgentMsg::StartedOver => self.transcript.push(Block::Info(
                 "The model wrote the reply anew instead of continuing it; only the new one is kept.".into(),
             )),
@@ -973,6 +1015,7 @@ impl App {
                     attempt,
                 } => send(AgentMsg::Retrying(error.into(), wait, attempt)),
                 Shown::StartedOver => send(AgentMsg::StartedOver),
+                Shown::Notice(n) => send(AgentMsg::Notice(n.into())),
                 Shown::Compacting => send(AgentMsg::Compacting),
                 Shown::Cleared { results, saved } => send(AgentMsg::Cleared(results, saved)),
                 Shown::Compacted {

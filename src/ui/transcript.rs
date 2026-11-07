@@ -65,7 +65,7 @@ pub struct Transcript {
     /// Reasoning shown in full rather than folded.
     reasoning_open: bool,
     /// The working directory, left out of paths in tool calls.
-    cwd: String,
+    pub cwd: String,
 }
 
 /// Lines of reasoning shown while the model is still thinking.
@@ -490,7 +490,7 @@ pub fn summary(args: &str, cwd: &str) -> String {
             p => p.into(),
         }
     };
-    if let Some(c) = get("command") {
+    if let Some(c) = get("command").or(get("task")) {
         let mut lines = c.trim().lines();
         let first = lines.next().unwrap_or_default().to_string();
         return if lines.next().is_some() {

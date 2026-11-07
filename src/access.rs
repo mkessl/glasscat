@@ -38,6 +38,7 @@ pub enum Seen {
     Outside,
 }
 
+#[derive(Clone)]
 pub struct Access {
     cwd: PathBuf,
     allowed: Vec<PathBuf>,

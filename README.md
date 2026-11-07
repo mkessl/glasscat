@@ -56,6 +56,17 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
   systems without Landlock there is no shell unless you allow it ([how](#settings)). The few
   commands whose harm undo cannot reach, such as a force push, a publish, destroying remote
   infrastructure, dropping a table or a reboot, wait for your yes.
+- **Web search and page reading** through Exa's MCP server, which needs no key; an `exa` entry
+  in the settings replaces it (with your key in its address) or turns it off.
+- **MCP servers**, on stdin and stdout or over HTTP, set the way other agents set them, so a
+  server's own instructions can be copied in ([how](#settings)). Their tools join the model's
+  own; what they change in the working directories undoes like a command's, and a tool its
+  server calls destructive waits for your yes. A server runs as its own program, outside the
+  limits on the shell and hidden paths.
+- **Agents.** The model can start other agents on parts of a task, several at once: each has a
+  fresh context and the same tools, and only its answer comes back, so the main conversation
+  stays small. Their steps show as they work, their cost counts in yours, their changes undo
+  like any other, and each one's whole conversation is kept beside yours.
 - **Tools of your own.** Give the model any program to run, such as your build or tests,
   with its arguments put into the command line and no shell in between
   ([how](#tools-of-your-own)).
@@ -66,9 +77,10 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
   as it was (not inside directories `.gitignore` leaves out, such as build output; an ignored
   file such as `.env` is kept). A file you changed
   yourself in the meantime is left alone.
-- **Instructions.** `AGENTS.md` in the working directory and your own
+- **Instructions.** `AGENTS.md` in the working directory (or, without one, the file another
+  agent reads: `CLAUDE.md`, `GEMINI.md`, `.cursorrules` and the like) and your own
   `~/.config/glasscat/AGENTS.md` go into the system prompt of a new conversation, where
-  <kbd>Ctrl</kbd>+<kbd>T</kbd> shows them. A hidden `AGENTS.md` stays out.
+  <kbd>Ctrl</kbd>+<kbd>T</kbd> shows them. A hidden file stays out.
 - **Hidden paths.** Paths given with `--hide` do not exist as far as the model can tell. It
   gets the same answer as for a missing file. Nothing outside the working directory and the
   folders you allow can be reached, through symlinks or `..` either. You are told each time
@@ -237,8 +249,9 @@ allowed and hidden paths, and your own tools. Add any OpenAI-compatible server u
 | `models` | settings for one model by its id; for now its own `request` fields, over the others |
 | `tools` | tools of your own: programs the model may run, see below |
 | `shell` | the model's shell: `landlock` (the default: limited, and none without Landlock), `unrestricted` (reaches all you can, hidden paths too) or `off` |
+| `mcp` | MCP servers by name: `{"command": "...", "args": [...], "env": {...}}`, or `{"url": "...", "headers": {...}}`; `"disabled": true` keeps one off |
 | `confirm` | whether the few commands undo cannot take back wait for your yes (default `true`) |
-| `instructions` | files in the working directory added to the system prompt (default `["AGENTS.md"]`) |
+| `instructions` | files in the working directory added to the system prompt (default: the first of `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.github/copilot-instructions.md`, `.cursorrules`, `.windsurfrules`, `.clinerules`, `CONVENTIONS.md`) |
 | `proxy` | a proxy for every provider; a provider's own `proxy` wins, and `--proxy` wins over both |
 
 Two accounts with one provider are two entries with the same `base_url`, each with its own
