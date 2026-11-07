@@ -123,6 +123,17 @@ fn remove_in(path: &Path, provider: &str) -> Result<usize> {
 }
 
 /// First stored key for a provider. Any read or parse error gives `None`.
+/// Every stored key for a provider, newest first.
+pub fn keys(provider: &str) -> Vec<String> {
+    load_from(&path())
+        .ok()
+        .and_then(|mut s| s.remove(provider))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.key)
+        .collect()
+}
+
 fn key_in(path: &Path, provider: &str) -> Option<String> {
     load_from(path)
         .ok()?

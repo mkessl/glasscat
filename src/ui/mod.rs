@@ -852,7 +852,7 @@ impl App {
                     crate::models::short(after)
                 )));
             }
-            AgentMsg::Notice(n) => self.transcript.push(Block::Error(n)),
+            AgentMsg::Notice(n) => self.transcript.push(Block::Info(n)),
             AgentMsg::Sub(sub) => {
                 use crate::agent::Sub;
                 match sub {

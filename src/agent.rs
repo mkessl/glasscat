@@ -281,6 +281,14 @@ impl Session {
         }
     }
 
+    /// Adds the notes kept from earlier conversations to the system prompt.
+    pub fn add_memory(&mut self, notes: &str) {
+        if let Some(Item::System(prompt)) = self.items.first_mut() {
+            prompt.push_str("\n\n");
+            prompt.push_str(notes);
+        }
+    }
+
     /// Forgets the conversation; the system prompt stays.
     pub fn clear(&mut self) {
         self.items.truncate(1);
@@ -500,9 +508,11 @@ impl Session {
             let mut attempt = 0;
             let (stream, start) = loop {
                 let start = Instant::now();
+                let keys = self.keys();
+                let key = pick(&keys, Instant::now()).or_else(|| keys.first().cloned());
                 let sent = openai::send(
                     &self.base_url,
-                    self.api_key.as_deref(),
+                    key.as_deref(),
                     self.proxy.as_deref(),
                     &body,
                     cancel,
@@ -512,6 +522,30 @@ impl Session {
                     Ok(None) => return Ok(()),
                     Err(e) => e,
                 };
+                // A key refused or at its limit rests while another is
+                // stored that does not.
+                if let (Some(h), Some(k)) = (e.downcast_ref::<openai::HttpError>(), &key)
+                    && let Some(rest) = rest_for(h)
+                {
+                    let until = Instant::now() + rest;
+                    let others = keys.iter().filter(|o| *o != k).cloned().collect::<Vec<_>>();
+                    if pick(&others, Instant::now()).is_some() {
+                        RESTING
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((k.clone(), until));
+                        let n = keys.iter().position(|o| o == k).map_or(0, |i| i + 1);
+                        let note = format!(
+                            "The provider answered key {n} of {} with HTTP {}; another stored \
+                             key goes instead, and this one rests for {} min.",
+                            keys.len(),
+                            h.status,
+                            rest.as_secs().div_ceil(60)
+                        );
+                        on(Shown::Notice(&note));
+                        continue;
+                    }
+                }
                 let wait = e
                     .downcast_ref::<openai::HttpError>()
                     .and_then(|h| h.retry_wait(attempt));
@@ -913,6 +947,20 @@ impl Session {
         }
     }
 
+    /// The keys to try, in order: the one in use, then the other stored
+    /// logins of the provider.
+    fn keys(&self) -> Vec<String> {
+        let mut all: Vec<String> = self.api_key.iter().cloned().collect();
+        if self.api_key.is_some() && !self.launch.provider.is_empty() {
+            for k in crate::auth::keys(&self.launch.provider) {
+                if !all.contains(&k) {
+                    all.push(k);
+                }
+            }
+        }
+        all
+    }
+
     /// Runs another agent on the task in `args`, with a fresh context and
     /// the same tools; what comes back is its last answer.
     fn run_agent(&self, args: &str, cancel: &AtomicBool) -> crate::tools::Ran {
@@ -1093,6 +1141,29 @@ fn refuses_tools(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
 /// Tries of a request after the first, on errors that may pass.
 pub const RETRIES: u32 = 3;
 
+/// Keys the provider refused or found at their limit, and until when
+/// they rest.
+static RESTING: std::sync::Mutex<Vec<(String, Instant)>> = std::sync::Mutex::new(Vec::new());
+
+/// The first of `keys` not resting.
+fn pick(keys: &[String], now: Instant) -> Option<String> {
+    let resting = RESTING.lock().unwrap_or_else(|e| e.into_inner());
+    keys.iter()
+        .find(|k| !resting.iter().any(|(r, until)| r == *k && *until > now))
+        .cloned()
+}
+
+/// How long a key rests after this error, if another may do better: a
+/// limit passes in the time the provider names, or a minute; a refused
+/// key or one out of credit stays so for long.
+fn rest_for(h: &openai::HttpError) -> Option<Duration> {
+    match h.status {
+        429 => Some(h.retry_after.unwrap_or(Duration::from_secs(60))),
+        401..=403 => Some(Duration::from_secs(3600)),
+        _ => None,
+    }
+}
+
 /// Waits unless cancelled first; false when cancelled.
 fn sleep_unless_cancelled(wait: Duration, cancel: &AtomicBool) -> bool {
     let end = Instant::now() + wait;
@@ -1156,19 +1227,42 @@ impl Fields {
 fn system_prompt(tools: &Tools) -> String {
     format!(
         "You are {name}, an AI agent working on the user's computer through your tools. \
-The user owns you and can see everything you are given, this text included; \
-answer questions about yourself plainly. \
-You may call several tools in one reply; those that only read run at the same time. \
-{run}Say what is unchecked instead of claiming it works.\n\
-Working directory: {cwd}\n\
-System: {os}\n\
+The user owns you and can see everything you are given, this text included; answer questions \
+about yourself plainly.
+
+# Work
+- Keep going until the task is done, then end your turn. Do not stop to ask what you can find \
+out with your tools or decide yourself; ask only for a choice that is the user's to make, or \
+when you are blocked. Never end a turn promising work you have not done.
+- Look before you act: read the code you change and what it touches; do not guess file \
+contents, names or behaviour. {run}
+- Before fixing a reported fault, confirm it: reproduce it, or find its cause in the code. If \
+it is not there, say so and change nothing.
+- Do what was asked, all of it, and nothing more: no unrequested refactors or extras; mention \
+them instead. Follow the style of the code around you. Leave alone changes you did not make.
+- You may call several tools in one reply; those that only read run at the same time.
+
+# Judgment
+- Think for yourself. If a request rests on a wrong premise, or a clearly better way exists, \
+say so briefly with the reason, then do what is best, or what the user insists on.
+- Do not agree to please. Point out flaws, in the user's ideas and in your own earlier work, \
+as soon as you see them.
+- Help with any lawful task directly: no lectures, moralising or warnings nobody asked for.
+
+# Reporting
+- Be brief and plain. End with what you did, what you checked and how, and what is left; \
+say what is unchecked instead of claiming it works, and report failures as they are.
+- Refer to code as path:line.
+
+Working directory: {cwd}
+System: {os}
 Date (UTC): {date}",
         name = crate::NAME,
         run = if tools.has_shell() {
-            ""
+            "Check your work by running it, its build or its tests where you can."
         } else {
-            "You can run only what your tools offer; the built-in ones work on files, and cannot \
-             run programs, builds or tests; a script you write is not run. "
+            "You can run only what your tools offer; the built-in ones work on files and cannot \
+             run programs, builds or tests, and a script you write is not run."
         },
         cwd = tools.cwd().display(),
         os = std::env::consts::OS,
@@ -1177,7 +1271,7 @@ Date (UTC): {date}",
 }
 
 /// Today's UTC date as YYYY-MM-DD.
-fn today() -> String {
+pub fn today() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -1342,6 +1436,32 @@ mod tests {
         assert_eq!(msgs[4]["content"], "beta\n");
         assert!(matches!(session.items.last(), Some(Item::Assistant(r)) if r.text == "done"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_refused_key_rests_while_another_does_not() {
+        let keys = ["k-rest-1".to_string(), "k-rest-2".to_string()];
+        let now = Instant::now();
+        assert_eq!(pick(&keys, now).as_deref(), Some("k-rest-1"));
+        RESTING
+            .lock()
+            .unwrap()
+            .push(("k-rest-1".into(), now + Duration::from_secs(60)));
+        assert_eq!(pick(&keys, now).as_deref(), Some("k-rest-2"));
+        let later = now + Duration::from_secs(61);
+        assert_eq!(
+            pick(&keys, later).as_deref(),
+            Some("k-rest-1"),
+            "rested enough"
+        );
+        let h = |status| openai::HttpError {
+            status,
+            message: String::new(),
+            retry_after: None,
+        };
+        assert_eq!(rest_for(&h(429)), Some(Duration::from_secs(60)));
+        assert_eq!(rest_for(&h(401)), Some(Duration::from_secs(3600)));
+        assert_eq!(rest_for(&h(500)), None);
     }
 
     #[test]

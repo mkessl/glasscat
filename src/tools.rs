@@ -212,7 +212,7 @@ pub fn specs() -> Vec<ToolSpec> {
 
 /// Tools that change nothing can run at the same time.
 pub fn read_only(name: &str) -> bool {
-    matches!(name, "read" | "list" | "find" | "search")
+    matches!(name, "read" | "list" | "find" | "search" | "recall")
 }
 
 /// The text up to the first full stop that ends a sentence, without it.
@@ -288,6 +288,7 @@ impl Tools {
     /// The definitions given to the model: built-in tools, then the user's.
     pub fn all_specs(&self) -> Vec<ToolSpec> {
         let mut all = specs();
+        all.extend(crate::memory::specs());
         if self.has_shell() {
             all.push(crate::shell::spec(self.shell));
         }
@@ -413,8 +414,9 @@ impl Tools {
         }
         if let Some(tool) = crate::shell::duplicate(line) {
             return format!(
-                "error: refused; use the {tool} tool for that. The other tools leave out what the \
-                 user hid, and their changes can be taken back."
+                "error: refused, nothing ran: a command in this line does what the {tool} tool \
+                 does. Use that tool for it, and send the rest of the line again without it. The \
+                 other tools leave out what the user hid, and their changes can be taken back."
             );
         }
         if let Some(why) = crate::danger::check(line).filter(|_| self.confirm) {
@@ -797,6 +799,8 @@ impl Tools {
             "edit" => self.edit(&args),
             "delete" => self.delete(&args),
             "move" => self.move_to(&args),
+            "memory" => crate::memory::tool(&args, self.cwd()),
+            "recall" => crate::memory::recall(&args, self.cwd()),
             _ => Err(format!("unknown tool {name}")),
         };
         result.unwrap_or_else(|e| format!("error: {e}"))

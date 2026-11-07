@@ -63,6 +63,10 @@ every token as it arrives, and stops the moment you press <kbd>Esc</kbd>.
   own; what they change in the working directories undoes like a command's, and a tool its
   server calls destructive waits for your yes. A server runs as its own program, outside the
   limits on the shell and hidden paths.
+- **Memory.** The model keeps a few short dated notes, about you
+  (`~/.config/glasscat/memory.md`) and about each project, and finds them in every new
+  conversation; for details it searches the past conversations themselves, as they were
+  written. The notes are plain files you can read and edit.
 - **Agents.** The model can start other agents on parts of a task, several at once: each has a
   fresh context and the same tools, and only its answer comes back, so the main conversation
   stays small. Their steps show as they work, their cost counts in yours, their changes undo
@@ -133,7 +137,8 @@ glasscat -c                               # pick up the last conversation held h
 piped in. Keys are kept in one file only you can read (`~/.local/share/glasscat/auth.json`;
 `%LOCALAPPDATA%\glasscat` on Windows); `glasscat logout` removes it. A key variable such
 as `OPENROUTER_API_KEY` overrides the stored key. Over SSH, the OpenRouter page shows a code
-to paste instead.
+to paste instead. Signing in again adds another key: when the provider refuses the one in
+use or says it hit its limit, the next goes instead while that one rests.
 
 With a prompt, the answer goes to stdout; tool calls, the lines each change took out and
 put in, retries and the cost of the run go to stderr.

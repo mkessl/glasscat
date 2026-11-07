@@ -12,6 +12,7 @@ mod journal;
 mod landlock;
 mod login;
 mod mcp;
+mod memory;
 mod models;
 mod oauth;
 mod openai;
@@ -189,6 +190,7 @@ fn run() -> Result<()> {
             project.truncate(1);
         }
         session.add_instructions(user, project);
+        session.add_memory(&memory::snapshot(session.tools.cwd()));
     }
     let Some(prompt) = args.prompt else {
         use std::io::IsTerminal;
